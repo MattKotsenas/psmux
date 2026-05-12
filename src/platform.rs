@@ -2424,6 +2424,67 @@ pub fn augment_enter_shift(key: &mut crossterm::event::KeyEvent) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IME (Input Method Editor) management for prefix mode (issue #286)
+// ---------------------------------------------------------------------------
+//
+// When an IME (e.g. Japanese, Chinese, Korean) is active, alphabetic
+// keystrokes after the prefix key get intercepted by the IME composition
+// engine instead of reaching psmux as raw key events.  We suppress the
+// IME while in prefix mode and restore it afterwards.
+
+/// Disable the IME on the console window.  Returns `true` if the IME was
+/// previously open (so the caller knows whether to restore it later).
+#[cfg(windows)]
+pub fn ime_disable() -> bool {
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(hWnd: isize) -> isize;
+        fn ImmGetOpenStatus(hIMC: isize) -> i32;
+        fn ImmSetOpenStatus(hIMC: isize, fOpen: i32) -> i32;
+        fn ImmReleaseContext(hWnd: isize, hIMC: isize) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> isize;
+    }
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd == 0 { return false; }
+        let himc = ImmGetContext(hwnd);
+        if himc == 0 { return false; }
+        let was_open = ImmGetOpenStatus(himc) != 0;
+        if was_open {
+            ImmSetOpenStatus(himc, 0);
+        }
+        ImmReleaseContext(hwnd, himc);
+        was_open
+    }
+}
+
+/// Restore (re-open) the IME on the console window.
+#[cfg(windows)]
+pub fn ime_restore() {
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(hWnd: isize) -> isize;
+        fn ImmSetOpenStatus(hIMC: isize, fOpen: i32) -> i32;
+        fn ImmReleaseContext(hWnd: isize, hIMC: isize) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> isize;
+    }
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd == 0 { return; }
+        let himc = ImmGetContext(hwnd);
+        if himc == 0 { return; }
+        ImmSetOpenStatus(himc, 1);
+        ImmReleaseContext(hwnd, himc);
+    }
+}
+
 #[cfg(test)]
 #[cfg(windows)]
 #[path = "../tests-rs/test_issue265_argv_backslash.rs"]

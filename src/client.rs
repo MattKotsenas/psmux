@@ -942,6 +942,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut prefix_armed = false;
     let mut prefix_armed_at = Instant::now();
     let mut prefix_repeating = false;
+    // Track whether IME was open before we suppressed it for prefix mode (issue #286).
+    #[cfg(windows)]
+    let mut ime_was_open = false;
     let mut repeat_time_ms: u64 = 500;
     let mut renaming = false;
     let mut session_renaming = false;
@@ -1796,6 +1799,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         {
                             prefix_armed = false;
                             prefix_repeating = false;
+                            #[cfg(windows)]
+                            if ime_was_open { crate::platform::ime_restore(); ime_was_open = false; }
                             cmd_batch.push("prefix-end\n".into());
                         }
 
@@ -2045,7 +2050,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             rsel_end = None;
                             selection_changed = true;
                         }
-                        else if is_prefix { prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into()); }
+                        else if is_prefix {
+                            // Suppress IME while in prefix mode so command keys
+                            // are not intercepted by the input method (issue #286).
+                            #[cfg(windows)]
+                            { ime_was_open = crate::platform::ime_disable(); }
+                            prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into());
+                        }
                         // Check root-table bindings (bind-key -n / bind-key -T root)
                         // These fire without prefix, before keys are forwarded to PTY
                         else if !command_input && !renaming && !pane_renaming && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
@@ -2457,6 +2468,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             } else {
                                 prefix_armed = false;
                                 prefix_repeating = false;
+                                #[cfg(windows)]
+                                if ime_was_open { crate::platform::ime_restore(); ime_was_open = false; }
                                 cmd_batch.push("prefix-end\n".into());
                             }
                         } else {
