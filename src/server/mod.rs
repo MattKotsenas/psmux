@@ -52,11 +52,17 @@ fn serialize_overlay_json(app: &AppState) -> String {
     // Popup overlay handles PopupMode, MenuMode, ConfirmMode, PaneChooser, and default
     let mut out = crate::popup::serialize_popup_overlay(app);
 
-    // Include status_message for display-message without -p (#110)
+    // Include status_message for display-message without -p (#110).
+    //
+    // tmux(1) display-message: "a delay of zero waits for a key press."
+    // So `-d 0` should keep the message visible until any key is pressed;
+    // the SendKey / SendText handlers clear status_message, which dismisses
+    // it naturally. Treat display_time == 0 as "sticky until keypress" by
+    // skipping the time-based expiry check.
     if let Some((ref msg, since, per_msg_duration)) = app.status_message {
         let elapsed = since.elapsed().as_millis() as u64;
         let display_time = per_msg_duration.unwrap_or(app.display_time_ms);
-        if elapsed < display_time {
+        if display_time == 0 || elapsed < display_time {
             out.push_str(",\"status_message\":\"");
             out.push_str(&json_escape_string(msg));
             out.push('"');
