@@ -2010,12 +2010,12 @@ fn forward_mouse_to_pane(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16, bu
 /// MOUSE_EVENT records for crossterm/ratatui apps (ReadConsoleInputW),
 /// and passes VT through for nvim/vim apps.  (fixes #60)
 fn forward_mouse_to_pane_ex(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16,
-                             _button_state: u32, _event_flags: u32,
+                             button_state: u32, event_flags: u32,
                              vt_button: u8, press: bool) {
     let col = abs_x as i16 - area.x as i16;
     let row = abs_y as i16 - area.y as i16;
     crate::window_ops::inject_mouse_combined(
-        pane, col, row, vt_button, press, 0, 0, "client");
+        pane, col, row, vt_button, press, button_state, event_flags, "client");
 }
 
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
@@ -3200,3 +3200,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue226_ctrl_slash.rs"]
 mod tests_issue226_ctrl_slash;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue284_pageup_wsl.rs"]
+mod tests_issue284_pageup_wsl;
