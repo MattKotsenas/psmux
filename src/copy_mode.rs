@@ -1,15 +1,6 @@
 use std::io::{self, Write};
-#[cfg(windows)]
-use std::thread;
-#[cfg(windows)]
-use std::time::Duration;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
-#[cfg(windows)]
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
-#[cfg(windows)]
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
+use crate::clipboard::copy_to_system_clipboard;
 use crate::types::{AppState, Mode, CopyModeState};
 use crate::tree::{active_pane, active_pane_mut};
 
@@ -149,95 +140,6 @@ pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switc
         app.mode = Mode::Passthrough;
     }
 }
-
-#[cfg(windows)]
-pub fn copy_to_system_clipboard(text: &str) {
-    const CF_UNICODETEXT: u32 = 13;
-
-    // Clipboard can be momentarily locked by other processes; retry briefly.
-    for _ in 0..5 {
-        let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
-        if opened == 0 {
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-
-        let mut utf16: Vec<u16> = text.encode_utf16().collect();
-        utf16.push(0); // null terminator required by CF_UNICODETEXT
-        let size_bytes = utf16.len() * std::mem::size_of::<u16>();
-        let mut hmem: HGLOBAL = std::ptr::null_mut();
-
-        unsafe {
-            if EmptyClipboard() != 0 {
-                hmem = GlobalAlloc(GMEM_MOVEABLE, size_bytes);
-                if !hmem.is_null() {
-                    let dst = GlobalLock(hmem) as *mut u16;
-                    if !dst.is_null() {
-                        std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-                        GlobalUnlock(hmem);
-                        if !SetClipboardData(CF_UNICODETEXT, hmem).is_null() {
-                            // Ownership transferred to the OS on success.
-                            hmem = std::ptr::null_mut();
-                        }
-                    }
-                }
-            }
-
-            if !hmem.is_null() {
-                let _ = GlobalFree(hmem);
-            }
-            let _ = CloseClipboard();
-        }
-        break;
-    }
-}
-
-#[cfg(not(windows))]
-pub fn copy_to_system_clipboard(_text: &str) {}
-
-/// Read text from the Windows system clipboard.
-#[cfg(windows)]
-pub fn read_from_system_clipboard() -> Option<String> {
-    const CF_UNICODETEXT: u32 = 13;
-    for _ in 0..5 {
-        let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
-        if opened == 0 {
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-        let result = unsafe {
-            let hmem = GetClipboardData(CF_UNICODETEXT);
-            if hmem.is_null() {
-                let _ = CloseClipboard();
-                return None;
-            }
-            let ptr = GlobalLock(hmem) as *const u16;
-            if ptr.is_null() {
-                let _ = CloseClipboard();
-                return None;
-            }
-            // Find null terminator
-            let mut len = 0usize;
-            while *ptr.add(len) != 0 {
-                len += 1;
-                if len > 1_000_000 { break; } // safety limit
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let text = String::from_utf16_lossy(slice);
-            GlobalUnlock(hmem);
-            let _ = CloseClipboard();
-            // Normalize Windows CRLF to LF — ConPTY expands LF to CRLF on
-            // output, so keeping \r\n produces double-spaced text.
-            let text = text.replace("\r\n", "\n");
-            Some(text)
-        };
-        return result;
-    }
-    None
-}
-
-#[cfg(not(windows))]
-pub fn read_from_system_clipboard() -> Option<String> { None }
 
 pub fn current_prompt_pos(app: &mut AppState) -> Option<(u16,u16)> {
     let win = &mut app.windows[app.active_idx];

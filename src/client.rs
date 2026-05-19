@@ -14,7 +14,7 @@ use crate::session::read_session_key;
 use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
-use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;

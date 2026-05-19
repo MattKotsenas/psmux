@@ -1981,7 +1981,7 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 /// Paste the system clipboard content into the active pane.
 /// This is the Windows Terminal right-click-to-paste behavior.
 fn paste_clipboard_to_active(app: &mut AppState) -> io::Result<()> {
-    if let Some(text) = crate::copy_mode::read_from_system_clipboard() {
+    if let Some(text) = crate::clipboard::read_from_system_clipboard() {
         if !text.is_empty() {
             send_paste_to_active(app, &text)?;
         }

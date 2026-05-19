@@ -14,6 +14,7 @@ mod commands;
 mod pane;
 mod warm_pane_sync;
 mod popup;
+mod clipboard;
 mod copy_mode;
 mod input;
 mod layout;
@@ -2572,6 +2573,7 @@ fn run_main() -> io::Result<()> {
             "load-buffer" | "loadb" => {
                 let mut buffer_name: Option<String> = None;
                 let mut file_path: Option<String> = None;
+                let mut propagate_to_clipboard = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -2581,7 +2583,13 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
-                        "-w" => {} // tmux 3.2+ clipboard propagation flag, silently accept
+                        // tmux 3.2+: forward the loaded buffer to the outer
+                        // terminal's system clipboard. Real tmux does this
+                        // via OSC 52 to the host terminal; on Windows we
+                        // have direct access to the Win32 clipboard, so
+                        // just write to it. Failures are non-fatal
+                        // (matches tmux's permissive behavior).
+                        "-w" => { propagate_to_clipboard = true; }
                         "-" => { file_path = Some("-".to_string()); }
                         s if !s.starts_with('-') => { file_path = Some(s.to_string()); }
                         _ => {}
@@ -2596,6 +2604,9 @@ fn run_main() -> io::Result<()> {
                     } else {
                         std::fs::read_to_string(&path)?
                     };
+                    if propagate_to_clipboard {
+                        crate::clipboard::copy_to_system_clipboard(&content);
+                    }
                     let mut cmd = "set-buffer".to_string();
                     if let Some(b) = buffer_name {
                         cmd.push_str(&format!(" -b {}", b));
