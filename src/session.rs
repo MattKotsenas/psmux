@@ -52,6 +52,61 @@ pub fn next_session_name(ns_prefix: Option<&str>) -> String {
     id.to_string()
 }
 
+/// Allocate a globally unique session ID by reading and incrementing
+/// the persistent counter file `.psmux/next_session_id`.
+pub fn allocate_session_id() -> usize {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let counter_path = format!("{}\\.psmux\\next_session_id", home);
+    let current = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&counter_path, (current + 1).to_string());
+    current
+}
+
+/// Write a `.sid` file recording the session ID for this session.
+pub fn write_session_id_file(port_file_base: &str, session_id: usize) {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let sid_path = format!("{}\\.psmux\\{}.sid", home, port_file_base);
+    let _ = std::fs::write(&sid_path, session_id.to_string());
+}
+
+/// Remove the `.sid` file for a session.
+pub fn remove_session_id_file(port_file_base: &str) {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let sid_path = format!("{}\\.psmux\\{}.sid", home, port_file_base);
+    let _ = std::fs::remove_file(&sid_path);
+}
+
+/// Resolve a tmux session ID (`$N`) to the port file base name of the
+/// session that owns that ID. Returns `None` if no session has that ID.
+pub fn resolve_session_by_id(id: usize) -> Option<String> {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
+    let psmux_dir = format!("{}\\.psmux", home);
+    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "sid").unwrap_or(false) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(file_id) = content.trim().parse::<usize>() {
+                        if file_id == id {
+                            if let Some(base) = path.file_stem().and_then(|s| s.to_str()) {
+                                // Verify the session is actually alive
+                                let port_path = format!("{}\\.psmux\\{}.port", home, base);
+                                if std::path::Path::new(&port_path).exists() {
+                                    return Some(base.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
@@ -71,15 +126,18 @@ pub fn cleanup_stale_port_files() {
                             Duration::from_millis(5)
                         ).is_err() {
                             let _ = std::fs::remove_file(&path);
-                            // Also remove the matching .key file to prevent
-                            // orphaned keys from accumulating (issue #136).
+                            // Also remove the matching .key and .sid files
                             let key_path = path.with_extension("key");
                             let _ = std::fs::remove_file(&key_path);
+                            let sid_path = path.with_extension("sid");
+                            let _ = std::fs::remove_file(&sid_path);
                         }
                     } else {
                         let _ = std::fs::remove_file(&path);
                         let key_path = path.with_extension("key");
                         let _ = std::fs::remove_file(&key_path);
+                        let sid_path = path.with_extension("sid");
+                        let _ = std::fs::remove_file(&sid_path);
                     }
                 }
             }

@@ -441,6 +441,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         };
         let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.port", home, base));
         let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.key", home, base));
+        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.sid", home, base));
     }));
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -486,6 +487,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let _ = std::fs::write(&regpath, port.to_string());
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
     let _ = std::fs::write(&keypath, &session_key);
+    // Write session ID file so $N targets can resolve to this session
+    crate::session::write_session_id_file(&app.port_file_base(), app.session_id);
 
     // Expose the server identity via env var so that child processes spawned
     // by run-shell (from hooks, keybindings, etc.) can find this server when
@@ -649,6 +652,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // behind when the pane command fails to spawn (issue #204).
         let _ = std::fs::remove_file(&regpath);
         let _ = std::fs::remove_file(&keypath);
+        crate::session::remove_session_id_file(&app.port_file_base());
         // Kill warm pane if one was pre-spawned
         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
         return Err(e);
@@ -1307,6 +1311,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -2339,13 +2344,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    // Remove port/key files FIRST so clients see the session
+                    // Remove port/key/sid files FIRST so clients see the session
                     // as gone immediately, then kill processes.
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
+                    crate::session::remove_session_id_file(&app.port_file_base());
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -2379,6 +2385,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = std::fs::remove_file(&old_keypath);
                             let _ = std::fs::write(&new_keypath, key);
                         }
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
                     }
                     app.session_name = name;
                     // Update env so run-shell/hooks from this server target the new name
@@ -2405,6 +2414,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = std::fs::remove_file(&old_keypath);
                             let _ = std::fs::write(&new_keypath, key);
                         }
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
                     }
                     app.session_name = name;
                     // Warm server's created_at is the warm process start time, not the
@@ -3324,6 +3336,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3403,6 +3416,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3450,6 +3464,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {

@@ -741,10 +741,7 @@ impl AppState {
             run_shell_rx: None,
             run_shell_tx: None,
             session_name,
-            session_id: {
-                static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),

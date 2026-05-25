@@ -147,12 +147,22 @@ fn run_main() -> io::Result<()> {
     // PSMUX_TARGET_FULL stores the full target (session:window.pane) for the server
     if let Some(pos) = args.iter().position(|a| a == "-t") {
         if let Some(target) = args.get(pos + 1) {
-            // Store the full target for the server to parse
-            env::set_var("PSMUX_TARGET_FULL", target);
             // Extract just the session name for port file lookup
             let parsed_target = crate::cli::parse_target(target);
             let has_explicit_session = parsed_target.session.is_some();
             let session = parsed_target.session.unwrap_or_else(|| "default".to_string());
+            // Store the full target for the server to parse, with $N resolved
+            // to the actual session name so the server can look up port files.
+            let resolved_full = if target.starts_with('$') {
+                if let Some(colon_pos) = target.find(':') {
+                    format!("{}{}", session, &target[colon_pos..])
+                } else {
+                    session.clone()
+                }
+            } else {
+                target.to_string()
+            };
+            env::set_var("PSMUX_TARGET_FULL", &resolved_full);
             // Apply -L namespace prefix for port file lookup
             let port_file_base = if let Some(ref l) = l_socket_name {
                 format!("{}__{}", l, session)
@@ -1479,11 +1489,15 @@ fn run_main() -> io::Result<()> {
                     match cmd_args[i].as_str() {
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
+                                // Resolve $N session IDs via parse_target
+                                let resolved = crate::cli::parse_target(t)
+                                    .session
+                                    .unwrap_or_else(|| t.to_string());
                                 // Apply -L namespace prefix for port file lookup
                                 let namespaced = if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, t)
+                                    format!("{}__{}", l, resolved)
                                 } else {
-                                    t.to_string()
+                                    resolved
                                 };
                                 target = Some(namespaced);
                                 i += 1;
