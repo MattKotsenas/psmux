@@ -107,42 +107,106 @@ pub fn resolve_session_by_id(id: usize) -> Option<String> {
     None
 }
 
-/// Clean up any stale port files (where server is not actually running)
+/// Clean up any stale port files (where server is not actually running).
+///
+/// Called at the start of every CLI invocation to remove `.port` files left
+/// behind by servers that crashed without going through the normal shutdown
+/// paths (which delete their own files).
+///
+/// **Race avoidance**: this function runs in every CLI process simultaneously
+/// and can race with port files being freshly written by ClaimSession (warm
+/// → real-session rename) or by a server startup that hasn't finished
+/// initialising its accept loop. To avoid deleting live servers' port files:
+///
+/// 1. Skip port files whose mtime is within `FRESH_PORT_FILE_SECS` of now.
+///    A port file written milliseconds ago is almost certainly being
+///    initialised, even if the TCP accept queue isn't ready yet.
+///
+/// 2. For older files, use a `STALE_PROBE_TIMEOUT` long enough that a healthy
+///    server under transient OS-level contention still responds. A 5ms
+///    timeout on localhost was previously used here and falsely flagged
+///    live servers as stale under sub-millisecond CPU contention.
 pub fn cleanup_stale_port_files() {
+    /// Skip cleanup for port files written in the last 30 seconds. The
+    /// largest single-file write/connect race observed in practice is well
+    /// under a second, so 30s leaves plenty of headroom even on a slow box.
+    const FRESH_PORT_FILE_SECS: u64 = 30;
+    /// TCP connect timeout for probing whether a port file's server is alive.
+    /// Localhost connect is normally sub-millisecond, but Windows TCP can
+    /// spike to tens of milliseconds under load. 500ms is comfortably above
+    /// the realistic worst case and still snappy from the user's perspective.
+    const STALE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
         Ok(h) => h,
         Err(_) => return,
     };
     let psmux_dir = format!("{}\\.psmux", home);
-    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "port").unwrap_or(false) {
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(5)
-                        ).is_err() {
-                            let _ = std::fs::remove_file(&path);
-                            // Also remove the matching .key and .sid files
-                            let key_path = path.with_extension("key");
-                            let _ = std::fs::remove_file(&key_path);
-                            let sid_path = path.with_extension("sid");
-                            let _ = std::fs::remove_file(&sid_path);
+    let entries = match std::fs::read_dir(&psmux_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "port").unwrap_or(false) {
+            // Skip files modified recently — they were almost certainly
+            // just written by an in-flight server startup or ClaimSession.
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(age) = now.duration_since(modified) {
+                        if age.as_secs() < FRESH_PORT_FILE_SECS {
+                            continue;
                         }
                     } else {
+                        continue;
+                    }
+                }
+            }
+            if let Ok(port_str) = std::fs::read_to_string(&path) {
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    let addr = format!("127.0.0.1:{}", port);
+                    if std::net::TcpStream::connect_timeout(
+                        &addr.parse().unwrap(),
+                        STALE_PROBE_TIMEOUT,
+                    ).is_err() {
                         let _ = std::fs::remove_file(&path);
+                        // Also remove the matching .key and .sid files
                         let key_path = path.with_extension("key");
                         let _ = std::fs::remove_file(&key_path);
                         let sid_path = path.with_extension("sid");
                         let _ = std::fs::remove_file(&sid_path);
                     }
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                    let key_path = path.with_extension("key");
+                    let _ = std::fs::remove_file(&key_path);
+                    let sid_path = path.with_extension("sid");
+                    let _ = std::fs::remove_file(&sid_path);
                 }
             }
         }
     }
+}
+
+/// Returns `true` if the given port file was modified within `threshold_secs`.
+///
+/// Used by stale-port checks (list-sessions, has-session, etc.) to avoid
+/// deleting freshly-written port files when a single TCP probe fails due to
+/// a transient OS condition such as Windows WSAEADDRINUSE 10048. A server
+/// that wrote its port file moments ago is overwhelmingly likely to still
+/// be alive even if a localhost connect briefly fails.
+///
+/// Returns `false` for nonexistent files, unreadable metadata, mtime in the
+/// future, or mtime older than the threshold.
+pub fn is_fresh_port_file(path: &std::path::Path, threshold_secs: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false; };
+    let Ok(modified) = meta.modified() else { return false; };
+    let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+        // mtime in the future — treat as fresh
+        return true;
+    };
+    age.as_secs() < threshold_secs
 }
 
 /// Read the session key from the key file
@@ -424,7 +488,31 @@ pub fn send_control(line: String) -> io::Result<()> {
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))?;
+    // Retry connect to absorb Windows TCP transients: WSAEADDRINUSE from
+    // local-ephemeral-port reuse when the same server port was just
+    // connected to and the previous tuple is in TIME_WAIT. The server
+    // itself is local and binds quickly; a real "no server" condition will
+    // fail every attempt and surface to the user as a real error after the
+    // budget is exhausted.
+    let mut stream = {
+        let mut last_err: Option<io::Error> = None;
+        let mut out = None;
+        for attempt in 0..24u32 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+                Ok(s) => { out = Some(s); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 23 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        match out {
+            Some(s) => s,
+            None => return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "connect failed"))),
+        }
+    };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let _ = write!(stream, "AUTH {}\n", session_key);
@@ -454,7 +542,27 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(&addr)?;
+    let addr_sock: std::net::SocketAddr = addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad addr: {e}")))?;
+    // Retry connect to absorb Windows TCP transients (see send_control).
+    let mut stream = {
+        let mut last_err: Option<io::Error> = None;
+        let mut out = None;
+        for attempt in 0..24u32 {
+            match std::net::TcpStream::connect_timeout(&addr_sock, Duration::from_millis(300)) {
+                Ok(s) => { out = Some(s); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 23 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        match out {
+            Some(s) => s,
+            None => return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "connect failed"))),
+        }
+    };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = write!(stream, "AUTH {}\n", session_key);

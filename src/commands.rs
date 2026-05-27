@@ -2071,8 +2071,11 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         }
                     }
                 }
-                // Stale port file, remove it
-                let _ = std::fs::remove_file(&port_path);
+                // Stale port file, remove it — but skip if it's fresh
+                // (transient WSAEADDRINUSE on a healthy server's listener).
+                if !crate::session::is_fresh_port_file(std::path::Path::new(&port_path), 5) {
+                    let _ = std::fs::remove_file(&port_path);
+                }
             }
 
             // Try to claim a warm server first (fast path)
