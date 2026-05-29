@@ -134,6 +134,20 @@ pub struct Screen {
     /// terminal (Windows Terminal, etc.).
     osc52_clipboard: Option<(Vec<u8>, Vec<u8>)>,
 
+    /// Currently-running command as announced by the shell via shell-integration
+    /// OSC sequences (issue #299). `None` when the shell is idle (at the prompt)
+    /// or hasn't emitted any command-identity sequence. `Some(<cmd>)` when:
+    ///
+    ///   * OSC 133;C;cmdline=<...>     (kitty bash/zsh) — stored verbatim
+    ///   * OSC 133;C;cmdline_url=<...> (kitty fish)     — URL-decoded
+    ///   * OSC 1337;SetUserVar=WEZTERM_PROG=<b64> (WezTerm) — base64-decoded
+    ///   * OSC 633;E;<cmd>[;<nonce>]   (VS Code script) — command segment only
+    ///
+    /// Cleared on OSC 133;A (prompt start) and OSC 133;D (command done).
+    /// Bare OSC 133;C (no cmdline= param) leaves the value alone so a prior
+    /// SetUserVar/633;E can "latch" via the subsequent C marker.
+    osc_shell_command: Option<String>,
+
     /// Set to `true` when the screen is cleared (CSI 2J) while
     /// `squelch_clear_pending` is active.  The layout serialiser
     /// checks this flag to know that `cls` has finished.
@@ -186,6 +200,7 @@ impl Screen {
             osc7_path: None,
             osc94_progress: None,
             osc52_clipboard: None,
+            osc_shell_command: None,
             squelch_cleared: false,
             squelch_clear_pending: false,
             audible_bell_count: 0,
@@ -812,6 +827,27 @@ impl Screen {
         self.osc52_clipboard
             .as_ref()
             .map(|(s, d)| (s.as_slice(), d.as_slice()))
+    }
+
+    /// Returns the most recently captured shell-integration command identity,
+    /// if any. Set by OSC 133;C with `cmdline=` / `cmdline_url=` parameters,
+    /// by OSC 1337;SetUserVar=WEZTERM_PROG, or by OSC 633;E. Cleared by
+    /// OSC 133;A (prompt start) and OSC 133;D (command done).
+    ///
+    /// See [`Screen::osc_shell_command`] field doc for the full protocol.
+    /// This is the authoritative signal for #{pane_current_command} when
+    /// shell integration is enabled; consumers fall back to a process-tree
+    /// heuristic when this returns `None`.
+    #[must_use]
+    pub fn shell_command(&self) -> Option<&str> {
+        self.osc_shell_command.as_deref()
+    }
+
+    /// Set the shell-integration command. Pass `Some(cmd)` to mark a command
+    /// as starting (used by OSC 133;C with parameter, OSC 1337;SetUserVar,
+    /// OSC 633;E). Pass `None` to clear (used by OSC 133;A, OSC 133;D).
+    pub(crate) fn set_shell_command(&mut self, cmd: Option<String>) {
+        self.osc_shell_command = cmd;
     }
 
     /// Returns `true` if a screen clear (CSI 2J) was detected while

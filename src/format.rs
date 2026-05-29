@@ -1167,7 +1167,17 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
         "pane_current_command" => {
             if let Some(p) = target_pane() {
+                // Layers 1-3: shell-integration OSC sources (issue #299).
+                // When the shell emits OSC 133;C;cmdline_url= / cmdline=,
+                // OSC 1337;SetUserVar=WEZTERM_PROG, or OSC 633;E, this is
+                // the authoritative signal for what's running.
+                if let Ok(parser) = p.term.lock() {
+                    if let Some(cmd) = parser.screen().shell_command() {
+                        return cmd.to_string();
+                    }
+                }
                 if let Some(pid) = p.child_pid {
+                    // Layers 4-5: upstream process-tree heuristic + shell binary fallback.
                     crate::platform::process_info::get_foreground_process_name(pid)
                         .or_else(|| crate::platform::process_info::get_process_name(pid))
                         .unwrap_or_else(|| "shell".into())
