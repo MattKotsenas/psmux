@@ -569,6 +569,17 @@ fn run_main() -> io::Result<()> {
                                                     println!("{}", display_name); 
                                                 }
                                             } else {
+                                                // Connect failed: only treat as stale if the
+                                                // port file is old enough that we're confident
+                                                // the server is dead, not just hit by a
+                                                // transient (e.g. Windows WSAEADDRINUSE 10048
+                                                // on a freshly-written port file). Fresh files
+                                                // are almost always live servers — skip them
+                                                // and let a later invocation clean up if the
+                                                // file is still around.
+                                                if crate::session::is_fresh_port_file(&e.path(), 5) {
+                                                    continue;
+                                                }
                                                 // stale port file - remove it along with matching key
                                                 let _ = std::fs::remove_file(e.path());
                                                 let key_path = e.path().with_extension("key");
@@ -814,14 +825,32 @@ fn run_main() -> io::Result<()> {
                             std::process::exit(1);
                         }
                     } else {
-                        // Stale port file - remove it and continue
-                        let _ = std::fs::remove_file(&port_path);
+                        // Stale port file - remove it and continue.
+                        // Guard against transient connect failures on fresh
+                        // files (Windows WSAEADDRINUSE) — if the port file
+                        // was just written, the server is almost certainly
+                        // alive and we should not destroy its registration.
+                        let pp = std::path::Path::new(&port_path);
+                        if crate::session::is_fresh_port_file(pp, 5) {
+                            // Treat as duplicate so we don't trample the fresh server
+                            if attach_if_exists {
+                                env::set_var("PSMUX_SESSION_NAME", &port_file_base);
+                                env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                            } else {
+                                eprintln!("duplicate session: {}", name);
+                                std::process::exit(1);
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&port_path);
+                        }
                     }
                 }
                 
                 // If -A attached to an existing session, skip server creation
+                let claimed_warm: bool;
                 if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() == Some("1") {
                     // Already set up for attach — skip server spawn
+                    claimed_warm = false;
                 } else {
                 // Fast path: try to claim a pre-spawned warm server.
                 // The warm server has config loaded and shell already running,
@@ -833,7 +862,7 @@ fn run_main() -> io::Result<()> {
                 let warm_disabled = std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
                     || crate::config::is_warm_disabled_by_config();
                 let has_custom_config = f_config_file.is_some() || std::env::var("PSMUX_CONFIG_FILE").is_ok();
-                let claimed_warm = if !warm_disabled && !has_custom_config && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && env_vars.is_empty() {
+                let claimed_warm_inner = if !warm_disabled && !has_custom_config && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && env_vars.is_empty() {
                     let warm_base = if let Some(ref l) = l_socket_name {
                         format!("{}____warm__", l)
                     } else {
@@ -893,6 +922,7 @@ fn run_main() -> io::Result<()> {
                         } else { false }
                     } else { false }
                 } else { false };
+                claimed_warm = claimed_warm_inner;
 
                 if !claimed_warm {
                 // Cold path: spawn a background server from scratch
@@ -994,23 +1024,64 @@ fn run_main() -> io::Result<()> {
 
                 // Verify the server is actually alive — the TCP listener is
                 // already active when the port file appears (we moved file write
-                // before create_window), so this connect should succeed instantly.
+                // before create_window), so this connect should succeed quickly.
+                //
+                // We skip this check entirely when we just claimed a warm server:
+                // claim-session already succeeded over TCP, so the listener is
+                // demonstrably alive and probing again is pure overhead — and
+                // worse, the probe can spuriously fail under Windows TCP
+                // transients (e.g. WSAEADDRINUSE from local-port reuse) and
+                // delete a perfectly healthy port file. See issue: detached
+                // sessions failing with "no server running" / "exited
+                // immediately" after rapid new-session + new-window sequences.
                 if !std::path::Path::new(&port_path).exists() {
                     eprintln!("psmux: failed to create session '{}'", name);
                     std::process::exit(1);
                 }
-                {
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
+                if !claimed_warm {
+                    // Cold-spawned server — verify it bound the listener.
+                    // Retry generously: a fresh connect_timeout occasionally
+                    // fails with WSAEADDRINUSE on Windows when the OS picks
+                    // a local ephemeral port that collides with a TIME_WAIT
+                    // entry from a previous connection to a recycled server
+                    // port. That's a transient OS condition, not a dead
+                    // server, so a long retry loop avoids false positives.
+                    //
+                    // After retries are exhausted, fall back to a port-file
+                    // existence check. The server's panic hook removes its
+                    // own port file on crash, and the normal exit paths
+                    // (KillServer, exit_empty, etc.) do the same, so a
+                    // persistent port file is a stronger signal of liveness
+                    // than a successful connect (which can spuriously fail
+                    // under WSAEADDRINUSE).
+                    let server_alive = (|| {
+                        let Ok(port_str) = std::fs::read_to_string(&port_path) else { return false; };
+                        let Ok(port) = port_str.trim().parse::<u16>() else { return false; };
+                        let addr: std::net::SocketAddr = match format!("127.0.0.1:{}", port).parse() {
+                            Ok(a) => a,
+                            Err(_) => return false,
+                        };
+                        for attempt in 0..24u32 {
+                            match std::net::TcpStream::connect_timeout(
+                                &addr,
+                                Duration::from_millis(300),
+                            ) {
+                                Ok(_) => return true,
+                                Err(_) => {
+                                    if attempt < 23 {
+                                        std::thread::sleep(Duration::from_millis(100));
+                                    }
+                                }
+                            }
+                        }
+                        // Retries exhausted. Trust the port file: if it's
+                        // still here, the server hasn't crashed/exited.
+                        std::path::Path::new(&port_path).exists()
+                    })();
                     if !server_alive {
-                        let _ = std::fs::remove_file(&port_path);
+                        // Server actually died: port file is gone (removed
+                        // by the server's own panic hook or exit path) or
+                        // unreadable. Nothing for us to clean up.
                         eprintln!("psmux: session '{}' exited immediately (check shell command)", name);
                         std::process::exit(1);
                     }
@@ -1807,8 +1878,12 @@ fn run_main() -> io::Result<()> {
                             // Fallback: connection succeeded so session likely exists
                             std::process::exit(0);
                         } else {
-                            // Stale port file - clean it up
-                            let _ = std::fs::remove_file(&path);
+                            // Connect failed: only treat as truly stale if the
+                            // port file is old. Fresh files are likely live
+                            // servers hit by a transient (WSAEADDRINUSE).
+                            if !crate::session::is_fresh_port_file(std::path::Path::new(&path), 5) {
+                                let _ = std::fs::remove_file(&path);
+                            }
                         }
                     }
                 }
