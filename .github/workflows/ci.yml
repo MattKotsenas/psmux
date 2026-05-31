@@ -64,4 +64,4 @@ jobs:
         run: |
           $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
           $env:PSMUX_EXE = $exe
-          .\tests\test_smoke_pr.ps1
+          .\tests\run_smoke_integration.ps1
