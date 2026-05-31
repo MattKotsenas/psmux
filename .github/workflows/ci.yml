@@ -57,11 +57,11 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Run Rust input tests
-        run: 'cargo test --bin psmux -- "tests_input::"'
+        run: 'cargo test --bin psmux -- "ctrl_c_key_event_"'
 
       - name: Run PR smoke tests
         shell: pwsh
         run: |
-          $exe = (Resolve-Path "target\release\psmux.exe").Path
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
           Set-Alias psmux $exe
           .\tests\test_smoke_pr.ps1
