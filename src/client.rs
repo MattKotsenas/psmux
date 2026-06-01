@@ -15,7 +15,7 @@ use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_r
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
-use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
+use crate::debug_log::{client_log, client_log_enabled, heartbeat, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
 
@@ -1701,6 +1701,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // actually changes (avoids resetting WT's blink timer every frame).
     let mut last_cursor_style: u8 = 255;
     loop {
+        heartbeat("loop:start");
         // ── Poll background reconnect result (non-blocking) ──────────────────
         // If a background reconnect thread has finished, apply its result here
         // before any other step so the rest of the loop sees the fresh channels.
@@ -1962,6 +1963,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         }
 
         {
+            heartbeat("loop:input_poll");
             let mut _pending_evt = input.read_timeout(Duration::from_millis(poll_ms))?;
             while let Some(_cur_evt) = _pending_evt {
                 // Input debug: log every raw event BEFORE filtering
@@ -4181,6 +4183,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             if new_size != last_sent_size {
                 last_sent_size = new_size;
                 size_changed = true;
+                heartbeat("loop:write_size");
                 if writer.write_all(format!("client-size {} {}\n", new_size.0, new_size.1).as_bytes()).is_err() {
                     break; // Connection lost
                 }
@@ -4215,6 +4218,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
         if sent_keys_this_iter {
+            heartbeat("loop:write_cmds");
             if input_log_enabled() {
                 for cmd in &cmd_batch {
                     input_log("send", &format!("→ {}", cmd.trim()));
@@ -4250,6 +4254,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             false
         };
         if should_dump && !dump_in_flight {
+            heartbeat("loop:write_dump");
             if writer.write_all(b"dump-state\n").is_err() { break; }
             if writer.flush().is_err() { break; }
             dump_in_flight = true;
@@ -4534,6 +4539,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         }
         // Reset OSC 8 hyperlink runs collected during this frame's render (#361).
         frame_hyperlinks_clear();
+        heartbeat("loop:draw");
         terminal.draw(|f| {
             let area = f.area();
             let constraints = if status_at_top {
@@ -5714,11 +5720,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // Written AFTER terminal.draw() so it doesn't interfere with
         // ratatui's VT output buffer.
         if let Some(clip_text) = pending_osc52.take() {
+            heartbeat("loop:post_draw:osc52");
             crate::copy_mode::emit_osc52(&mut std::io::stdout(), &clip_text);
         }
 
         // ── Post-draw: emit audible bell ─────────────────────────────
         if pending_bell {
+            heartbeat("loop:post_draw:bell");
             pending_bell = false;
             let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -5733,6 +5741,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // terminal every frame.
         if host_title_this_frame != last_emitted_host_title {
             if let Some(ref title) = host_title_this_frame {
+                heartbeat("loop:post_draw:title");
                 use std::io::Write;
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(b"\x1b]0;");
@@ -5755,6 +5764,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         && s.bytes().all(|b| b.is_ascii_digit())
                         && v.bytes().all(|b| b.is_ascii_digit())
                     {
+                        heartbeat("loop:post_draw:progress");
                         use std::io::Write;
                         let mut out = std::io::stdout().lock();
                         let _ = out.write_all(b"\x1b]9;4;");
@@ -5773,6 +5783,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // ConPTY or terminal resize can silently disable mouse reporting.
         // Re-send every 30 seconds to keep mouse working reliably.
         if is_ssh_mode && last_mouse_enable.elapsed().as_secs() >= 30 {
+            heartbeat("loop:ssh_mouse_enable");
             crate::ssh_input::send_mouse_enable();
             last_mouse_enable = Instant::now();
         }
@@ -5835,6 +5846,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 let _ = write!(buf, "\x1b[{} q", effective);
             }
             if !buf.is_empty() {
+                heartbeat("loop:post_draw:cursor");
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(buf.as_bytes());
                 let _ = out.flush();
@@ -5845,6 +5857,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             // console window.
             if !is_ssh_mode {
                 if let Some((cx, cy)) = cursor_visible {
+                    heartbeat("loop:post_draw:caret");
                     crate::platform::caret::update(cx, cy);
                 }
             }

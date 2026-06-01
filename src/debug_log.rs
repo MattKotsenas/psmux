@@ -13,6 +13,7 @@
 //! | `PSMUX_SSH_DEBUG=1`    | `~/.psmux/ssh_input.log`          | SSH input handling (existing)        |
 //! | `PSMUX_LATENCY_LOG=1`  | `~/.psmux/latency.log`            | Keypress-to-render latency (existing)|
 //! | `PSMUX_SESSION_DEBUG=1`| `~/.psmux/session_debug.log`      | Session-registry stale-port cleanup  |
+//! | `PSMUX_HEARTBEAT_DEBUG=1` | `~/.psmux/heartbeat.log`       | Client main-loop step heartbeat - last line before a freeze pinpoints the stuck syscall |
 //!
 //! All loggers are:
 //! - **Off by default** — zero overhead when disabled (one atomic load per call)
@@ -276,4 +277,58 @@ pub fn session_log(component: &str, msg: &str) {
 /// Returns `true` if session-registry debug logging is active.
 pub fn session_log_enabled() -> bool {
     SESSION_LOG.lock().ok().map_or(false, |g| g.is_some())
+}
+
+// ─── Client main-loop heartbeat ─────────────────────────────────────────────
+
+/// Fast-path enable check so a disabled heartbeat costs only one atomic load
+/// per call site. The `LazyLock<bool>` reads `PSMUX_HEARTBEAT_DEBUG` exactly
+/// once on first access; subsequent accesses are a cached read.
+static HEARTBEAT_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_enabled("PSMUX_HEARTBEAT_DEBUG"));
+
+static HEARTBEAT_LOG: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| {
+    if !*HEARTBEAT_ENABLED { return Mutex::new(None); }
+    Mutex::new(open_log("heartbeat.log"))
+});
+
+static HEARTBEAT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Large cap - at ~12 markers per main-loop iteration and ~100 Hz when the
+/// user is typing, 100k entries gives ~80 s of context, plenty to capture
+/// a freeze and the iterations leading up to it.
+const HEARTBEAT_CAP: u32 = 100_000;
+
+/// Record a single main-loop step marker. No-op unless `PSMUX_HEARTBEAT_DEBUG=1`.
+///
+/// Each call writes `[HH:MM:SS.mmm] <step>` and flushes immediately, so the
+/// **last line in the log identifies the syscall the main thread was about
+/// to enter when it froze**. Pair with the existing client/input logs to
+/// correlate the freeze with frames/events around it.
+///
+/// Cost when disabled: one cached bool load + early return. Safe to sprinkle
+/// liberally in the main loop.
+#[inline]
+pub fn heartbeat(step: &str) {
+    if !*HEARTBEAT_ENABLED { return; }
+    let n = HEARTBEAT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= HEARTBEAT_CAP {
+        if n == HEARTBEAT_CAP {
+            if let Ok(mut guard) = HEARTBEAT_LOG.lock() {
+                if let Some(ref mut f) = *guard {
+                    let _ = writeln!(f, "[{}] --- heartbeat cap reached ({} entries) ---",
+                        chrono::Local::now().format("%H:%M:%S%.3f"), HEARTBEAT_CAP);
+                    let _ = f.flush();
+                }
+            }
+        }
+        return;
+    }
+    if let Ok(mut guard) = HEARTBEAT_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "[{}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"), step);
+            let _ = f.flush();
+        }
+    }
 }
