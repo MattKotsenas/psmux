@@ -1604,9 +1604,18 @@ match cmd {
             parts.join(" ")
         };
         // Pass target pane index for PANE_POS_OVERRIDE (#113).
-        let target_pane_idx: Option<usize> = if !pane_is_id { target_pane } else { None };
+        // Bare %N (pane_is_id=true) goes through DisplayMessageById which
+        // resolves the pane ID globally across windows (#332).
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_stdout, duration_ms));
+        if pane_is_id {
+            if let Some(pid) = target_pane {
+                let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_stdout, duration_ms));
+            } else {
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, None, !print_stdout, duration_ms));
+            }
+        } else {
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, !print_stdout, duration_ms));
+        }
         if let Ok(text) = rrx.recv() {
             if print_stdout {
                 if persistent {
@@ -2980,7 +2989,15 @@ fn dispatch_control_command(
             };
             let target_pane_idx = if pane_is_id { None } else { target_pane };
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+            if pane_is_id {
+                if let Some(pid) = target_pane {
+                    let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_mode, None));
+                } else {
+                    let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+                }
+            } else {
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+            }
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }

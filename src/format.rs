@@ -320,6 +320,21 @@ pub fn expand_format_for_pane(
     result
 }
 
+/// Like `expand_format_for_pane` but resolves the pane by its global ID
+/// (e.g. from a bare `%N` -t target). Falls back to the active pane if no
+/// pane with that id exists. (Issue #332.)
+pub fn expand_format_for_pane_by_id(
+    fmt: &str,
+    app: &AppState,
+    pane_id: usize,
+) -> String {
+    if let Some((win_idx, pos)) = crate::tree::find_pane_by_id_global(app, pane_id) {
+        expand_format_for_pane(fmt, app, win_idx, pos)
+    } else {
+        expand_format(fmt, app)
+    }
+}
+
 // ─────────────────── expression dispatcher ───────────────────────
 
 /// Expand a `#{...}` expression (the content between `#{` and `}`).

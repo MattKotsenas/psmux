@@ -1038,6 +1038,8 @@ pub enum CtrlReq {
     DeleteNamedBuffer(String),
     PasteBufferAt(usize),
     DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
+    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>),  // resp, format, pane_id, set_status_bar, duration_override_ms
     LastWindow,
     LastPane,
     RotateWindow(bool),

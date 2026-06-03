@@ -612,6 +612,19 @@ pub fn get_pane_position_in_window(node: &Node, target_id: usize) -> Option<usiz
     ids.iter().position(|&id| id == target_id)
 }
 
+/// Locate a pane by its global pane ID across every window in the app.
+/// Returns (window_index, pane_position_within_window) or None if no pane
+/// with that id exists. Used to make bare `%N` -t targets work for any
+/// command that operates on pane *position* internally (issue #332).
+pub fn find_pane_by_id_global(app: &AppState, pane_id: usize) -> Option<(usize, usize)> {
+    for (wi, w) in app.windows.iter().enumerate() {
+        if let Some(pos) = get_pane_position_in_window(&w.root, pane_id) {
+            return Some((wi, pos));
+        }
+    }
+    None
+}
+
 /// Get the Nth leaf pane (0-based positional index) from the tree.
 pub fn get_nth_pane(node: &Node, n: usize) -> Option<&Pane> {
     fn collect_panes<'a>(node: &'a Node, panes: &mut Vec<&'a Pane>) {

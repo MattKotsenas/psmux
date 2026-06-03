@@ -2627,6 +2627,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let _ = resp.send(result);
                 }
+                CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms) => {
+                    // Bare %N pane targeting (#332) — resolve the pane ID
+                    // globally across all windows and expand the format with
+                    // PANE_POS_OVERRIDE pointing at it.
+                    helpers::propagate_osc_titles(&mut app);
+                    let result = crate::format::expand_format_for_pane_by_id(&fmt, &app, pane_id);
+                    if set_status_bar {
+                        app.status_message = Some((result.clone(), Instant::now(), duration_ms));
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(result);
+                }
                 CtrlReq::LastWindow => {
                     if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
                         switch_with_copy_save(&mut app, |app| {
