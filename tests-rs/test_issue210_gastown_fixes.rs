@@ -196,7 +196,7 @@ fn prefix_defaults_d_is_detach_client() {
 #[test]
 fn prefix_defaults_x_is_kill_pane() {
     let action = find_in_defaults("x").expect("'x' missing from PREFIX_DEFAULTS");
-    assert_eq!(action, "kill-pane");
+    assert_eq!(action, "confirm-before -p 'kill-pane #P? (y/n)' kill-pane");
 }
 
 #[test]

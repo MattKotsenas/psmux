@@ -1,9 +1,14 @@
 use super::*;
 
+/// Serialize backpressure tests: push_frame broadcasts to ALL registered
+/// channels globally, so concurrent tests cross-contaminate each other.
+static BP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Proof that push_frame now delivers the newest frame when the channel is full.
 /// Previously (before PR #267 fix), the newest frame was silently dropped.
 #[test]
 fn push_frame_drops_newest_when_channel_full() {
+    let _guard = BP_TEST_LOCK.lock().unwrap();
     let client_id = u64::MAX - 9990;
     // Clean up any prior registration
     shutdown_client_stream(client_id);
@@ -36,6 +41,7 @@ fn push_frame_drops_newest_when_channel_full() {
 /// PR #267's original test: saturated frame queue delivers latest snapshot.
 #[test]
 fn push_frame_replaces_stale_backlog_when_full() {
+    let _guard = BP_TEST_LOCK.lock().unwrap();
     let client_id = u64::MAX - 246;
     shutdown_client_stream(client_id);
 

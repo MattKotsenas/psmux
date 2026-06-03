@@ -17,17 +17,18 @@ use crate::format::hostname_cached;
 /// real terminal keeps its user-configured default cursor.
 pub const CURSOR_SHAPE_UNSET: u8 = 255;
 
-/// Send a preemptive cursor-position report (\x1b[1;1R) to the ConPTY input pipe.
+/// Originally sent a preemptive cursor-position report (\x1b[1;1R) to the
+/// ConPTY input pipe at spawn time.  Disabled in issue #313: the ConPTY is
+/// created with `PSEUDOCONSOLE_WIN32_INPUT_MODE` which expects input sequences
+/// ending with `_`, not `R`.  The raw VT response confused the Win32 input
+/// parser, leaving it in a half-state that consumed the first user keystroke
+/// and triggered a PSReadLine bell on every freshly-attached pane.
 ///
-/// Windows ConPTY sends a Device Status Report (\x1b[6n]) during initialization
-/// and **blocks** until the host responds with a cursor-position report.  In
-/// portable-pty ≤0.2 this was handled internally, but 0.9+ exposes raw handles
-/// and the host must respond.  Writing the response preemptively (before the
-/// reader thread even starts) is safe because the data sits in the pipe buffer
-/// and ConPTY reads it when ready.
-pub fn conpty_preemptive_dsr_response(writer: &mut dyn std::io::Write) {
-    let _ = writer.write_all(b"\x1b[1;1R");
-    let _ = writer.flush();
+/// CPR queries from ConPTY (ESC\[6n) are now handled reactively by
+/// `scan_cpr_query` + `drain_cpr_pending`, which respond with the correct
+/// cursor position on demand.
+pub fn conpty_preemptive_dsr_response(_writer: &mut dyn std::io::Write) {
+    // no-op: reactive CPR responder handles all ESC[6n queries (#313)
 }
 
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
@@ -97,7 +98,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         }
         let epoch = std::time::Instant::now() - Duration::from_secs(2);
         let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-        let pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
+        let pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
         let win_name = default_shell_name(None, configured_shell);
         let initial_pane_id = wp.pane_id;
         app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![initial_pane_id], zoom_saved: None, linked_from: None });
@@ -169,7 +170,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None });
@@ -285,7 +286,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![raw_pane_id], zoom_saved: None, linked_from: None });
@@ -388,7 +389,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         }
         let epoch = std::time::Instant::now() - Duration::from_secs(2);
         let new_pane_id = wp.pane_id;
-        let new_leaf = Node::Leaf(Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring });
+        let new_leaf = Node::Leaf(Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring });
         let win = &mut app.windows[app.active_idx];
         replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
         let mut new_path = win.active_path.clone();
@@ -441,7 +442,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);

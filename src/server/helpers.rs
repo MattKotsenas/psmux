@@ -112,6 +112,14 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     if let Some(win) = app.windows.get(app.active_idx) {
         walk(&win.root, &mut v);
     }
+    // Include per-window status flags so non-active windows changing their
+    // bell/activity/silence state forces a frame emission. Without this, the
+    // status bar shows the bell or activity indicator only after some
+    // incidental repaint trigger like a mouse move or window switch (#162).
+    for (i, w) in app.windows.iter().enumerate() {
+        let bits = (w.bell_flag as u64) | ((w.activity_flag as u64) << 1) | ((w.silence_flag as u64) << 2);
+        v = v.wrapping_add(bits.wrapping_mul(0x50011).wrapping_add(i as u64));
+    }
     // Include mode discriminant so overlay state changes (PopupMode, MenuMode,
     // ConfirmMode, PaneChooser, ClockMode) always invalidate the cached version.
     // Without this, the NC optimization could return stale frames that lack
@@ -153,6 +161,14 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     v = v.wrapping_add((app.copy_scroll_offset as u64).wrapping_mul(0x20003));
     if let Some((ar, ac)) = app.copy_anchor {
         v = v.wrapping_add((ar as u64).wrapping_mul(0x30007).wrapping_add(ac as u64));
+    }
+    // Include status_message content so the search prompt refreshes per
+    // keystroke while the user is typing in copy-mode search (#335).
+    if let Some((ref msg, _, _)) = app.status_message {
+        v = v.wrapping_add((msg.len() as u64).wrapping_mul(0x40009));
+        if let Some(b) = msg.as_bytes().last() {
+            v = v.wrapping_add(*b as u64);
+        }
     }
     v
 }
@@ -285,6 +301,41 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
     }
     let parser = pane.term.lock().ok()?;
     parser.screen().progress()
+}
+
+/// Drain a pending OSC 52 clipboard payload from any pane in the tree.
+/// Returns the first `(selector, base64_data)` found and clears it on the
+/// source pane.  Lets a child process inside any pane (e.g. Claude Code's
+/// `/copy`) ask the host terminal to copy text — the dump-state builder
+/// stages the result onto `App.clipboard_osc52`, the client re-emits OSC
+/// 52 on its own stdout, and the host terminal performs the copy.
+pub(crate) fn take_pane_clipboard(app: &AppState) -> Option<(Vec<u8>, Vec<u8>)> {
+    for win in &app.windows {
+        if let Some(payload) = drain_clipboard_in_node(&win.root) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn drain_clipboard_in_node(node: &Node) -> Option<(Vec<u8>, Vec<u8>)> {
+    match node {
+        Node::Leaf(p) => {
+            if p.dead {
+                return None;
+            }
+            let mut parser = p.term.lock().ok()?;
+            parser.screen_mut().take_clipboard()
+        }
+        Node::Split { children, .. } => {
+            for c in children {
+                if let Some(r) = drain_clipboard_in_node(c) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+    }
 }
 
 fn propagate_osc_titles_in_tree(node: &mut Node, dirty: &mut bool) {

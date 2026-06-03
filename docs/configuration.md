@@ -104,7 +104,7 @@ psmux split-window -- "C:/Program Files/Git/bin/bash.exe"
 | `mouse` | Bool | `on` | Mouse support |
 | `mouse-selection` | Bool | `on` | psmux's client-side drag selection. Set `off` to let in-pane TUI apps (opencode, nvim, etc.) handle their own mouse selection without psmux drawing on top |
 | `scroll-enter-copy-mode` | Bool | `on` | Enter copy mode on mouse scroll (set `off` to disable) |
-| `pwsh-mouse-selection` | Bool | `off` | Windows 11 PowerShell-style word/line selection (double/triple-click) |
+| `pwsh-mouse-selection` | Bool | `off` | tmux-like release-copy selection with word/line multi-click and pane-clipped extraction |
 | `paste-detection` | Bool | `on` | Detect Ctrl+V paste from console host and send as bracketed paste (set `off` to let Ctrl+V reach child apps like neovim) |
 | `choose-tree-preview` | Bool | `off` | Open `choose-session` / `choose-tree` pickers with the live preview pane already visible (saves pressing `p`). See [preview.md](preview.md) |
 | `status` | Bool/Int | `on` | Show status bar (number = line count) |
@@ -249,10 +249,12 @@ set -g mouse off
 # Disable entering copy mode on mouse scroll
 set -g scroll-enter-copy-mode off
 
-# Enable Windows 11 PowerShell-style word/line selection
+# Enable tmux-like release-copy selection with pane clipping
 # Double-click selects a word, triple-click selects a line
 set -g pwsh-mouse-selection on
 ```
+
+When `pwsh-mouse-selection` is `on`, releasing a left-drag copies the selected text immediately and clears the transient highlight. Right-click copy and `Ctrl+Shift+C` still work as explicit copy actions.
 
 When `scroll-enter-copy-mode` is `off`, scrolling in a pane does not enter copy mode and instead passes scroll events directly to the running application.
 
@@ -282,7 +284,7 @@ What changes when `mouse-selection` is `off`:
 
 - psmux no longer draws its own selection rectangle on left-click drag
 - Right-click clipboard copy via psmux's selection is no longer triggered (selection never starts)
-- The Windows 11 style word/line multi-click (`pwsh-mouse-selection`) is suppressed too while `mouse-selection off` is in effect
+- The `pwsh-mouse-selection` word/line multi-click and release-copy behavior is suppressed too while `mouse-selection off` is in effect
 
 To restore the default behaviour:
 

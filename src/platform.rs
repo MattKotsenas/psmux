@@ -1118,16 +1118,17 @@ pub mod mouse_inject {
 
             log(&format!("GenerateConsoleCtrlEvent => ok={} err={}", ok, err));
 
+            // GenerateConsoleCtrlEvent dispatches asynchronously via a system
+            // thread pool.  Sleep while still attached so the signal has time
+            // to propagate through the console subsystem before we detach.
+            // psmux is protected by the preceding SetConsoleCtrlHandler(None, 1).
+            std::thread::sleep(std::time::Duration::from_millis(5));
+
             // Detach from the child's console BEFORE restoring Ctrl+C handling.
-            // GenerateConsoleCtrlEvent dispatches asynchronously via a new thread;
-            // if we restore the default handler while still attached, the async
+            // If we restore the default handler while still attached, the async
             // handler thread might terminate psmux.  Detaching first ensures the
             // event only targets processes that remain on the console.
             FreeConsole();
-
-            // Brief sleep to let the async CTRL_C_EVENT handler thread finish
-            // before we re-enable default handling.
-            std::thread::sleep(std::time::Duration::from_millis(5));
 
             // Restore default Ctrl+C handling now that we're detached
             SetConsoleCtrlHandler(None, 0);
@@ -1138,6 +1139,33 @@ pub mod mouse_inject {
 
             ok != 0
         }
+    }
+
+    pub fn char_to_vk(ch: char) -> u16 {
+        match ch {
+            '\x1b' => 0x1B,  // VK_ESCAPE — VkKeyScanW returns -1 for non-printable
+            '\r'   => 0x0D,  // VK_RETURN
+            _ => {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn VkKeyScanW(ch: u16) -> i16;
+                }
+                let mut buf = [0u16; 2];
+                let wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
+                let result = unsafe { VkKeyScanW(wch) };
+                if result == -1 { 0u16 } else { (result & 0xFF) as u16 }
+            }
+        }
+    }
+
+    /// Map a virtual key code to its scan code.
+    pub fn vk_to_scan(vk: u16) -> u16 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+        }
+        // MAPVK_VK_TO_VSC = 0
+        unsafe { MapVirtualKeyW(vk as u32, 0) as u16 }
     }
 
     /// Inject a modified key event into a child process's console input buffer.
@@ -1151,13 +1179,9 @@ pub mod mouse_inject {
     /// them as separate key events.  Similarly, Ctrl+Alt+key written as
     /// ESC + control-char is not reassembled.
     ///
-    /// For Ctrl+key: `u_char` = control character (ch & 0x1F), matching the
-    /// Windows console convention.  For Alt+key: `u_char` = the plain char.
-    /// For Ctrl+Alt: `u_char` = control character.
-    ///
+    /// For Ctrl+key: `u_char` = control character (ch & 0x1F); for Alt+key:
+    /// `u_char` = the plain char; for Ctrl+Alt: `u_char` = control character.
     /// Sends both key-down and key-up events for proper event pairing.
-    ///
-    /// Convenience wrapper: `send_alt_key_event` calls this with ctrl=false, alt=true, shift=false.
     pub fn send_modified_key_event(child_pid: u32, ch: char, ctrl: bool, alt: bool, shift: bool) -> bool {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
@@ -1213,46 +1237,22 @@ pub mod mouse_inject {
                 event: KEY_EVENT_RECORD,
             }
 
-            #[link(name = "user32")]
-            extern "system" {
-                fn VkKeyScanW(ch: u16) -> i16;
-                fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
-            }
-
             // Build control_key_state flags (matching Windows Terminal convention)
             let mut flags: u32 = 0;
             if ctrl { flags |= LEFT_CTRL_PRESSED; }
             if alt  { flags |= LEFT_ALT_PRESSED; }
             if shift { flags |= SHIFT_PRESSED; }
 
-            // Determine the character to send:
-            // - Ctrl+key: u_char = control character (ch & 0x1F)
-            // - Alt+key: u_char = plain character
-            // - Ctrl+Alt+key: u_char = control character
-            // - Shift+key: u_char = uppercase/shifted character
-            let base_char = if shift && !ctrl {
-                ch.to_ascii_uppercase()
-            } else {
-                ch
-            };
-
+            let base_char = if shift && !ctrl { ch.to_ascii_uppercase() } else { ch };
             let u_char_value: u16 = if ctrl {
-                // Control character: letter & 0x1F
                 (base_char.to_ascii_lowercase() as u16) & 0x1F
             } else {
                 let mut buf = [0u16; 2];
-                let encoded = base_char.encode_utf16(&mut buf);
-                encoded[0]
+                base_char.encode_utf16(&mut buf)[0]
             };
 
-            // VK code is always the unmodified letter key
-            let mut buf = [0u16; 2];
-            let plain_wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
-            let vk_result = VkKeyScanW(plain_wch);
-            let vk = if vk_result == -1 { 0u16 } else { (vk_result & 0xFF) as u16 };
-
-            // MAPVK_VK_TO_VSC = 0
-            let scan = MapVirtualKeyW(vk as u32, 0) as u16;
+            let vk = char_to_vk(ch);
+            let scan = vk_to_scan(vk);
 
             let records = [
                 KEY_INPUT_RECORD {
@@ -1443,6 +1443,8 @@ pub mod mouse_inject {
     pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
     pub fn send_alt_key_event(_pid: u32, _ch: char) -> bool { false }
     pub fn send_modified_enter_event(_pid: u32, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
+    pub fn char_to_vk(_ch: char) -> u16 { 0 }
+    pub fn vk_to_scan(_vk: u16) -> u16 { 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1922,12 +1924,28 @@ pub mod process_info {
         )
     }
 
+    /// Known shell/wrapper executables where the meaningful foreground
+    /// command is one level deeper (e.g. `cmd /c foo`, `bash -c foo`,
+    /// `npx tool`).  When the immediate child is one of these, we look
+    /// at *its* immediate child instead.
+    fn is_wrapper_exe(name: &str) -> bool {
+        let stem = name.strip_suffix(".exe").unwrap_or(name);
+        matches!(stem,
+            "cmd" | "bash" | "sh" | "dash" | "zsh" | "fish"
+            | "npx" | "npm" | "pnpm" | "yarn" | "bunx"
+            | "env" | "sudo" | "runas"
+        )
+    }
+
     /// Walk the process tree from `root_pid` downward and return the PID of
     /// the process most likely to be the user's foreground command.
     ///
-    /// Strategy: BFS all descendants, then pick the deepest non-system leaf.
-    /// When multiple candidates exist at the same depth, prefer the largest
-    /// PID (heuristic for "most recently created").
+    /// Strategy: pick the immediate non-system child of `root_pid`.  This
+    /// matches tmux's effective behaviour (`tcgetpgrp` returns the process
+    /// that took TTY foreground, which is the program the user launched from
+    /// the shell).  For known wrapper processes (cmd, bash, npx, ...) we
+    /// look one level deeper so the meaningful program is returned instead
+    /// of the wrapper.
     fn find_foreground_child_pid(root_pid: u32) -> Option<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1953,74 +1971,51 @@ pub mod process_info {
 
             autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
 
-            // Log direct children of root_pid
-            let direct: Vec<_> = entries.iter()
-                .filter(|(_, ppid, _)| *ppid == root_pid)
+            // Immediate children of root_pid, skipping system processes.
+            let direct: Vec<(u32, String)> = entries.iter()
+                .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
+                .map(|(pid, _, name)| (*pid, name.clone()))
                 .collect();
-            for (pid, _, name) in &direct {
+
+            for (pid, name) in &direct {
                 autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
             }
 
-            // BFS: collect all descendants with their depth.
-            // Each entry is (pid, exe_name, depth).
-            let mut descendants: Vec<(u32, String, u32)> = Vec::new();
-            let mut queue: Vec<(u32, u32)> = vec![(root_pid, 0)]; // (pid, depth)
-            let mut head = 0;
-            while head < queue.len() {
-                let (parent, depth) = queue[head];
-                head += 1;
-                for (pid, ppid, name) in &entries {
-                    if *ppid == parent && *pid != root_pid
-                        && !descendants.iter().any(|(p, _, _)| p == pid)
-                    {
-                        descendants.push((*pid, name.clone(), depth + 1));
-                        queue.push((*pid, depth + 1));
-                    }
-                }
-            }
-
-            autorename_log(&format!("root={} descendants={}", root_pid, descendants.len()));
-            for (pid, name, depth) in &descendants {
-                autorename_log(&format!("  desc: pid={} name={} depth={}", pid, name, depth));
-            }
-
-            if descendants.is_empty() {
+            if direct.is_empty() {
+                autorename_log(&format!("root={} no_direct_children", root_pid));
                 return None;
             }
 
-            // A "leaf" is a descendant that has no children in our descendant set.
-            let desc_pids: std::collections::HashSet<u32> =
-                descendants.iter().map(|(p, _, _)| *p).collect();
-            let leaves: Vec<(u32, &str, u32)> = descendants.iter()
-                .filter(|(pid, _, _)| {
-                    // No entry in the process table has this pid as parent
-                    // while also being in our descendant set.
-                    !entries.iter().any(|(ep, eppid, _)| *eppid == *pid && desc_pids.contains(ep))
-                })
-                .map(|(pid, name, depth)| (*pid, name.as_str(), *depth))
-                .collect();
+            // Pick the immediate child.  When multiple exist, prefer the
+            // largest PID (most recently created).
+            let (mut chosen_pid, chosen_name) = direct.iter()
+                .max_by_key(|(pid, _)| *pid)
+                .map(|(pid, name)| (*pid, name.clone()))
+                .unwrap();
 
-            // Choose from leaves if available, otherwise from all descendants.
-            let pool: Vec<(u32, &str, u32)> = if !leaves.is_empty() {
-                leaves
-            } else {
-                descendants.iter().map(|(p, n, d)| (*p, n.as_str(), *d)).collect()
-            };
+            autorename_log(&format!("root={} immediate_child={} name={}", root_pid, chosen_pid, chosen_name));
 
-            // Prefer non-system candidates.
-            let user_pool: Vec<&(u32, &str, u32)> = pool.iter()
-                .filter(|(_, name, _)| !is_system_exe(name))
-                .collect();
+            // If the immediate child is a known wrapper (cmd, bash, npx, ...),
+            // look one level deeper for the real program.
+            if is_wrapper_exe(&chosen_name) {
+                let grandchildren: Vec<(u32, String)> = entries.iter()
+                    .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
+                    .map(|(pid, _, name)| (*pid, name.clone()))
+                    .collect();
 
-            let selection = if !user_pool.is_empty() { user_pool } else { pool.iter().collect() };
+                if let Some((gc_pid, gc_name)) = grandchildren.iter()
+                    .max_by_key(|(pid, _)| *pid)
+                {
+                    autorename_log(&format!(
+                        "root={} wrapper={} skip_to_grandchild={} name={}",
+                        root_pid, chosen_name, gc_pid, gc_name
+                    ));
+                    chosen_pid = *gc_pid;
+                }
+            }
 
-            // Deepest first, then largest PID as tiebreaker.
-            let result = selection.iter()
-                .max_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
-                .map(|(pid, _, _)| *pid);
-
-            autorename_log(&format!("root={} selected={:?}", root_pid, result));
-            result
+            autorename_log(&format!("root={} selected={}", root_pid, chosen_pid));
+            Some(chosen_pid)
         }
     }
 
@@ -2489,3 +2484,8 @@ pub fn ime_restore() {
 #[cfg(windows)]
 #[path = "../tests-rs/test_issue265_argv_backslash.rs"]
 mod tests_issue265_argv_backslash;
+
+#[cfg(test)]
+#[cfg(windows)]
+#[path = "../tests-rs/test_char_to_vk.rs"]
+mod tests_char_to_vk;

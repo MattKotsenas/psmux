@@ -425,8 +425,9 @@ For more information: https://github.com/psmux/psmux
 }
 
 pub fn print_version() {
-    let prog = get_program_name();
-    println!("{} {}", prog, VERSION);
+    // Always print "tmux <version>" for compatibility with tools like
+    // libtmux/tmuxp that parse the "tmux " prefix from `-V` output.
+    println!("tmux {}", VERSION);
 }
 
 pub fn print_commands() {
@@ -532,12 +533,19 @@ pub fn parse_target(target: &str) -> ParsedTarget {
         }
         return result;
     }
-    // $N is a tmux session ID (e.g., "$0"). In psmux each server process
-    // hosts exactly one session (always id 0), so session IDs are not
-    // meaningful for routing. Treat "$N" as "current session" by leaving
-    // session = None (the caller will fall through to the default session).
-    if target.starts_with('$') && target[1..].parse::<usize>().is_ok() {
-        return result;
+    // $N is a tmux session ID (e.g., "$0"). Resolve it to the actual
+    // session name by looking up the .sid file that maps this ID.
+    if target.starts_with('$') {
+        if let Ok(id) = target[1..].parse::<usize>() {
+            // Set session to the resolved name, or to the literal "$N"
+            // (which won't match any real session) so callers don't
+            // fall through to "most recent session" for invalid IDs.
+            result.session = Some(
+                crate::session::resolve_session_by_id(id)
+                    .unwrap_or_else(|| target.to_string())
+            );
+            return result;
+        }
     }
     
     let (session_part, window_pane_part) = if let Some(colon_pos) = target.find(':') {
@@ -545,9 +553,14 @@ pub fn parse_target(target: &str) -> ParsedTarget {
             None
         } else {
             let s = &target[..colon_pos];
-            // $N session IDs (e.g. "$0:1") — ignore the session part
-            if s.starts_with('$') && s[1..].parse::<usize>().is_ok() {
-                None
+            // $N session IDs (e.g. "$0:1") — resolve to session name
+            if s.starts_with('$') {
+                if let Ok(id) = s[1..].parse::<usize>() {
+                    Some(crate::session::resolve_session_by_id(id)
+                        .unwrap_or_else(|| s.to_string()))
+                } else {
+                    Some(s.to_string())
+                }
             } else {
                 Some(s.to_string())
             }

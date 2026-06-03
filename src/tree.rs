@@ -266,11 +266,11 @@ pub fn resize_all_panes(app: &mut AppState) {
                     let inner_width = rect.width.max(crate::pane::MIN_PANE_DIM);
                     
                     if pane.last_rows != inner_height || pane.last_cols != inner_width {
-                        let _ = pane.master.resize(portable_pty::PtySize { 
-                            rows: inner_height, 
-                            cols: inner_width, 
-                            pixel_width: 0, 
-                            pixel_height: 0 
+                        let _ = pane.master.resize(portable_pty::PtySize {
+                            rows: inner_height,
+                            cols: inner_width,
+                            pixel_width: 0,
+                            pixel_height: 0
                         });
                         if let Ok(mut parser) = pane.term.lock() {
                             parser.screen_mut().set_size(inner_height, inner_width);
@@ -297,6 +297,18 @@ pub fn resize_all_panes(app: &mut AppState) {
         let win = &mut app.windows[app.active_idx];
         let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
         compute_rects(&win.root, area, &mut rects);
+        // When the window is zoomed, split_with_gaps still subtracts the
+        // separator gap (1 px) AND the minimum-size steal (1 px) from the
+        // visible pane, making it 2 rows/cols shorter than the full viewport.
+        // The client renders the zoomed pane using the full area, so the PTY
+        // must also be sized to the full area — otherwise the bottom/right
+        // edge shows blank rows/columns.
+        if win.zoom_saved.is_some() {
+            let active_path = win.active_path.clone();
+            if let Some((_, rect)) = rects.iter_mut().find(|(p, _)| *p == active_path) {
+                *rect = area;
+            }
+        }
         let mut path = Vec::new();
         resize_node(&mut win.root, &rects, &mut path, border_status_rows);
     }
@@ -610,6 +622,19 @@ pub fn get_pane_position_in_window(node: &Node, target_id: usize) -> Option<usiz
     let mut ids = Vec::new();
     collect_ids(node, &mut ids);
     ids.iter().position(|&id| id == target_id)
+}
+
+/// Locate a pane by its global pane ID across every window in the app.
+/// Returns (window_index, pane_position_within_window) or None if no pane
+/// with that id exists. Used to make bare `%N` -t targets work for any
+/// command that operates on pane *position* internally (issue #332).
+pub fn find_pane_by_id_global(app: &AppState, pane_id: usize) -> Option<(usize, usize)> {
+    for (wi, w) in app.windows.iter().enumerate() {
+        if let Some(pos) = get_pane_position_in_window(&w.root, pane_id) {
+            return Some((wi, pos));
+        }
+    }
+    None
 }
 
 /// Get the Nth leaf pane (0-based positional index) from the tree.

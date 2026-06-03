@@ -310,6 +310,61 @@ In addition to the 83 standard tmux commands, psmux provides extra commands usef
 | `set-pane-title <title>` | Set pane title directly |
 | `toggle-sync` | Toggle synchronized input for all panes in a window |
 
+### Text-input route signal (`#{pane_last_text_input}`)
+
+A read-only format variable: **milliseconds since printable text last reached
+this pane via the interactive input route** (empty until the first one).
+
+```powershell
+psmux display-message -t dev -p '#{pane_last_text_input}'   # e.g. "740", or "" if none yet
+```
+
+It is a **route** signal, not human-presence detection. The contract:
+
+- **Interactive route** (`handle_key -> forward_key_to_active`) **updates** it.
+- **Injected route** (`send-keys` / `send-paste` / `send-text` ->
+  `send_text_to_active`) does **not** update it. App output never does either,
+  so it distinguishes interactive text from injected text — something
+  `capture-pane` can't.
+- **Key scope:** printable text counts; `Enter`, arrows/navigation, shortcuts
+  and any `Ctrl`/`Alt` chord do not.
+- **Caveat:** a bot that injects *real key events* through the interactive
+  route (not via `send-keys`) will also update it — this measures the route,
+  not who's behind it.
+
+Useful when a tool drives a pane programmatically and wants to yield the moment
+typing arrives on the interactive route. Consumers own all policy (e.g. treat
+"value < N ms" as "active"); psmux just exposes the timestamp, kept on the pane
+(no file, freed with the pane).
+
+### Special-key route signal (`#{pane_last_special_key}`)
+
+The sibling of `#{pane_last_text_input}` for **non-text** keys. Two read-only
+format variables describing the last key, other than printable text, that
+reached this pane via the interactive input route:
+
+- `#{pane_last_special_key}` -- its canonical bind-key name (`Escape`, `Enter`,
+  `Tab`, `Up`, `F9`, `C-c`, `M-a`, ...), empty until the first one.
+- `#{pane_last_special_key_ms}` -- milliseconds since it arrived, empty if none.
+
+```powershell
+psmux display-message -t dev -p '#{pane_last_special_key} #{pane_last_special_key_ms}'
+# e.g. "Escape 320", or " " if none yet
+```
+
+Same route contract as `#{pane_last_text_input}`:
+
+- **Interactive route** (`handle_key -> forward_key_to_active`) **updates** it.
+- **Injected route** (`send-keys` / `send-paste` / `send-text`) does **not**.
+- **Scope:** every key that is *not* printable text input -- `Escape`, `Enter`,
+  `Tab`, `Backspace`, arrows/navigation, function keys, and any `Ctrl`/`Alt`
+  chord. Printable text goes to `#{pane_last_text_input}` instead; together the
+  two partition all interactive keys. Names come from the same renderer
+  `list-keys` uses.
+
+Consumers own all policy (e.g. "name is `Escape` and `_ms` < N"); psmux just
+exposes the last key + its age, kept on the pane (no file, freed with it).
+
 ## Named Paste Buffers
 
 psmux supports named paste buffers for structured inter-pane data exchange:

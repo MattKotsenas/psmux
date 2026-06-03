@@ -14,6 +14,7 @@ mod commands;
 mod pane;
 mod warm_pane_sync;
 mod popup;
+mod clipboard;
 mod copy_mode;
 mod input;
 mod layout;
@@ -146,12 +147,22 @@ fn run_main() -> io::Result<()> {
     // PSMUX_TARGET_FULL stores the full target (session:window.pane) for the server
     if let Some(pos) = args.iter().position(|a| a == "-t") {
         if let Some(target) = args.get(pos + 1) {
-            // Store the full target for the server to parse
-            env::set_var("PSMUX_TARGET_FULL", target);
             // Extract just the session name for port file lookup
             let parsed_target = crate::cli::parse_target(target);
             let has_explicit_session = parsed_target.session.is_some();
             let session = parsed_target.session.unwrap_or_else(|| "default".to_string());
+            // Store the full target for the server to parse, with $N resolved
+            // to the actual session name so the server can look up port files.
+            let resolved_full = if target.starts_with('$') {
+                if let Some(colon_pos) = target.find(':') {
+                    format!("{}{}", session, &target[colon_pos..])
+                } else {
+                    session.clone()
+                }
+            } else {
+                target.to_string()
+            };
+            env::set_var("PSMUX_TARGET_FULL", &resolved_full);
             // Apply -L namespace prefix for port file lookup
             let port_file_base = if let Some(ref l) = l_socket_name {
                 format!("{}__{}", l, session)
@@ -474,9 +485,16 @@ fn run_main() -> io::Result<()> {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
                                             if let Ok(mut s) = std::net::TcpStream::connect_timeout(
                                                 &addr.parse().unwrap(),
-                                                Duration::from_millis(50)
+                                                Duration::from_millis(200)
                                             ) {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                                // Format expansion for variables like
+                                                // pane_current_command/pane_current_path can
+                                                // take 40+ ms each (OS process queries), so
+                                                // 50 ms was too tight for multi-variable
+                                                // format strings (e.g. libtmux's 123-field
+                                                // format). 500 ms allows complex formats
+                                                // while still detecting dead sessions quickly.
+                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
                                                 // Read session key and authenticate
                                                 let key_path = format!("{}\\.psmux\\{}.key", home, base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
@@ -566,17 +584,37 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "a" | "at" | "attach" | "attach-session" => {
-                let name = args
+                // Search cmd_args (skips binary name + global flags). Skip
+                // cmd_args[0] which is the subcommand itself ("a"/"attach"/etc),
+                // otherwise argv[0] (the exe path or subcommand name) gets
+                // picked up as the target session name.
+                let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
+                let name = sub_args
                     .iter()
-                    .position(|a| a == "-t")
-                    .and_then(|i| args.get(i + 1))
+                    .position(|a| *a == "-t")
+                    .and_then(|i| sub_args.get(i + 1))
                     .map(|s| {
-                        // Apply -L namespace prefix when -t is specified
                         if let Some(ref l) = l_socket_name {
                             format!("{}__{}", l, s)
                         } else {
-                            s.clone()
+                            (*s).clone()
                         }
+                    })
+                    .or_else(|| {
+                        // Accept positional argument as target session name
+                        // (e.g. "psmux attach work" without -t flag)
+                        let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
+                        sub_args.iter().enumerate().find_map(|(i, a)| {
+                            if !a.starts_with('-') && Some(i) != t_val_idx {
+                                Some(if let Some(ref l) = l_socket_name {
+                                    format!("{}__{}", l, a)
+                                } else {
+                                    (*a).clone()
+                                })
+                            } else {
+                                None
+                            }
+                        })
                     })
                     .or_else(resolve_default_session_name)
                     .or_else(|| crate::session::resolve_last_session_name_ns(l_socket_name.as_deref()))
@@ -1165,6 +1203,40 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        a if a.len() > 2
+                            && a.starts_with('-')
+                            && !a.starts_with("--")
+                            && a.chars().skip(1).all(|c| matches!(c, 'p' | 'e' | 'J')) =>
+                        {
+                            // POSIX cluster of capture-pane booleans (-ep, -pe, -pJ, -eJ,
+                            // -epJ, ...). -t/-S/-E/-b take a value, so they are NOT
+                            // eligible for clustering.
+                            if a.contains('p') { cmd.push_str(" -p"); print_stdout = true; }
+                            if a.contains('e') { cmd.push_str(" -e"); }
+                            if a.contains('J') { cmd.push_str(" -J"); }
+                        }
+                        // Cluster ending in a value-taking flag: -pt <target>,
+                        // -pet <target>, -pS <start>, etc.
+                        a if a.len() > 2
+                            && a.starts_with('-')
+                            && !a.starts_with("--")
+                            && {
+                                let last = a.chars().last().unwrap_or(' ');
+                                matches!(last, 't' | 'S' | 'E' | 'b')
+                                    && a[1..a.len()-1].chars().all(|c| matches!(c, 'p' | 'e' | 'J'))
+                            } =>
+                        {
+                            let last = a.chars().last().unwrap();
+                            // Expand boolean flags in the cluster
+                            if a.contains('p') { cmd.push_str(" -p"); print_stdout = true; }
+                            if a.contains('e') { cmd.push_str(" -e"); }
+                            if a.contains('J') { cmd.push_str(" -J"); }
+                            // Consume the next arg as the value for the trailing flag
+                            if let Some(val) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -{} {}", last, val));
+                                i += 1;
+                            }
+                        }
                         _ => {}
                     }
                     i += 1;
@@ -1298,56 +1370,143 @@ fn run_main() -> io::Result<()> {
             }
             // list-panes - List all panes
             "list-panes" | "lsp" => {
-                let mut cmd = "list-panes".to_string();
+                let mut all_sessions = false;
+                let mut session_scope = false;
+                let mut format_str: Option<String> = None;
+                let mut target_session: Option<String> = None;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
-                        "-a" => { cmd.push_str(" -a"); }
-                        "-s" => { cmd.push_str(" -s"); }
+                        "-a" => { all_sessions = true; }
+                        "-s" => { session_scope = true; }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
+                                target_session = Some(t.to_string());
                                 i += 1;
                             }
                         }
                         "-F" => {
                             if let Some(f) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                                format_str = Some(f.to_string());
                                 i += 1;
                             }
                         }
                         s if s.starts_with("-F") && s.len() > 2 => {
-                            cmd.push_str(&format!(" -F \"{}\"", s[2..].trim_matches('"').replace("\"", "\\\"")));
+                            format_str = Some(s[2..].to_string());
                         }
                         _ => {}
                     }
                     i += 1;
                 }
-                cmd.push('\n');
-                let resp = send_control_with_response(cmd)?;
-                print!("{}", resp);
+
+                if all_sessions {
+                    // Iterate over all session port files (like list-sessions does)
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let dir = format!("{}\\.psmux", home);
+                    let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for e in entries.flatten() {
+                            if let Some(name) = e.file_name().to_str() {
+                                if let Some((base, ext)) = name.rsplit_once('.') {
+                                    if ext != "port" { continue; }
+                                    if crate::session::is_warm_session(base) { continue; }
+                                    if let Some(ref pfx) = ns_prefix {
+                                        if !base.starts_with(pfx.as_str()) { continue; }
+                                    } else if base.contains("__") { continue; }
+                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
+                                            let addr = format!("127.0.0.1:{}", port_str.trim());
+                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                                                &addr.parse().unwrap(),
+                                                Duration::from_millis(500),
+                                            ) {
+                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
+                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
+                                                }
+                                                // Send list-panes -s (all panes in this session) to each server
+                                                let query = if let Some(ref fmt) = format_str {
+                                                    format!("list-panes -s -F \"{}\"\n", fmt.replace('"', "\\\""))
+                                                } else {
+                                                    "list-panes -s\n".to_string()
+                                                };
+                                                let _ = std::io::Write::write_all(&mut s, query.as_bytes());
+                                                let _ = s.flush();
+                                                let mut br = std::io::BufReader::new(s);
+                                                let mut line = String::new();
+                                                let _ = std::io::BufRead::read_line(&mut br, &mut line);
+                                                if line.trim() == "OK" {
+                                                    line.clear();
+                                                    let _ = std::io::BufRead::read_line(&mut br, &mut line);
+                                                }
+                                                if line.trim() == "ERROR: Authentication required" { continue; }
+                                                // Print all lines from this session
+                                                if !line.trim().is_empty() {
+                                                    print!("{}", line);
+                                                }
+                                                loop {
+                                                    let mut next = String::new();
+                                                    match std::io::BufRead::read_line(&mut br, &mut next) {
+                                                        Ok(0) => break,
+                                                        Ok(_) => {
+                                                            if !next.trim().is_empty() {
+                                                                print!("{}", next);
+                                                            }
+                                                        }
+                                                        Err(_) => break,
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = std::fs::remove_file(e.path());
+                                                let key_path = e.path().with_extension("key");
+                                                let _ = std::fs::remove_file(&key_path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Single session: build command and send to target session
+                    let mut cmd = "list-panes".to_string();
+                    if session_scope { cmd.push_str(" -s"); }
+                    if let Some(ref t) = target_session {
+                        cmd.push_str(&format!(" -t {}", t));
+                    }
+                    if let Some(ref f) = format_str {
+                        cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                    }
+                    cmd.push('\n');
+                    let resp = send_control_with_response(cmd)?;
+                    print!("{}", resp);
+                }
                 return Ok(());
             }
             // list-windows - List all windows
             "list-windows" | "lsw" => {
-                let mut cmd = "list-windows".to_string();
+                let mut all_sessions = false;
+                let mut json_mode = false;
+                let mut format_str: Option<String> = None;
+                let mut target_session: Option<String> = None;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
-                        "-a" => { cmd.push_str(" -a"); }
-                        "-J" => { cmd.push_str(" -J"); }
+                        "-a" => { all_sessions = true; }
+                        "-J" => { json_mode = true; }
                         "-F" => {
                             if let Some(f) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                                format_str = Some(f.to_string());
                                 i += 1;
                             }
                         }
                         s if s.starts_with("-F") && s.len() > 2 => {
-                            cmd.push_str(&format!(" -F \"{}\"", s[2..].trim_matches('"').replace("\"", "\\\"")));
+                            format_str = Some(s[2..].to_string());
                         }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
+                                target_session = Some(t.to_string());
                                 i += 1;
                             }
                         }
@@ -1355,9 +1514,91 @@ fn run_main() -> io::Result<()> {
                     }
                     i += 1;
                 }
-                cmd.push('\n');
-                let resp = send_control_with_response(cmd)?;
-                print!("{}", resp);
+
+                if all_sessions {
+                    // Iterate over all session port files (like list-sessions does)
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let dir = format!("{}\\.psmux", home);
+                    let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for e in entries.flatten() {
+                            if let Some(name) = e.file_name().to_str() {
+                                if let Some((base, ext)) = name.rsplit_once('.') {
+                                    if ext != "port" { continue; }
+                                    if crate::session::is_warm_session(base) { continue; }
+                                    if let Some(ref pfx) = ns_prefix {
+                                        if !base.starts_with(pfx.as_str()) { continue; }
+                                    } else if base.contains("__") { continue; }
+                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
+                                            let addr = format!("127.0.0.1:{}", port_str.trim());
+                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                                                &addr.parse().unwrap(),
+                                                Duration::from_millis(500),
+                                            ) {
+                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
+                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
+                                                }
+                                                // Send list-windows to each server (without -a to avoid recursion)
+                                                let query = if let Some(ref fmt) = format_str {
+                                                    format!("list-windows -F \"{}\"\n", fmt.replace('"', "\\\""))
+                                                } else if json_mode {
+                                                    "list-windows -J\n".to_string()
+                                                } else {
+                                                    "list-windows\n".to_string()
+                                                };
+                                                let _ = std::io::Write::write_all(&mut s, query.as_bytes());
+                                                let _ = s.flush();
+                                                let mut br = std::io::BufReader::new(s);
+                                                let mut line = String::new();
+                                                let _ = std::io::BufRead::read_line(&mut br, &mut line);
+                                                if line.trim() == "OK" {
+                                                    line.clear();
+                                                    let _ = std::io::BufRead::read_line(&mut br, &mut line);
+                                                }
+                                                if line.trim() == "ERROR: Authentication required" { continue; }
+                                                if !line.trim().is_empty() {
+                                                    print!("{}", line);
+                                                }
+                                                loop {
+                                                    let mut next = String::new();
+                                                    match std::io::BufRead::read_line(&mut br, &mut next) {
+                                                        Ok(0) => break,
+                                                        Ok(_) => {
+                                                            if !next.trim().is_empty() {
+                                                                print!("{}", next);
+                                                            }
+                                                        }
+                                                        Err(_) => break,
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = std::fs::remove_file(e.path());
+                                                let key_path = e.path().with_extension("key");
+                                                let _ = std::fs::remove_file(&key_path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Single session: build command and send to target session
+                    let mut cmd = "list-windows".to_string();
+                    if json_mode { cmd.push_str(" -J"); }
+                    if let Some(ref f) = format_str {
+                        cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                    }
+                    if let Some(ref t) = target_session {
+                        cmd.push_str(&format!(" -t {}", t));
+                    }
+                    cmd.push('\n');
+                    let resp = send_control_with_response(cmd)?;
+                    print!("{}", resp);
+                }
                 return Ok(());
             }
             // kill-window - Kill a window
@@ -1471,11 +1712,15 @@ fn run_main() -> io::Result<()> {
                     match cmd_args[i].as_str() {
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
+                                // Resolve $N session IDs via parse_target
+                                let resolved = crate::cli::parse_target(t)
+                                    .session
+                                    .unwrap_or_else(|| t.to_string());
                                 // Apply -L namespace prefix for port file lookup
                                 let namespaced = if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, t)
+                                    format!("{}__{}", l, resolved)
                                 } else {
-                                    t.to_string()
+                                    resolved
                                 };
                                 target = Some(namespaced);
                                 i += 1;
@@ -1690,6 +1935,7 @@ fn run_main() -> io::Result<()> {
             "set-buffer" | "setb" => {
                 let mut buffer_name: Option<String> = None;
                 let mut data: Option<String> = None;
+                let mut propagate_to_clipboard = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -1699,12 +1945,18 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-w" => { propagate_to_clipboard = true; }
                         s if !s.starts_with('-') => {
                             data = Some(s.to_string());
                         }
                         _ => {}
                     }
                     i += 1;
+                }
+                if propagate_to_clipboard {
+                    if let Some(ref d) = data {
+                        crate::clipboard::copy_to_system_clipboard(d);
+                    }
                 }
                 let mut cmd = "set-buffer".to_string();
                 if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
@@ -1810,6 +2062,27 @@ fn run_main() -> io::Result<()> {
                             i += 1;
                         }
                         "-I" => { i += 1; } // consume -I <input>, skip value
+                        // POSIX cluster ending in value-taking flag: -pt <target>
+                        a if a.len() > 2
+                            && a.starts_with('-')
+                            && !a.starts_with("--")
+                            && {
+                                let last = a.chars().last().unwrap_or(' ');
+                                matches!(last, 't' | 'd' | 'I')
+                                    && a[1..a.len()-1].chars().all(|c| matches!(c, 'p'))
+                            } =>
+                        {
+                            let last = a.chars().last().unwrap();
+                            if a.contains('p') { print_to_stdout = true; }
+                            if let Some(val) = cmd_args.get(i + 1) {
+                                match last {
+                                    't' => { target = Some(val.to_string()); }
+                                    'd' => { duration_ms = val.parse::<u64>().ok(); }
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
                         s => { message.push(s.to_string()); }
                     }
                     i += 1;
@@ -2572,6 +2845,7 @@ fn run_main() -> io::Result<()> {
             "load-buffer" | "loadb" => {
                 let mut buffer_name: Option<String> = None;
                 let mut file_path: Option<String> = None;
+                let mut propagate_to_clipboard = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -2581,7 +2855,13 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
-                        "-w" => {} // tmux 3.2+ clipboard propagation flag, silently accept
+                        // tmux 3.2+: forward the loaded buffer to the outer
+                        // terminal's system clipboard. Real tmux does this
+                        // via OSC 52 to the host terminal; on Windows we
+                        // have direct access to the Win32 clipboard, so
+                        // just write to it. Failures are non-fatal
+                        // (matches tmux's permissive behavior).
+                        "-w" => { propagate_to_clipboard = true; }
                         "-" => { file_path = Some("-".to_string()); }
                         s if !s.starts_with('-') => { file_path = Some(s.to_string()); }
                         _ => {}
@@ -2596,6 +2876,9 @@ fn run_main() -> io::Result<()> {
                     } else {
                         std::fs::read_to_string(&path)?
                     };
+                    if propagate_to_clipboard {
+                        crate::clipboard::copy_to_system_clipboard(&content);
+                    }
                     let mut cmd = "set-buffer".to_string();
                     if let Some(b) = buffer_name {
                         cmd.push_str(&format!(" -b {}", b));

@@ -22,7 +22,7 @@ A: Yes! psmux includes a `tmux` alias. Commands like `tmux new-session`, `tmux a
 A: Session creation takes < 100ms. New windows/panes add < 80ms overhead. The bottleneck is your shell's startup time, not psmux. Compiled with opt-level 3 and full LTO.
 
 **Q: Does psmux support mouse?**
-A: Full mouse support: click to focus panes, drag to resize borders, scroll wheel, click status-bar tabs, drag-select text, right-click copy. Plus VT mouse forwarding for TUI apps like vim, htop, and midnight commander.
+A: Full mouse support: click to focus panes, drag to resize borders, scroll wheel, click status-bar tabs, drag-select text (including tmux-like copy-on-release with `pwsh-mouse-selection on`), and right-click copy/paste paths. Plus VT mouse forwarding for TUI apps like vim, htop, and midnight commander.
 
 **Q: What shells does psmux support?**
 A: PowerShell 7 (default), PowerShell 5, cmd.exe, Git Bash, WSL, nushell, and any Windows executable. Change with `set -g default-shell <shell>`.

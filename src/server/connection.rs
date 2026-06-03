@@ -252,6 +252,11 @@ if line.trim() == "PERSISTENT" {
     // receivers here; the writer thread waits for each response and
     // writes it to TCP in order.
     let mut ws_bg = write_stream.try_clone().unwrap();
+    // Prevent the writer from blocking indefinitely when the client's TCP
+    // receive buffer fills up (e.g. during a slow render). Without a write
+    // timeout, a full socket causes write() to block forever, silently
+    // freezing frame delivery. 5 s matches the command-response timeout.
+    let _ = ws_bg.set_write_timeout(Some(Duration::from_secs(5)));
     let (resp_tx, resp_rx) = mpsc::channel::<mpsc::Receiver<String>>();
 
     // Register a bounded frame channel for server-pushed frames (event-driven
@@ -266,7 +271,35 @@ if line.trim() == "PERSISTENT" {
     // by frame channel backpressure.
     let directive_rx = crate::types::register_directive_channel(client_id);
 
+    // Clone the write socket so the Guard can shut down the connection when
+    // the writer exits. shutdown(Both) on any clone affects the underlying
+    // socket, causing the client's reader thread to receive EOF and reconnect
+    // instead of hanging indefinitely with a frozen last frame.
+    //
+    // We use write_stream (not ws_bg) as the source so that even under fd
+    // pressure the clone chain stays shallow.  If the clone fails here we
+    // return early — the client immediately sees a closed connection and
+    // reconnects, which is far better than hanging with no shutdown signal.
+    let ws_shutdown = match write_stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     std::thread::spawn(move || {
+        // Deregister the frame channel and shut down the TCP connection when
+        // this thread exits for any reason (write timeout, resp_rx disconnect,
+        // etc.). The shutdown causes the client's reader thread to see EOF,
+        // which triggers reconnect rather than leaving the client frozen.
+        struct Guard { client_id: u64, shutdown: std::net::TcpStream }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+                crate::types::deregister_frame_channel(self.client_id);
+                crate::types::remove_directive_channel(self.client_id);
+                crate::types::deregister_persistent_stream(self.client_id);
+            }
+        }
+        let _guard = Guard { client_id, shutdown: ws_shutdown };
+
         loop {
             // 0. Check for queued directives (non-blocking) — these take priority
             while let Ok(directive) = directive_rx.try_recv() {
@@ -276,29 +309,50 @@ if line.trim() == "PERSISTENT" {
             // 1. Drain all pending command responses (non-blocking after first)
             match resp_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(rrx) => {
-                    if let Ok(text) = rrx.recv() {
-                        if write!(ws_bg, "{}\n", text).is_err() { break; }
-                        if ws_bg.flush().is_err() { break; }
-                    }
-                    while let Ok(rrx) = resp_rx.try_recv() {
-                        if let Ok(text) = rrx.recv() {
+                    // Use a timeout matching the TCP write timeout (5 s) so the
+                    // writer thread cannot block indefinitely if the command
+                    // handler is slow or panics without sending a response.
+                    // A timeout (or disconnected sender) is treated as fatal:
+                    // break so Guard::drop fires, the client receives EOF, and
+                    // reconnects cleanly rather than stalling on a silent drop.
+                    match rrx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(text) => {
                             if write!(ws_bg, "{}\n", text).is_err() { return; }
                             if ws_bg.flush().is_err() { return; }
+                        }
+                        Err(_) => return,
+                    }
+                    while let Ok(rrx) = resp_rx.try_recv() {
+                        match rrx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(text) => {
+                                if write!(ws_bg, "{}\n", text).is_err() { return; }
+                                if ws_bg.flush().is_err() { return; }
+                            }
+                            Err(_) => return,
                         }
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            // 2. Drain all queued frames from the bounded channel
-            if let Ok(frame_rx) = frame_chan.rx.lock() {
-                while let Ok(text) = frame_rx.try_recv() {
-                    if write!(ws_bg, "{}\n", text).is_err() { return; }
-                    if ws_bg.flush().is_err() { return; }
+            // 2. Drain all queued frames from the bounded channel.
+            // Drain into a local buffer while holding rx.lock(), then drop
+            // the lock before writing to TCP. Holding rx.lock() across a
+            // blocking flush would deadlock push_frame() on the server loop.
+            let mut pending_frames: Vec<String> = Vec::new();
+            match frame_chan.rx.lock() {
+                Ok(frame_rx) => {
+                    while let Ok(text) = frame_rx.try_recv() {
+                        pending_frames.push(text);
+                    }
                 }
-            } else {
-                return;
+                Err(_) => return,
+            }
+            // rx.lock released here — TCP writes happen with no lock held
+            for text in &pending_frames {
+                if write!(ws_bg, "{}\n", text).is_err() { return; }
+                if ws_bg.flush().is_err() { return; }
             }
         }
     });
@@ -1384,8 +1438,9 @@ match cmd {
         }
     }
     "set-buffer" => {
-        // Parse -b name and content, skipping flags
+        // Parse -b name, -w (clipboard propagation), and content
         let mut buf_name: Option<String> = None;
+        let mut propagate_to_clipboard = false;
         let mut i = 0;
         let mut content_parts: Vec<&str> = Vec::new();
         while i < args.len() {
@@ -1394,6 +1449,9 @@ match cmd {
                     buf_name = Some(name.to_string());
                 }
                 i += 2; // skip -b and its value (buffer name)
+            } else if args[i] == "-w" {
+                propagate_to_clipboard = true;
+                i += 1;
             } else if args[i].starts_with('-') {
                 i += 1; // skip unknown flags
             } else {
@@ -1402,6 +1460,9 @@ match cmd {
             }
         }
         let content = content_parts.join(" ");
+        if propagate_to_clipboard {
+            crate::clipboard::copy_to_system_clipboard(&content);
+        }
         if let Some(name) = buf_name {
             let _ = tx.send(CtrlReq::SetNamedBuffer(name, content));
         } else {
@@ -1543,9 +1604,18 @@ match cmd {
             parts.join(" ")
         };
         // Pass target pane index for PANE_POS_OVERRIDE (#113).
-        let target_pane_idx: Option<usize> = if !pane_is_id { target_pane } else { None };
+        // Bare %N (pane_is_id=true) goes through DisplayMessageById which
+        // resolves the pane ID globally across windows (#332).
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_stdout, duration_ms));
+        if pane_is_id {
+            if let Some(pid) = target_pane {
+                let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_stdout, duration_ms));
+            } else {
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, None, !print_stdout, duration_ms));
+            }
+        } else {
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, !print_stdout, duration_ms));
+        }
         if let Ok(text) = rrx.recv() {
             if print_stdout {
                 if persistent {
@@ -1914,7 +1984,10 @@ match cmd {
                     let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
                 }
                 if let Ok(text) = rrx.recv() {
-                    let resolved = if text.is_empty() && window_scope && has_a {
+                    let resolved = if text.is_empty() && window_scope {
+                        // Fall back to global options when window-scope
+                        // lookup returns empty. Options like pane-base-index
+                        // may only exist at the global level in psmux.
                         let (frtx, frrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ShowOptionValue(frtx, name.to_string()));
                         frrx.recv().unwrap_or_default()
@@ -2485,15 +2558,38 @@ match cmd {
     }
     "if-shell" | "if" => {
         let format_mode = args.iter().any(|a| *a == "-F" || *a == "-bF" || *a == "-Fb");
-        // Collect positional args (skip flags like -b, -F, -bF)
-        let positional: Vec<&str> = args.iter()
-            .filter(|a| !a.starts_with('-'))
-            .copied()
-            .collect();
+        // Collect positional args (skip flags like -b, -F, -bF),
+        // collapsing brace blocks { ... } into single tokens.
+        let mut positional: Vec<String> = Vec::new();
+        {
+            let non_flags: Vec<&str> = args.iter()
+                .filter(|a| !a.starts_with('-'))
+                .copied()
+                .collect();
+            let mut j = 0;
+            while j < non_flags.len() {
+                if non_flags[j] == "{" {
+                    // Collect everything between { and } as a single command
+                    let mut depth = 1;
+                    let mut block = Vec::new();
+                    j += 1;
+                    while j < non_flags.len() && depth > 0 {
+                        if non_flags[j] == "{" { depth += 1; }
+                        else if non_flags[j] == "}" { depth -= 1; if depth == 0 { break; } }
+                        block.push(non_flags[j]);
+                        j += 1;
+                    }
+                    positional.push(block.join(" "));
+                } else {
+                    positional.push(non_flags[j].to_string());
+                }
+                j += 1;
+            }
+        }
         if positional.len() >= 2 {
-            let condition = positional[0];
-            let true_cmd = positional[1];
-            let false_cmd = positional.get(2).copied();
+            let condition = &positional[0];
+            let true_cmd = &positional[1];
+            let false_cmd = positional.get(2);
             let success = if format_mode {
                 let (rtx, rrx) = std::sync::mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, None));
@@ -2508,7 +2604,7 @@ match cmd {
                 let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
                 let mut c = std::process::Command::new(&shell_prog);
                 for a in &shell_args { c.arg(a); }
-                c.arg(condition);
+                c.arg(condition.as_str());
                 c.stdout(std::process::Stdio::null());
                 c.stderr(std::process::Stdio::null());
                 { use crate::platform::HideWindowCommandExt; c.hide_window(); }
@@ -2893,7 +2989,15 @@ fn dispatch_control_command(
             };
             let target_pane_idx = if pane_is_id { None } else { target_pane };
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+            if pane_is_id {
+                if let Some(pid) = target_pane {
+                    let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_mode, None));
+                } else {
+                    let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+                }
+            } else {
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+            }
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }

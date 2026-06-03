@@ -200,6 +200,37 @@ fn make_row(runs: Vec<crate::layout::CellRunJson>) -> crate::layout::RowRunsJson
 }
 
 #[cfg(windows)]
+fn make_leaf(id: usize, rows: &[&str]) -> crate::layout::LayoutJson {
+    let cols = rows.first().map(|row| row.chars().count()).unwrap_or(0) as u16;
+    crate::layout::LayoutJson::Leaf {
+        id,
+        rows: rows.len() as u16,
+        cols,
+        cursor_row: 0,
+        cursor_col: 0,
+        alternate_screen: false,
+        hide_cursor: false,
+        cursor_shape: 0,
+        active: id == 0,
+        copy_mode: false,
+        scroll_offset: 0,
+        sel_start_row: None,
+        sel_start_col: None,
+        sel_end_row: None,
+        sel_end_col: None,
+        sel_mode: None,
+        copy_cursor_row: None,
+        copy_cursor_col: None,
+        content: Vec::new(),
+        rows_v2: rows
+            .iter()
+            .map(|row| make_row(vec![make_run(row, cols)]))
+            .collect(),
+        title: None,
+    }
+}
+
+#[cfg(windows)]
 #[test]
 fn normalize_selection_reading_order() {
     // Start before end: no swap
@@ -270,7 +301,6 @@ fn char_at_col_basics() {
 #[cfg(windows)]
 #[test]
 fn extract_selection_text_block_mode() {
-    use ratatui::layout::Rect as Rect;
     // A single leaf pane 10 cols wide, 3 rows
     let layout = crate::layout::LayoutJson::Leaf {
         id: 0,
@@ -301,12 +331,48 @@ fn extract_selection_text_block_mode() {
     };
 
     // Block select cols 2..5, rows 0..2
-    let text = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), true);
+    let text = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), true, None);
     assert_eq!(text, "2345\ncdef\nCDEF");
 
     // Non-block (reading order) same coordinates should give full intermediate rows
-    let text_normal = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), false);
+    let text_normal = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), false, None);
     assert_eq!(text_normal, "23456789\nabcdefghij\nABCDEF");
+}
+
+#[cfg(windows)]
+#[test]
+fn extract_selection_text_clips_reading_order_to_origin_pane() {
+    let layout = crate::layout::LayoutJson::Split {
+        kind: "Horizontal".to_string(),
+        sizes: vec![50, 50],
+        children: vec![
+            make_leaf(0, &["abcde", "fghij", "klmno"]),
+            make_leaf(1, &["ABCDE", "FGHIJ", "KLMNO"]),
+        ],
+    };
+    let pane_clip = ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 };
+
+    let text = extract_selection_text(&layout, 11, 3, (1, 0), (3, 2), false, Some(pane_clip));
+
+    assert_eq!(text, "bcde\nfghij\nklmn");
+}
+
+#[cfg(windows)]
+#[test]
+fn extract_selection_text_clips_block_mode_to_origin_pane() {
+    let layout = crate::layout::LayoutJson::Split {
+        kind: "Horizontal".to_string(),
+        sizes: vec![50, 50],
+        children: vec![
+            make_leaf(0, &["abcde", "fghij", "klmno"]),
+            make_leaf(1, &["ABCDE", "FGHIJ", "KLMNO"]),
+        ],
+    };
+    let pane_clip = ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 };
+
+    let text = extract_selection_text(&layout, 11, 3, (1, 0), (8, 2), true, Some(pane_clip));
+
+    assert_eq!(text, "bcde\nghij\nlmno");
 }
 
 #[cfg(windows)]
@@ -357,4 +423,147 @@ fn word_bounds_at_finds_word() {
 fn pwsh_mouse_selection_option_default_off() {
     let state = crate::types::AppState::new("test-session".to_string());
     assert!(!state.pwsh_mouse_selection, "pwsh_mouse_selection should default to off");
+}
+
+// ── Issue #290: paste must not leak past the command prompt ─────────────
+// route_paste_to_overlay is the helper that the Event::Paste branch in the
+// client loop delegates to.  When an overlay returns true, the loop skips
+// the `send-paste` forwarding, so paste content cannot reach the shell.
+
+#[test]
+fn paste_into_command_prompt_inserts_and_advances_cursor() {
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "hello",
+        true, &mut command_buf, &mut command_cursor,
+        false, &mut rename_buf,
+        false, &mut pane_title_buf,
+        false, &mut window_idx_buf,
+    );
+    assert!(consumed, "command_input overlay must consume paste");
+    assert_eq!(command_buf, "hello");
+    assert_eq!(command_cursor, 5);
+}
+
+#[test]
+fn paste_into_command_prompt_inserts_at_cursor_position() {
+    // User typed "abdef", moved cursor between b and d, then pastes "c".
+    let mut command_buf = String::from("abdef");
+    let mut command_cursor = 2;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "c",
+        true, &mut command_buf, &mut command_cursor,
+        false, &mut rename_buf,
+        false, &mut pane_title_buf,
+        false, &mut window_idx_buf,
+    );
+    assert!(consumed);
+    assert_eq!(command_buf, "abcdef");
+    assert_eq!(command_cursor, 3);
+}
+
+#[test]
+fn paste_with_no_overlay_active_is_not_consumed() {
+    // Caller must forward via send-paste when this returns false.
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "hello",
+        false, &mut command_buf, &mut command_cursor,
+        false, &mut rename_buf,
+        false, &mut pane_title_buf,
+        false, &mut window_idx_buf,
+    );
+    assert!(!consumed);
+    assert!(command_buf.is_empty());
+    assert!(rename_buf.is_empty());
+    assert!(pane_title_buf.is_empty());
+    assert!(window_idx_buf.is_empty());
+}
+
+#[test]
+fn paste_into_rename_prompt_appends() {
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::from("foo");
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "bar",
+        false, &mut command_buf, &mut command_cursor,
+        true, &mut rename_buf,
+        false, &mut pane_title_buf,
+        false, &mut window_idx_buf,
+    );
+    assert!(consumed);
+    assert_eq!(rename_buf, "foobar");
+}
+
+#[test]
+fn paste_into_pane_title_appends() {
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::from("title");
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "-suffix",
+        false, &mut command_buf, &mut command_cursor,
+        false, &mut rename_buf,
+        true, &mut pane_title_buf,
+        false, &mut window_idx_buf,
+    );
+    assert!(consumed);
+    assert_eq!(pane_title_buf, "title-suffix");
+}
+
+#[test]
+fn paste_into_window_idx_prompt_keeps_only_digits() {
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "1a2b3",
+        false, &mut command_buf, &mut command_cursor,
+        false, &mut rename_buf,
+        false, &mut pane_title_buf,
+        true, &mut window_idx_buf,
+    );
+    assert!(consumed);
+    assert_eq!(window_idx_buf, "123");
+}
+
+#[test]
+fn paste_command_prompt_takes_precedence_over_other_overlays() {
+    // If multiple overlay flags are accidentally true, command_input wins
+    // (matches the if/else-if order in the helper).
+    let mut command_buf = String::new();
+    let mut command_cursor = 0;
+    let mut rename_buf = String::new();
+    let mut pane_title_buf = String::new();
+    let mut window_idx_buf = String::new();
+    let consumed = super::route_paste_to_overlay(
+        "x",
+        true, &mut command_buf, &mut command_cursor,
+        true, &mut rename_buf,
+        true, &mut pane_title_buf,
+        true, &mut window_idx_buf,
+    );
+    assert!(consumed);
+    assert_eq!(command_buf, "x");
+    assert!(rename_buf.is_empty());
+    assert!(pane_title_buf.is_empty());
+    assert!(window_idx_buf.is_empty());
 }

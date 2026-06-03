@@ -1122,12 +1122,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             toggle_zoom(app);
         }
         "copy-mode" => {
-            enter_copy_mode(app);
             if parts.iter().any(|a| *a == "-u") {
-                let half = app.windows.get(app.active_idx)
-                    .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
-                    .map(|p| p.last_rows as usize).unwrap_or(20);
-                scroll_copy_up(app, half);
+                if app.scroll_enter_copy_mode {
+                    enter_copy_mode(app);
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
+                        .map(|p| p.last_rows as usize).unwrap_or(20);
+                    scroll_copy_up(app, half);
+                } else {
+                    // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
+                    if let Some(win) = app.windows.get_mut(app.active_idx) {
+                        if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                            let _ = pane.writer.write_all(b"\x1b[5~");
+                        }
+                    }
+                }
+            } else {
+                enter_copy_mode(app);
             }
         }
         "display-panes" | "displayp" => {
@@ -1452,16 +1463,20 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             paste_latest(app)?;
         }
         "set-buffer" | "setb" => {
-            // Parse -b name and extract content, skipping flags
+            // Parse -b name, -w (clipboard), and extract content
             let mut i = 1;
             let mut buf_name: Option<String> = None;
             let mut content: Option<String> = None;
+            let mut propagate_to_clipboard = false;
             while i < parts.len() {
                 if parts[i] == "-b" {
                     if let Some(name) = parts.get(i + 1) {
                         buf_name = Some(name.to_string());
                     }
                     i += 2; // skip -b and its value (buffer name)
+                } else if parts[i] == "-w" {
+                    propagate_to_clipboard = true;
+                    i += 1;
                 } else if parts[i].starts_with('-') {
                     i += 1; // skip unknown flags
                 } else {
@@ -1470,11 +1485,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     break;
                 }
             }
-            if let Some(text) = content {
+            if let Some(ref text) = content {
+                if propagate_to_clipboard {
+                    crate::clipboard::copy_to_system_clipboard(text);
+                }
                 if let Some(name) = buf_name {
-                    app.named_buffers.insert(name, text);
+                    app.named_buffers.insert(name, text.clone());
                 } else {
-                    app.paste_buffers.insert(0, text);
+                    app.paste_buffers.insert(0, text.clone());
                     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
                 }
             }

@@ -14,7 +14,7 @@ use crate::session::read_session_key;
 use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
-use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
@@ -196,6 +196,45 @@ fn normalize_selection(start: (u16, u16), end: (u16, u16), block: bool) -> (u16,
     }
 }
 
+fn selection_row_cols(
+    row: u16,
+    r0: u16,
+    c0: u16,
+    r1: u16,
+    c1: u16,
+    block: bool,
+    term_width: u16,
+    pane_clip: Option<Rect>,
+) -> Option<(u16, u16)> {
+    if term_width == 0 {
+        return None;
+    }
+
+    let mut col_start = if block || row == r0 { c0 } else { 0 };
+    let mut col_end = if block || row == r1 {
+        c1
+    } else {
+        term_width.saturating_sub(1)
+    };
+
+    if let Some(clip) = pane_clip {
+        if clip.width == 0 || clip.height == 0 {
+            return None;
+        }
+
+        let clip_bottom = clip.y.saturating_add(clip.height).saturating_sub(1);
+        if row < clip.y || row > clip_bottom {
+            return None;
+        }
+
+        let clip_right = clip.x.saturating_add(clip.width).saturating_sub(1);
+        col_start = col_start.max(clip.x);
+        col_end = col_end.min(clip_right);
+    }
+
+    (col_start <= col_end).then_some((col_start, col_end))
+}
+
 fn extract_selection_text(
     layout: &LayoutJson,
     term_width: u16,
@@ -203,25 +242,37 @@ fn extract_selection_text(
     start: (u16, u16),
     end: (u16, u16),
     block: bool,
+    pane_clip: Option<Rect>,
 ) -> String {
     let (r0, c0, r1, c1) = normalize_selection(start, end, block);
 
-    let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
+    let content_area = Rect {
+        x: 0,
+        y: 0,
+        width: term_width,
+        height: content_height,
+    };
     let mut leaves: Vec<PaneLeaf> = Vec::new();
     collect_leaves(layout, content_area, &mut leaves);
 
     let mut result = String::new();
+    let mut wrote_line = false;
     for row in r0..=r1 {
-        let col_start = if block || row == r0 { c0 } else { 0 };
-        let col_end = if block || row == r1 { c1 } else { term_width.saturating_sub(1) };
+        let Some((col_start, col_end)) =
+            selection_row_cols(row, r0, c0, r1, c1, block, term_width, pane_clip)
+        else {
+            continue;
+        };
 
         let mut line = String::new();
         for col in col_start..=col_end {
             let mut ch = ' ';
             for leaf in &leaves {
                 let inner = &leaf.inner;
-                if col >= inner.x && col < inner.x + inner.width
-                    && row >= inner.y && row < inner.y + inner.height
+                if col >= inner.x
+                    && col < inner.x + inner.width
+                    && row >= inner.y
+                    && row < inner.y + inner.height
                 {
                     let local_row = (row - inner.y) as usize;
                     let local_col = (col - inner.x) as usize;
@@ -233,11 +284,11 @@ fn extract_selection_text(
             }
             line.push(ch);
         }
-        let trimmed = line.trim_end();
-        result.push_str(trimmed);
-        if row < r1 {
+        if wrote_line {
             result.push('\n');
         }
+        result.push_str(line.trim_end());
+        wrote_line = true;
     }
 
     result
@@ -428,6 +479,47 @@ pub fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
             for (i, child) in children.iter().enumerate() {
                 if i < rects.len() {
                     if let Some(r) = compute_active_rect_json(child, rects[i]) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Compute the active pane rectangle, optionally treating the layout as zoomed.
+///
+/// When `zoomed` is true, this mirrors `render_layout_json` behavior by walking
+/// only the visible (non-zero) split child and passing down the full parent area.
+pub(crate) fn compute_active_rect_json_zoom_aware(
+    node: &LayoutJson,
+    area: Rect,
+    zoomed: bool,
+) -> Option<Rect> {
+    match node {
+        LayoutJson::Leaf { active, .. } => {
+            if *active { Some(area) } else { None }
+        }
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            if zoomed {
+                if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
+                    if let Some(child) = children.get(i) {
+                        return compute_active_rect_json_zoom_aware(child, area, zoomed);
+                    }
+                }
+                return None;
+            }
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() {
+                    if let Some(r) = compute_active_rect_json_zoom_aware(child, rects[i], zoomed) {
                         return Some(r);
                     }
                 }
@@ -877,6 +969,78 @@ struct ClientDragState {
     total_pixels: u16,
 }
 
+/// Connect to the server, authenticate, enter persistent mode, spawn the reader
+/// thread, and return a (writer, frame_rx) pair ready for the event loop.
+/// Sets a 5-second write timeout so blocked writes never freeze the client.
+fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
+    let stream = std::net::TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
+    let mut writer = stream.try_clone()?;
+    writer.set_nodelay(true)?;
+    writer.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(stream);
+
+    let _ = writer.write_all(format!("AUTH {}\n", key).as_bytes());
+    let _ = writer.flush();
+    let mut auth_line = String::new();
+    reader.read_line(&mut auth_line)?;
+    if !auth_line.trim().starts_with("OK") {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed"));
+    }
+
+    let _ = writer.write_all(b"PERSISTENT\n");
+    let _ = writer.write_all(b"client-attach\n");
+    let _ = writer.flush();
+
+    // 2-second read timeout keeps the thread from blocking forever on process exit.
+    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = String::with_capacity(64 * 1024);
+        loop {
+            buf.clear();
+            loop {
+                match reader.read_line(&mut buf) {
+                    Ok(0) => return,
+                    Ok(_) => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Do NOT clear buf here. read_line appends to whatever is
+                        // already in buf, so a partial line from a previous
+                        // fill_buf call is preserved across timeouts. Clearing
+                        // would break the framing and corrupt the next message.
+                        continue;
+                    }
+                    Err(_) => return,
+                }
+            }
+            let line = std::mem::take(&mut buf);
+            buf = String::with_capacity(64 * 1024);
+            if frame_tx.send(line).is_err() { return; }
+        }
+    });
+
+    Ok((writer, frame_rx))
+}
+
+/// A live connection: write half + incoming-frame channel.
+type Connection = (std::net::TcpStream, std::sync::mpsc::Receiver<String>);
+
+/// Retry connecting up to 5 times: one immediate attempt, then up to 4 more
+/// with increasing backoff (500ms, 1s, 1.5s, 2s). Returns None if all fail.
+fn try_reconnect(addr: &str, key: &str) -> Option<Connection> {
+    for attempt in 0..5u64 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(attempt * 500));
+        }
+        if let Ok(result) = establish_connection(addr, key) {
+            return Some(result);
+        }
+    }
+    None
+}
+
 pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::PsmuxWriter>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
@@ -891,60 +1055,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     }
 
     // ── Open persistent TCP connection ───────────────────────────────────
-    let stream = std::net::TcpStream::connect(&addr)?;
-    stream.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
-    let mut writer = stream.try_clone()?;
-    writer.set_nodelay(true)?;
-    let mut reader = BufReader::new(stream);
-
-    // AUTH handshake
-    let _ = writer.write_all(format!("AUTH {}\n", session_key).as_bytes());
-    let _ = writer.flush();
-    let mut auth_line = String::new();
-    reader.read_line(&mut auth_line)?;
-    if !auth_line.trim().starts_with("OK") {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed"));
-    }
-
-    // Enter persistent mode + attach
-    let _ = writer.write_all(b"PERSISTENT\n");
-    let _ = writer.write_all(b"client-attach\n");
-    let _ = writer.flush();
-
-    // Spawn a dedicated reader thread so the event loop never blocks on I/O.
-    // The reader thread reads lines from the server and sends them via channel.
-    // Use a 2-second read timeout so the thread unblocks periodically.
-    // Without this, process::exit(0) on the server side may not deliver a
-    // TCP RST promptly on Windows, leaving read_line() blocked forever and
-    // the client stuck after the last pane exits.
-    let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut buf = String::with_capacity(64 * 1024);
-        loop {
-            buf.clear();
-            loop {
-                match reader.read_line(&mut buf) {
-                    Ok(0) => return, // EOF — server closed connection
-                    Ok(_) => break,  // Got a complete line, send it
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        // Timeout: buf may contain a partial line from a
-                        // previous fill_buf.  Do NOT clear it — read_line
-                        // will resume appending on the next call.  This
-                        // keeps the protocol stream intact.
-                        continue;
-                    }
-                    Err(_) => return, // Real error — connection died
-                }
-            }
-            let line = std::mem::take(&mut buf);
-            buf = String::with_capacity(64 * 1024);
-            if frame_tx.send(line).is_err() { return; }
-        }
-    });
+    let (mut writer, mut frame_rx) = establish_connection(&addr, &session_key)?;
+    // Pending background reconnect: Some(rx) while a reconnect thread is running.
+    // Kept as None in normal operation. When the channel yields Some(result),
+    // the result replaces writer/frame_rx; if it yields None all attempts failed.
+    let mut reconnect_pending: Option<std::sync::mpsc::Receiver<Option<Connection>>> = None;
 
     let mut quit = false;
     // detach-client -P: server sets this via DETACH-KILL-PARENT directive.
@@ -967,6 +1082,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut command_cursor: usize = 0;
     let mut command_history: Vec<String> = Vec::new();
     let mut command_history_idx: usize = 0;
+    // Template for command-prompt -I '#W' 'rename-window "%%"' style bindings.
+    // When set, Enter substitutes %% with user input and executes the template.
+    let mut command_template: Option<String> = None;
+    // Custom prompt label from command-prompt -p 'prompt:'
+    let mut command_prompt_label: Option<String> = None;
+    // Track active window name from last dump-state for #W expansion
+    let mut active_window_name = String::new();
     let mut window_idx_input = false;
     let mut window_idx_buf = String::new();
 
@@ -1053,6 +1175,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Synced bindings from server (updated each frame from DumpState)
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
     let mut defaults_suppressed: bool = false;
+    let mut scroll_enter_copy_mode: bool = true;
     // When false, Ctrl+V is forwarded to the child app instead of being
     // intercepted for paste detection.
     #[cfg(windows)]
@@ -1165,6 +1288,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     fn default_repeat_time() -> u64 { 500 }
     fn default_paste_detection() -> bool { true }
     fn default_mouse_selection() -> bool { true }
+    fn default_scroll_enter_copy_mode() -> bool { true }
 
     /// A single key binding synced from the server.
     #[derive(serde::Deserialize, Clone, Debug)]
@@ -1261,6 +1385,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a)
         #[serde(default)]
         defaults_suppressed: bool,
+        /// scroll-enter-copy-mode option (mirror of server-side AppState field).
+        /// When false, root key bindings that enter copy mode (e.g. PageUp ->
+        /// copy-mode -u) are skipped so the key reaches the PTY (#284).
+        #[serde(default = "default_scroll_enter_copy_mode")]
+        scroll_enter_copy_mode: bool,
         /// pwsh-mouse-selection option (mirror of server-side AppState field)
         #[serde(default)]
         pwsh_mouse_selection: bool,
@@ -1454,6 +1583,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // actually changes (avoids resetting WT's blink timer every frame).
     let mut last_cursor_style: u8 = 255;
     loop {
+        // ── Poll background reconnect result (non-blocking) ──────────────────
+        // If a background reconnect thread has finished, apply its result here
+        // before any other step so the rest of the loop sees the fresh channels.
+        if let Some(ref rx) = reconnect_pending {
+            if let Ok(result) = rx.try_recv() {
+                reconnect_pending = None;
+                if let Some((new_writer, new_rx)) = result {
+                    if !quit {
+                        // Normal reconnect: apply fresh writer + frame channel.
+                        writer = new_writer;
+                        frame_rx = new_rx;
+                        force_dump = true;
+                        dump_in_flight = false;
+                    }
+                    // If quit is already set (user detached while reconnect was
+                    // in-flight), let new_writer drop here so the TcpStream
+                    // closes immediately — server-side Guard fires right away
+                    // rather than waiting for the 5 s write timeout.
+                } else {
+                    quit = true;
+                }
+            }
+        }
         // Expire stale key_send_instant after 30ms — ConPTY echo should
         // have arrived by then; stop force-dumping to save CPU.
         if let Some(ks) = key_send_instant {
@@ -1492,6 +1644,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             let _ = writer.flush();
                             quit = true;
                         }
+                    } else if line.trim() == "DETACH" {
+                        // Server-initiated clean shutdown (session ended, kill-session, etc.)
+                        // Set quit before the TCP connection closes so the Disconnected
+                        // handler does not spawn a reconnect thread.
+                        quit = true;
                     } else if line.trim() == "DETACH-KILL-PARENT" {
                         // detach-client -P: detach this client AND kill the
                         // parent shell on exit (tmux -P parity, issue #275).
@@ -1505,7 +1662,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => { quit = true; break; }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // TCP connection dropped. If the server already removed its port
+                    // file (all clean-shutdown paths do this before calling
+                    // shutdown_persistent_streams), treat the disconnect as intentional
+                    // and quit immediately instead of burning 5 s of reconnect backoff.
+                    if !quit && !std::path::Path::new(&path).exists() {
+                        quit = true;
+                    } else if reconnect_pending.is_none() && !quit {
+                        let addr_c = addr.clone();
+                        let key_c = session_key.clone();
+                        let (rtx, rrx) = std::sync::mpsc::channel();
+                        reconnect_pending = Some(rrx);
+                        std::thread::spawn(move || {
+                            let _ = rtx.send(try_reconnect(&addr_c, &key_c));
+                        });
+                    }
+                    break;
+                }
             }
         }
         if quit && !got_frame { break; }
@@ -2072,11 +2246,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // These fire without prefix, before keys are forwarded to PTY
                         else if !command_input && !renaming && !pane_renaming && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
-                            synced_bindings.iter().any(|b| b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple))
+                            synced_bindings.iter().any(|b| {
+                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                // Skip scroll-triggered copy mode bindings when option is off (#284)
+                                && !(b.c.starts_with("copy-mode") && b.c.contains("-u") && !scroll_enter_copy_mode)
+                            })
                         } {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             if let Some(entry) = synced_bindings.iter().find(|b| {
                                 b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                && !(b.c.starts_with("copy-mode") && b.c.contains("-u") && !scroll_enter_copy_mode)
                             }) {
                                 if entry.c == "detach-client" || entry.c == "detach" {
                                     quit = true;
@@ -2122,8 +2301,54 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     renaming = true; rename_buf.clear();
                                 } else if cmd == "rename-session" {
                                     renaming = true; rename_buf.clear(); session_renaming = true;
-                                } else if cmd == "command-prompt" {
-                                    command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len();
+                                } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
+                                    command_input = true;
+                                    command_cursor = 0;
+                                    command_history_idx = command_history.len();
+                                    command_template = None;
+                                    command_prompt_label = None;
+                                    if cmd.starts_with("command-prompt ") {
+                                        // Parse -I initial_text, -p prompt, and template argument
+                                        let cp_args = &cmd["command-prompt ".len()..];
+                                        let tokens = crate::config::shell_words(cp_args);
+                                        let mut initial = String::new();
+                                        let mut prompt_text: Option<String> = None;
+                                        let mut positional: Vec<String> = Vec::new();
+                                        let mut i = 0;
+                                        while i < tokens.len() {
+                                            if tokens[i] == "-I" && i + 1 < tokens.len() {
+                                                initial = tokens[i + 1].clone();
+                                                i += 2;
+                                            } else if tokens[i] == "-p" && i + 1 < tokens.len() {
+                                                prompt_text = Some(tokens[i + 1].clone());
+                                                i += 2;
+                                            } else if tokens[i] == "-1" || tokens[i] == "-N" || tokens[i] == "-W" {
+                                                i += 1; // skip flags
+                                            } else if tokens[i].starts_with('-') {
+                                                i += 1; // skip unknown flags
+                                            } else {
+                                                positional.push(tokens[i].clone());
+                                                i += 1;
+                                            }
+                                        }
+                                        // Expand format variables in initial text
+                                        let initial = initial
+                                            .replace("#W", &active_window_name)
+                                            .replace("#{window_name}", &active_window_name)
+                                            .replace("#S", &current_session)
+                                            .replace("#{session_name}", &current_session);
+                                        command_buf = initial.clone();
+                                        command_cursor = command_buf.len();
+                                        // Join all positional args to form the template
+                                        // e.g. 'rename-window "%%"' → single arg, or
+                                        //       rename-window %%    → two args joined
+                                        if !positional.is_empty() {
+                                            command_template = Some(positional.join(" "));
+                                        }
+                                        command_prompt_label = prompt_text;
+                                    } else {
+                                        command_buf.clear();
+                                    }
                                 } else if cmd == "list-keys" {
                                     keys_viewer_scroll = 0;
                                     let user_binds: Vec<(bool, String, String, String)> = synced_bindings
@@ -2484,6 +2709,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 cmd_batch.push("prefix-end\n".into());
                             }
                         } else {
+                            // True briefly after an Event::Paste consumed by an
+                            // overlay (issue #290).  On Windows, crossterm emits
+                            // Event::Paste AND per-char Event::Key for one
+                            // Ctrl+V — this gates the duplicate Char inserts
+                            // into the overlay buffers below.
+                            #[cfg(windows)]
+                            let paste_burst_active =
+                                paste_suppress_until.map_or(false, |t| Instant::now() < t);
+                            #[cfg(not(windows))]
+                            let paste_burst_active = false;
                             match key.code {
                                 KeyCode::Up if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
                                 KeyCode::Down if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
@@ -2746,14 +2981,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if confirm_cmd.is_some() => {
                                     confirm_cmd = None;
                                 }
-                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { rename_buf.push(c); }
-                                KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { pane_title_buf.push(c); }
-                                KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() => { window_idx_buf.push(c); }
-                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) => { command_buf.insert(command_cursor, c); command_cursor += 1; }
+                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); }
+                                KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); }
+                                KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() && !paste_burst_active => { window_idx_buf.push(c); }
+                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); }
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
                                 KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
-                                KeyCode::Backspace if command_input => { if command_cursor > 0 { command_buf.remove(command_cursor - 1); command_cursor -= 1; } }
+                                KeyCode::Backspace if command_input => {
+                                    if command_cursor > 0 {
+                                        // Walk back to the previous char boundary so we never split a UTF-8 sequence.
+                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
+                                        let new_cursor = command_cursor - prev_len;
+                                        command_buf.replace_range(new_cursor..command_cursor, "");
+                                        command_cursor = new_cursor;
+                                    }
+                                }
                                 KeyCode::Enter if renaming => {
                                     if session_renaming {
                                         cmd_batch.push(format!("rename-session {}\n", quote_arg(&rename_buf)));
@@ -2772,11 +3015,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                                 KeyCode::Enter if command_input => {
                                     let trimmed = command_buf.trim().to_string();
-                                    if !trimmed.is_empty() {
-                                        command_history.push(trimmed.clone());
-                                        command_history_idx = command_history.len();
+                                    if !trimmed.is_empty() || command_template.is_some() {
+                                        if !trimmed.is_empty() {
+                                            command_history.push(trimmed.clone());
+                                            command_history_idx = command_history.len();
+                                        }
+                                        // If we have a template (from command-prompt -I ... 'cmd "%%"'),
+                                        // substitute %% with user input and send that command instead.
+                                        let final_cmd = if let Some(ref tmpl) = command_template {
+                                            tmpl.replace("%%", &trimmed)
+                                        } else {
+                                            trimmed.clone()
+                                        };
                                         // Intercept client-side UI commands from command prompt
-                                        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+                                        let first_word = final_cmd.split_whitespace().next().unwrap_or("");
                                         if first_word == "choose-buffer" || first_word == "chooseb" {
                                             // Open interactive buffer chooser instead of sending to server
                                             buffer_chooser = true;
@@ -2824,7 +3076,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             if buffer_entries.is_empty() { buffer_chooser = false; }
                                         } else {
                                             // Split on \; or ; to support command chaining (issue #192)
-                                            let sub_cmds = crate::config::split_chained_commands_pub(&trimmed);
+                                            let sub_cmds = crate::config::split_chained_commands_pub(&final_cmd);
                                             // detach-client typed at the prompt must also quit
                                             // THIS client unless `-a` (detach others) or
                                             // `-t %<id>`/`-t <tty>` (target someone else) is
@@ -2856,8 +3108,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; }
 
                                 // Command prompt: cursor movement, history, and editing keys
-                                KeyCode::Left if command_input => { if command_cursor > 0 { command_cursor -= 1; } }
-                                KeyCode::Right if command_input => { if command_cursor < command_buf.len() { command_cursor += 1; } }
+                                KeyCode::Left if command_input => {
+                                    if command_cursor > 0 {
+                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
+                                        command_cursor -= prev_len;
+                                    }
+                                }
+                                KeyCode::Right if command_input => {
+                                    if command_cursor < command_buf.len() {
+                                        let next_len = command_buf[command_cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                                        command_cursor += next_len;
+                                    }
+                                }
                                 KeyCode::Home if command_input => { command_cursor = 0; }
                                 KeyCode::End if command_input => { command_cursor = command_buf.len(); }
                                 KeyCode::Delete if command_input => { if command_cursor < command_buf.len() { command_buf.remove(command_cursor); } }
@@ -2955,6 +3217,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
+                                                    rsel_pane_rect,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -3000,6 +3263,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
+                                                rsel_pane_rect,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3104,13 +3368,28 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                     }
                     Event::Paste(data) => {
-                        let encoded = base64_encode(&data);
-                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                        // Route paste into the active client-side text overlay
+                        // (issue #290) so it does not leak past the command
+                        // prompt / rename prompts into the underlying pane.
+                        let consumed = route_paste_to_overlay(
+                            &data,
+                            command_input, &mut command_buf, &mut command_cursor,
+                            renaming, &mut rename_buf,
+                            pane_renaming, &mut pane_title_buf,
+                            window_idx_input, &mut window_idx_buf,
+                        );
+                        if !consumed {
+                            let encoded = base64_encode(&data);
+                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                        }
                         // On Windows, crossterm with EnableBracketedPaste may
                         // emit Event::Paste AND individual Event::Key events
                         // for the same Ctrl+V paste.  Suppress the duplicate
                         // Key events by clearing any partially accumulated
                         // paste_pend chars and blocking accumulation briefly.
+                        // The same paste_suppress_until window also gates the
+                        // overlay Char arms so the duplicate Key events do
+                        // not double-insert when an overlay consumed the paste.
                         #[cfg(windows)]
                         {
                             paste_pend.clear();
@@ -3356,6 +3635,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
+                                                rsel_pane_rect,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3465,12 +3745,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     client_drag = None;
                                 } else if rsel_dragged {
                                     if client_pwsh_selection {
-                                        // Windows 11 style: keep the selection
-                                        // visible until the user right-clicks to
-                                        // copy. Do not overwrite rsel_end here —
-                                        // the drag handler already tracks it,
-                                        // and double-click word bounds must not
-                                        // be replaced by the release-position.
+                                        // tmux-like copy-on-release for
+                                        // pwsh-mouse-selection: use the drag
+                                        // endpoint tracked by MouseDrag so
+                                        // double/triple-click bounds remain
+                                        // intact, then clear transient state.
+                                        if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                            if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                                let text = extract_selection_text(
+                                                    &state.layout,
+                                                    last_sent_size.0,
+                                                    last_sent_size.1,
+                                                    s, e,
+                                                    rsel_block,
+                                                    rsel_pane_rect,
+                                                );
+                                                if !text.is_empty() {
+                                                    copy_to_system_clipboard(&text);
+                                                    pending_osc52 = Some(text);
+                                                }
+                                            }
+                                        }
+                                        rsel_start = None;
+                                        rsel_end = None;
+                                        rsel_pane_rect = None;
+                                        rsel_block = false;
+                                        rsel_dragged = false;
                                         selection_changed = true;
                                     } else {
                                         // Legacy: copy-on-release.
@@ -3483,6 +3783,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     false,
+                                                    rsel_pane_rect,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -3788,6 +4089,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
         let root = state.layout;
         let windows = state.windows;
+        // Track the active window name for command-prompt -I '#W' expansion
+        if let Some(aw) = windows.iter().find(|w| w.active) {
+            active_window_name = aw.name.clone();
+        }
         last_tree = state.tree;
         let base_index = state.base_index;
         client_base_index = base_index;
@@ -3941,6 +4246,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             synced_bindings = state.bindings;
         }
         defaults_suppressed = state.defaults_suppressed;
+        scroll_enter_copy_mode = state.scroll_enter_copy_mode;
         // Sync repeat-time from server
         repeat_time_ms = state.repeat_time;
         // Update status-left / status-right from server (already format-expanded)
@@ -4045,7 +4351,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             let mut border_path = Vec::new();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
 
-            let active_rect = compute_active_rect_json(&root, content_chunk);
+            let active_rect = compute_active_rect_json_zoom_aware(&root, content_chunk, state.zoomed);
             let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);
             let border_status = state.pane_border_status.as_deref().unwrap_or("off");
             let border_format = state.pane_border_format.as_deref().unwrap_or("");
@@ -4884,7 +5190,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 f.render_widget(para, overlay.inner(oa));
             }
             if command_input {
-                let overlay = Block::default().borders(Borders::ALL).title("command");
+                let title = command_prompt_label.as_deref().unwrap_or("command");
+                let overlay = Block::default().borders(Borders::ALL).title(title);
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
@@ -5262,29 +5569,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
             let effective = find_active_cursor_shape(&root)
                 .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
-            // Compute the active pane's screen Rect so we can translate
-            // pane-local cursor coords to terminal-global coords.
-            fn find_active_rect(node: &LayoutJson, area: Rect) -> Option<Rect> {
-                match node {
-                    LayoutJson::Leaf { active, .. } => {
-                        if *active { Some(area) } else { None }
-                    }
-                    LayoutJson::Split { kind, sizes, children } => {
-                        let eff: Vec<u16> = if sizes.len() == children.len() {
-                            sizes.clone()
-                        } else {
-                            vec![(100 / children.len().max(1)) as u16; children.len()]
-                        };
-                        let rects = crate::tree::split_with_gaps(kind == "Horizontal", &eff, area);
-                        for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() {
-                                if let Some(r) = find_active_rect(child, rects[i]) { return Some(r); }
-                            }
-                        }
-                        None
-                    }
-                }
-            }
             let active_pane_area: Option<Rect> = {
                 let sz = terminal.size().unwrap_or_default();
                 let constraints = if status_at_top {
@@ -5295,7 +5579,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 let chunks = Layout::default().direction(Direction::Vertical)
                     .constraints(constraints).split(sz.into());
                 let content_chunk = if status_at_top { chunks[1] } else { chunks[0] };
-                find_active_rect(&root, content_chunk)
+                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed)
             };
             // Compute screen-global cursor position from pane-local coords.
             let cursor_visible = if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
@@ -5435,6 +5719,43 @@ fn paste_buffer_has_non_ascii(buf: &str) -> bool {
     buf.chars().any(|c| !c.is_ascii())
 }
 
+/// Route a clipboard paste into the active client-side text overlay
+/// (command prompt, rename prompt, pane title, window-index prompt).
+/// Returns `true` when an overlay consumed the paste — callers must skip
+/// the `send-paste` forwarding in that case so the text does not also leak
+/// into the underlying pane (fixes issue #290).
+fn route_paste_to_overlay(
+    data: &str,
+    command_input: bool,
+    command_buf: &mut String,
+    command_cursor: &mut usize,
+    renaming: bool,
+    rename_buf: &mut String,
+    pane_renaming: bool,
+    pane_title_buf: &mut String,
+    window_idx_input: bool,
+    window_idx_buf: &mut String,
+) -> bool {
+    if command_input {
+        command_buf.insert_str(*command_cursor, data);
+        *command_cursor += data.len();
+        true
+    } else if renaming {
+        rename_buf.push_str(data);
+        true
+    } else if pane_renaming {
+        pane_title_buf.push_str(data);
+        true
+    } else if window_idx_input {
+        for c in data.chars() {
+            if c.is_ascii_digit() { window_idx_buf.push(c); }
+        }
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests-rs/test_client.rs"]
 mod tests;
@@ -5442,3 +5763,11 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_bleed.rs"]
 mod test_zoom_bleed;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_zoom_cursor_rect.rs"]
+mod test_zoom_cursor_rect;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue345_command_prompt_utf8.rs"]
+mod test_issue345_command_prompt_utf8;

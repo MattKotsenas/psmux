@@ -22,7 +22,7 @@ use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all
     get_split_mut, path_exists};
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
-    list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
+    list_windows_json_with_tabs, combined_data_version, take_pane_clipboard, TMUX_COMMANDS};
 use options::{get_option_value, render_window_options, apply_set_option};
 
 use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
@@ -83,7 +83,9 @@ fn ensure_session_registry_files(home: &str, app: &AppState) {
     let base = app.port_file_base();
     let port_path = format!("{}\\{}.port", dir, base);
     let key_path = format!("{}\\{}.key", dir, base);
+    let sid_path = format!("{}\\{}.sid", dir, base);
     let port_value = port.to_string();
+    let sid_value = app.session_id.to_string();
 
     if std::fs::read_to_string(&port_path)
         .map(|s| s.trim() != port_value)
@@ -97,6 +99,13 @@ fn ensure_session_registry_files(home: &str, app: &AppState) {
         .unwrap_or(true)
     {
         let _ = std::fs::write(&key_path, &app.session_key);
+    }
+
+    if std::fs::read_to_string(&sid_path)
+        .map(|s| s.trim() != sid_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&sid_path, &sid_value);
     }
 }
 
@@ -466,6 +475,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         };
         let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.port", home, base));
         let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.key", home, base));
+        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.sid", home, base));
     }));
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -673,6 +683,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // behind when the pane command fails to spawn (issue #204).
         let _ = std::fs::remove_file(&regpath);
         let _ = std::fs::remove_file(&keypath);
+        crate::session::remove_session_id_file(&app.port_file_base());
         // Kill warm pane if one was pre-spawned
         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
         return Err(e);
@@ -827,6 +838,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             if crate::types::CPR_DATA_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 for win in &mut app.windows {
                     helpers::drain_cpr_pending(&mut win.root);
+                }
+                // Also answer CPR queries for the warm pane — it is not in
+                // any window yet, but pwsh / PSReadLine blocks on the ESC[6n
+                // response during shell startup.  Without this, the warm
+                // pane's shell never finishes loading.
+                if let Some(ref mut wp) = app.warm_pane {
+                    if wp.cpr_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        let (r, c) = wp.term.lock()
+                            .map(|g| g.screen().cursor_position())
+                            .unwrap_or((0, 0));
+                        let response = format!("\x1b[{};{}R", r + 1, c + 1);
+                        use std::io::Write as _;
+                        let _ = wp.writer.write_all(response.as_bytes());
+                        let _ = wp.writer.flush();
+                    }
                 }
             }
         }
@@ -1338,6 +1364,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -1482,7 +1509,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                     let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -1494,6 +1521,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.mouse_selection,
                         app.paste_detection,
                         app.choose_tree_preview,
+                        app.scroll_enter_copy_mode,
                     ));
                     // Inject overlay state (popup, menu, confirm, display_panes)
                     {
@@ -1555,6 +1583,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     cached_dump_state.clear();
                     cached_dump_state.push_str(&combined_buf);
+                    // Forward OSC 52 from pane child processes (e.g. Claude
+                    // Code's `/copy`).  The pane's parser stages incoming
+                    // OSC 52 onto its Screen; drain it and decode to plain
+                    // text so the existing dump-state injection below
+                    // re-emits it as OSC 52 on the client's stdout to the
+                    // host terminal.  Gated by `set-clipboard` option.
+                    if app.set_clipboard != "off" && app.clipboard_osc52.is_none() {
+                        if let Some((_sel, b64)) = take_pane_clipboard(&app) {
+                            if let Ok(b64_str) = std::str::from_utf8(&b64) {
+                                if let Some(text) = crate::util::base64_decode(b64_str) {
+                                    app.clipboard_osc52 = Some(text);
+                                }
+                            }
+                        }
+                    }
                     // Inject one-shot clipboard data for OSC 52 delivery to
                     // the client.  Only the *response* includes this field;
                     // the cached copy does not, so subsequent NC frames won't
@@ -1823,6 +1866,33 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 s if s.starts_with("C-") => {
                                     if let Some(c) = s.chars().nth(2) {
                                         let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) else { continue };
+                                        // On Windows with Win32 input mode, write the key as
+                                        // a Win32 input mode escape sequence so ConPTY generates
+                                        // a proper KEY_EVENT with VK + LEFT_CTRL_PRESSED (#305).
+                                        #[cfg(windows)]
+                                        {
+                                            if c.is_ascii_alphabetic() {
+                                                // Keep Ctrl+C on the legacy interrupt path:
+                                                // raw 0x03 + send_ctrl_c_event below.
+                                                if ctrl == 0x03 {
+                                                    send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                                } else {
+                                                    let vk = crate::platform::mouse_inject::char_to_vk(c);
+                                                    let scan = crate::platform::mouse_inject::vk_to_scan(vk);
+                                                    let u_char = (c.to_ascii_lowercase() as u16) & 0x1F;
+                                                    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+                                                    let seq = format!(
+                                                        "\x1b[{};{};{};1;{};1_\x1b[{};{};{};0;{};1_",
+                                                        vk, scan, u_char, LEFT_CTRL_PRESSED,
+                                                        vk, scan, u_char, LEFT_CTRL_PRESSED
+                                                    );
+                                                    send_text_to_active(&mut app, &seq)?;
+                                                }
+                                            } else {
+                                                send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                            }
+                                        }
+                                        #[cfg(not(windows))]
                                         send_text_to_active(&mut app, &String::from(ctrl as char))?;
                                         // On Windows, writing 0x03 to the PTY pipe doesn't
                                         // generate CTRL_C_EVENT when ENABLE_PROCESSED_INPUT
@@ -2000,9 +2070,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "scroll-down" => { scroll_copy_down(&mut app, 1); }
                         "search-forward" | "search-forward-incremental" => {
                             app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                            let prompt = "(search down) ".to_string();
+                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
                         }
                         "search-backward" | "search-backward-incremental" => {
                             app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                            let prompt = "(search up) ".to_string();
+                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
                         }
                         "search-again" => { crate::copy_mode::search_next(&mut app); }
                         "search-reverse" => { crate::copy_mode::search_prev(&mut app); }
@@ -2333,13 +2407,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    // Remove port/key files FIRST so clients see the session
+                    // Remove port/key/sid files FIRST so clients see the session
                     // as gone immediately, then kill processes.
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
+                    crate::session::remove_session_id_file(&app.port_file_base());
+                    crate::types::send_directive_to_all_clients("DETACH");
+                    std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -2373,6 +2450,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = std::fs::remove_file(&old_keypath);
                             let _ = std::fs::write(&new_keypath, key);
                         }
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
                     }
                     app.session_name = name;
                     // Update env so run-shell/hooks from this server target the new name
@@ -2399,6 +2479,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = std::fs::remove_file(&old_keypath);
                             let _ = std::fs::write(&new_keypath, key);
                         }
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
                     }
                     app.session_name = name;
                     // Warm server's created_at is the warm process start time, not the
@@ -2580,6 +2663,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         expand_format(&fmt, &app)
                     };
+                    if set_status_bar {
+                        app.status_message = Some((result.clone(), Instant::now(), duration_ms));
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(result);
+                }
+                CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms) => {
+                    // Bare %N pane targeting (#332) — resolve the pane ID
+                    // globally across all windows and expand the format with
+                    // PANE_POS_OVERRIDE pointing at it.
+                    helpers::propagate_osc_titles(&mut app);
+                    let result = crate::format::expand_format_for_pane_by_id(&fmt, &app, pane_id);
                     if set_status_bar {
                         app.status_message = Some((result.clone(), Instant::now(), duration_ms));
                         state_dirty = true;
@@ -3318,6 +3413,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3335,7 +3431,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if let Some(cid) = target_cid {
                         if kill_parent {
                             crate::types::send_directive_to_client(cid, "DETACH-KILL-PARENT");
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            std::thread::sleep(Duration::from_millis(50));
                         }
                         app.client_sizes.remove(&cid);
                         let was_present = app.client_registry.remove(&cid).is_some();
@@ -3369,7 +3465,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                     if kill_parent && !targets.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
                         app.client_sizes.remove(cid);
@@ -3397,6 +3493,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3417,7 +3514,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                     if kill_parent && !targets.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
                         app.client_sizes.remove(cid);
@@ -3444,6 +3541,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3649,6 +3747,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
+                    crate::types::send_directive_to_all_clients("DETACH");
+                    std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -4434,7 +4534,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             };
             let cursor_style_code = crate::rendering::configured_cursor_code();
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"choose_tree_preview\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -4444,6 +4544,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 app.pwsh_mouse_selection,
                 app.mouse_selection,
                 app.choose_tree_preview,
+                app.scroll_enter_copy_mode,
             ));
             // Inject overlay state (popup, menu, confirm, display_panes)
             {
@@ -4499,6 +4600,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     combined_buf.pop();
                     combined_buf.push_str(&overlay_json);
                     combined_buf.push('}');
+                }
+            }
+            // Forward OSC 52 from pane child processes (e.g. Claude Code
+            // `/copy`).  See sibling block in the dump-state response path
+            // for full context.  Gated by `set-clipboard`.
+            if app.set_clipboard != "off" && app.clipboard_osc52.is_none() {
+                if let Some((_sel, b64)) = take_pane_clipboard(&app) {
+                    if let Ok(b64_str) = std::str::from_utf8(&b64) {
+                        if let Some(text) = crate::util::base64_decode(b64_str) {
+                            app.clipboard_osc52 = Some(text);
+                        }
+                    }
                 }
             }
             // Inject clipboard data if pending
@@ -4729,6 +4842,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                 let _ = std::fs::remove_file(&regpath);
                 let _ = std::fs::remove_file(&keypath);
+                crate::types::send_directive_to_all_clients("DETACH");
+                std::thread::sleep(Duration::from_millis(50));
                 crate::types::shutdown_persistent_streams();
                 // Kill warm pane's child (process::exit skips Drop)
                 if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }

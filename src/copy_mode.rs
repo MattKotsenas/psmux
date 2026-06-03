@@ -1,15 +1,6 @@
 use std::io::{self, Write};
-#[cfg(windows)]
-use std::thread;
-#[cfg(windows)]
-use std::time::Duration;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
-#[cfg(windows)]
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
-#[cfg(windows)]
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
+use crate::clipboard::copy_to_system_clipboard;
 use crate::types::{AppState, Mode, CopyModeState};
 use crate::tree::{active_pane, active_pane_mut};
 
@@ -52,6 +43,8 @@ pub fn exit_copy_mode(app: &mut AppState) {
     app.copy_pos = None;
     app.copy_mouse_down_cell = None;
     app.copy_scroll_offset = 0;
+    // Clear the search prompt if it was lingering from CopySearch (#335).
+    app.status_message = None;
     let win = &mut app.windows[app.active_idx];
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
         // Clear the pane-local copy state so re-entering this pane won't
@@ -149,95 +142,6 @@ pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switc
         app.mode = Mode::Passthrough;
     }
 }
-
-#[cfg(windows)]
-pub fn copy_to_system_clipboard(text: &str) {
-    const CF_UNICODETEXT: u32 = 13;
-
-    // Clipboard can be momentarily locked by other processes; retry briefly.
-    for _ in 0..5 {
-        let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
-        if opened == 0 {
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-
-        let mut utf16: Vec<u16> = text.encode_utf16().collect();
-        utf16.push(0); // null terminator required by CF_UNICODETEXT
-        let size_bytes = utf16.len() * std::mem::size_of::<u16>();
-        let mut hmem: HGLOBAL = std::ptr::null_mut();
-
-        unsafe {
-            if EmptyClipboard() != 0 {
-                hmem = GlobalAlloc(GMEM_MOVEABLE, size_bytes);
-                if !hmem.is_null() {
-                    let dst = GlobalLock(hmem) as *mut u16;
-                    if !dst.is_null() {
-                        std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-                        GlobalUnlock(hmem);
-                        if !SetClipboardData(CF_UNICODETEXT, hmem).is_null() {
-                            // Ownership transferred to the OS on success.
-                            hmem = std::ptr::null_mut();
-                        }
-                    }
-                }
-            }
-
-            if !hmem.is_null() {
-                let _ = GlobalFree(hmem);
-            }
-            let _ = CloseClipboard();
-        }
-        break;
-    }
-}
-
-#[cfg(not(windows))]
-pub fn copy_to_system_clipboard(_text: &str) {}
-
-/// Read text from the Windows system clipboard.
-#[cfg(windows)]
-pub fn read_from_system_clipboard() -> Option<String> {
-    const CF_UNICODETEXT: u32 = 13;
-    for _ in 0..5 {
-        let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
-        if opened == 0 {
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-        let result = unsafe {
-            let hmem = GetClipboardData(CF_UNICODETEXT);
-            if hmem.is_null() {
-                let _ = CloseClipboard();
-                return None;
-            }
-            let ptr = GlobalLock(hmem) as *const u16;
-            if ptr.is_null() {
-                let _ = CloseClipboard();
-                return None;
-            }
-            // Find null terminator
-            let mut len = 0usize;
-            while *ptr.add(len) != 0 {
-                len += 1;
-                if len > 1_000_000 { break; } // safety limit
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let text = String::from_utf16_lossy(slice);
-            GlobalUnlock(hmem);
-            let _ = CloseClipboard();
-            // Normalize Windows CRLF to LF — ConPTY expands LF to CRLF on
-            // output, so keeping \r\n produces double-spaced text.
-            let text = text.replace("\r\n", "\n");
-            Some(text)
-        };
-        return result;
-    }
-    None
-}
-
-#[cfg(not(windows))]
-pub fn read_from_system_clipboard() -> Option<String> { None }
 
 pub fn current_prompt_pos(app: &mut AppState) -> Option<(u16,u16)> {
     let win = &mut app.windows[app.active_idx];
@@ -1167,6 +1071,21 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
             let screen = parser.screen();
             render_styled_row(screen, r, &mut text);
         }
+        // Trim trailing all-empty rows — match the behaviour the plain
+        // (non-styled) capture path has had for a long time (`while
+        // text.ends_with("\n\n") { text.pop(); }` + the iTerm2 comment in
+        // `capture_active_pane_text` and `capture_active_pane_range`).
+        // The styled path needs its own helper because empty rows that
+        // follow a styled row carry an `\x1b[0m` SGR reset between the
+        // newlines, so the plain ends_with("\n\n") test misses them.
+        // Without the trim, a downstream consumer that writes the snapshot
+        // into a terminal (xterm.js for a screen-mirror UI, fresh xterm
+        // window, …) leaves the cursor under the visible content — by as
+        // many rows as the pane has trailing blanks. Aiball #531 + POC
+        // (delta_y/x measured between display-message and xterm.js after
+        // term.write) reported the same shift on tmux Linux even though
+        // there the wrap at column 80 made it visually less obvious.
+        trim_trailing_empty_styled_lines(&mut text);
         return Ok(Some(text));
     }
 
@@ -1210,7 +1129,107 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
     }
 
     parser.screen_mut().set_scrollback(saved_sb);
+    trim_trailing_empty_styled_lines(&mut text);
     Ok(Some(text))
+}
+
+/// Strip trailing all-empty rows from a styled (`-e`) capture buffer.
+///
+/// A row in the styled output is one "line" terminated by `\n`. An empty
+/// row carries either `\n` (no style ever active) or `\x1b[0m\n` (the
+/// previous row left a style active and this row reset it). After all
+/// trailing empty rows are gone, the buffer ends with the last
+/// content-bearing row + its newline (or is empty if there was no
+/// content at all). The plain-capture siblings already do this via
+/// `while text.ends_with("\n\n") { text.pop(); }` — the styled path
+/// needs its own helper because of the SGR resets between newlines.
+fn trim_trailing_empty_styled_lines(text: &mut String) {
+    loop {
+        if !text.ends_with('\n') {
+            return;
+        }
+        let trailing_nl_at = text.len() - 1;
+        let line_start = text[..trailing_nl_at].rfind('\n').map_or(0, |i| i + 1);
+        let last_line = &text[line_start..trailing_nl_at];
+        // The line is "empty" when stripping any leading `\x1b[0m` SGR
+        // resets leaves nothing.
+        let mut remaining = last_line;
+        while let Some(rest) = remaining.strip_prefix("\x1b[0m") {
+            remaining = rest;
+        }
+        if !remaining.is_empty() {
+            return; // last line has content — done.
+        }
+        text.truncate(line_start);
+    }
+}
+
+#[cfg(test)]
+mod trim_trailing_empty_styled_lines_tests {
+    use super::trim_trailing_empty_styled_lines;
+
+    fn run(input: &str) -> String {
+        let mut s = String::from(input);
+        trim_trailing_empty_styled_lines(&mut s);
+        s
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert_eq!(run(""), "");
+    }
+
+    #[test]
+    fn no_trailing_newline_untouched() {
+        assert_eq!(run("hello"), "hello");
+        assert_eq!(run("\x1b[31mred"), "\x1b[31mred");
+    }
+
+    #[test]
+    fn single_trailing_newline_after_content_kept() {
+        assert_eq!(run("hello\n"), "hello\n");
+        assert_eq!(run("first\nsecond\n"), "first\nsecond\n");
+    }
+
+    #[test]
+    fn trailing_blank_lines_collapsed() {
+        assert_eq!(run("hello\n\n\n\n"), "hello\n");
+    }
+
+    #[test]
+    fn trailing_sgr_reset_lines_collapsed() {
+        // Each trailing empty row carries an SGR reset before its \n.
+        assert_eq!(run("hello\n\x1b[0m\n\x1b[0m\n"), "hello\n");
+    }
+
+    #[test]
+    fn mixed_trailing_blank_and_reset_lines_collapsed() {
+        assert_eq!(run("hello\n\n\x1b[0m\n\n\x1b[0m\n"), "hello\n");
+    }
+
+    #[test]
+    fn fully_empty_input_truncates() {
+        // Only resets + newlines, no content anywhere.
+        assert_eq!(run("\n\n\n"), "");
+        assert_eq!(run("\x1b[0m\n\x1b[0m\n"), "");
+    }
+
+    #[test]
+    fn content_with_inline_resets_kept() {
+        // SGR reset in the middle of a content row is part of that row, not a
+        // trailing-empty marker — must NOT be confused.
+        assert_eq!(
+            run("\x1b[31mred\x1b[0m text\n\n"),
+            "\x1b[31mred\x1b[0m text\n",
+        );
+    }
+
+    #[test]
+    fn multiple_sgr_resets_on_an_empty_line_still_empty() {
+        // Pathological but legal: a row that resets and then resets again
+        // (some renderers may emit double resets defensively).
+        assert_eq!(run("hello\n\x1b[0m\x1b[0m\n"), "hello\n");
+    }
 }
 
 /// Move to next empty line (paragraph boundary) — } key

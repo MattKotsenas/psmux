@@ -140,6 +140,24 @@ fn ctrl_a_produces_soh() {
 }
 
 #[test]
+fn ctrl_c_key_event_detects_uppercase_control_c() {
+    let ev = key(KeyCode::Char('C'), KeyModifiers::CONTROL);
+    assert!(is_ctrl_c_key_event(&ev), "Ctrl+C must be recognized as interrupt key");
+}
+
+#[test]
+fn ctrl_c_key_event_detects_raw_etx() {
+    let ev = key(KeyCode::Char('\u{0003}'), KeyModifiers::NONE);
+    assert!(is_ctrl_c_key_event(&ev), "raw ETX (0x03) must be recognized as Ctrl+C");
+}
+
+#[test]
+fn ctrl_c_key_event_rejects_alt_modified_c() {
+    let ev = key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    assert!(!is_ctrl_c_key_event(&ev), "Ctrl+Alt+C must not be treated as plain Ctrl+C");
+}
+
+#[test]
 fn plain_backslash_no_modifiers() {
     let ev = key(KeyCode::Char('\\'), KeyModifiers::NONE);
     let bytes = encode_key_event(&ev).unwrap();

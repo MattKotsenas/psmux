@@ -170,11 +170,42 @@ class Injector
                     {
                         if (SendKey(handle, 0x27, '\0', 0, log)) injected++;
                     }
+                    else if (token == "HOME")
+                    {
+                        if (SendKey(handle, 0x24, '\0', 0, log)) injected++;
+                    }
+                    else if (token == "END")
+                    {
+                        if (SendKey(handle, 0x23, '\0', 0, log)) injected++;
+                    }
+                    else if (token == "PGUP" || token == "PAGEUP")
+                    {
+                        if (SendKey(handle, 0x21, '\0', 0, log)) injected++;
+                    }
+                    else if (token == "PGDN" || token == "PAGEDOWN")
+                    {
+                        if (SendKey(handle, 0x22, '\0', 0, log)) injected++;
+                    }
                     else if (token.StartsWith("SLEEP:"))
                     {
                         int ms = int.Parse(token.Substring(6));
                         Thread.Sleep(ms);
                         log.Add("  SLEEP " + ms + "ms");
+                    }
+                    else if (token.StartsWith("U:"))
+                    {
+                        // {U:XXXX[,XXXX,...]} — inject one or more Unicode codepoints
+                        // (hex BMP) as KEY_EVENT records with vk=0 and UnicodeChar set.
+                        // crossterm's ReadConsoleInputW path delivers these as
+                        // KeyCode::Char(c) — the only reliable way to inject e.g.
+                        // CJK characters into the console input buffer.
+                        var hexes = token.Substring(2).Split(',');
+                        foreach (var hex in hexes)
+                        {
+                            char uc = (char)Convert.ToUInt16(hex, 16);
+                            if (SendKey(handle, 0, uc, 0, log)) injected++;
+                            Thread.Sleep(20);
+                        }
                     }
                     else if (token.StartsWith("RAW:"))
                     {

@@ -106,6 +106,21 @@ pub struct Pane {
     pub last_infer_title: Instant,
     /// True when the child process has exited but remain-on-exit keeps the pane visible.
     pub dead: bool,
+    /// Timestamp of the last printable keystroke routed via the INTERACTIVE
+    /// text-input route (`handle_key -> forward_key_to_active`); `None` until
+    /// the first one. NOT updated by the injected route (`send-keys` /
+    /// `send-paste` / `send-text`). Exposed read-only as the
+    /// `#{pane_last_text_input}` format variable. Lives on the pane, so it's
+    /// freed with it (no separate lifecycle / file).
+    pub last_text_input: Option<Instant>,
+    /// The last NON-text key routed via the INTERACTIVE input route
+    /// (`handle_key -> forward_key_to_active`): its canonical bind-key name
+    /// (`Escape`, `Enter`, `Up`, `F9`, `C-c`, `M-a`, ...) + the `Instant` it
+    /// arrived; `None` until the first one. Same route contract as
+    /// `last_text_input` (NOT updated by the injected route). The text vs
+    /// non-text split is `is_text_input_key`. Exposed read-only as
+    /// `#{pane_last_special_key}` / `#{pane_last_special_key_ms}`.
+    pub last_special_key: Option<(Instant, String)>,
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
@@ -734,10 +749,7 @@ impl AppState {
             run_shell_rx: None,
             run_shell_tx: None,
             session_name,
-            session_id: {
-                static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),
@@ -1026,6 +1038,8 @@ pub enum CtrlReq {
     DeleteNamedBuffer(String),
     PasteBufferAt(usize),
     DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
+    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>),  // resp, format, pane_id, set_status_bar, duration_override_ms
     LastWindow,
     LastPane,
     RotateWindow(bool),
@@ -1268,6 +1282,16 @@ pub fn register_persistent_stream(client_id: u64, stream: &std::net::TcpStream) 
     }
 }
 
+/// Remove a specific client's entry from PERSISTENT_STREAMS without shutting
+/// it down. Called by the writer-thread Guard on normal disconnect — the socket
+/// is already shut down via ws_shutdown at that point, so we only need to drop
+/// the dead clone from the Vec to prevent unbounded accumulation.
+pub fn deregister_persistent_stream(client_id: u64) {
+    if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+        v.retain(|(cid, _)| *cid != client_id);
+    }
+}
+
 /// Shut down all tracked persistent client streams so their readers get EOF.
 pub fn shutdown_persistent_streams() {
     if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
@@ -1351,15 +1375,19 @@ pub fn push_frame(frame: &str) {
                     // Frames are full snapshots, not deltas. If the client is
                     // behind, stale queued frames should not block the newest
                     // corrective frame from reaching the terminal.
-                    let rx = match channel.rx.lock() {
-                        Ok(rx) => rx,
-                        Err(_) => return false,
-                    };
-                    loop {
-                        match rx.try_recv() {
-                            Ok(_) => {}
-                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                    //
+                    // Use try_lock, not lock: the writer thread holds rx.lock()
+                    // while it drains into its local buffer (before TCP writes).
+                    // Blocking here would deadlock the server's main loop.
+                    // If try_lock fails the writer is mid-drain; skip our drain
+                    // and try_send anyway — the writer will free space shortly.
+                    if let Ok(rx) = channel.rx.try_lock() {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(_) => {}
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                            }
                         }
                     }
                     matches!(
@@ -1376,6 +1404,15 @@ pub fn push_frame(frame: &str) {
 /// Check if any persistent clients are registered for push.
 pub fn has_frame_receivers() -> bool {
     FRAME_PUSH_CHANNELS.lock().map_or(false, |v| !v.is_empty())
+}
+
+/// Remove the frame channel for a specific client. Called by the writer thread
+/// on exit so the server stops pushing to dead channels and has_frame_receivers()
+/// returns false when no live clients remain.
+pub fn deregister_frame_channel(client_id: u64) {
+    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
+        v.retain(|(cid, _)| *cid != client_id);
+    }
 }
 
 /// Per-client directive channels (queued, not overwritten like frame slots).

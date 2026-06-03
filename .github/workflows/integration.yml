@@ -1,0 +1,65 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      test-pattern:
+        description: "PowerShell filter for integration tests (e.g. test_issue*.ps1)"
+        required: false
+        default: "test_*.ps1"
+      fail-fast:
+        description: "Stop after first failing integration test"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Default cadence: nightly at 05:00 UTC.
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: integration-tests
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: Full Integration Suite
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build x64 release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Run all integration tests
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
+          $env:PSMUX_EXE = $exe
+
+          $pattern = "${{ github.event.inputs['test-pattern'] }}"
+          if ([string]::IsNullOrWhiteSpace($pattern)) {
+            $pattern = "test_*.ps1"
+          }
+
+          $args = @("-Pattern", $pattern)
+          if ("${{ github.event.inputs['fail-fast'] }}" -eq "true") {
+            $args += "-FailFast"
+          }
+
+          .\tests\run_all_integration.ps1 @args

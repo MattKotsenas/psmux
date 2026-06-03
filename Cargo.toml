@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "3.3.4"
+version = "3.3.5"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
@@ -46,6 +46,14 @@ path = "tests-rs/test_issue201_rename_dialog.rs"
 name = "test_issue269_osc94_dropped"
 path = "tests-rs/test_issue269_osc94_dropped.rs"
 
+[[test]]
+name = "test_h1_osc52_clipboard_capture"
+path = "tests-rs/test_h1_osc52_clipboard_capture.rs"
+
+[[test]]
+name = "test_h1_osc52_end_to_end"
+path = "tests-rs/test_h1_osc52_end_to_end.rs"
+
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
 [target.'cfg(windows)'.dependencies]
@@ -70,10 +78,10 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-portable-pty = { version = "0.9.3", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
+portable-pty = { version = "0.9.4", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
 which = "8"
 chrono = "0.4"
-vt100 = { version = "0.16.6", path = "crates/vt100-psmux", package = "vt100-psmux" }
+vt100 = { version = "0.16.7", path = "crates/vt100-psmux", package = "vt100-psmux" }
 unicode-width = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

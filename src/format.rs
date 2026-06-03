@@ -320,6 +320,21 @@ pub fn expand_format_for_pane(
     result
 }
 
+/// Like `expand_format_for_pane` but resolves the pane by its global ID
+/// (e.g. from a bare `%N` -t target). Falls back to the active pane if no
+/// pane with that id exists. (Issue #332.)
+pub fn expand_format_for_pane_by_id(
+    fmt: &str,
+    app: &AppState,
+    pane_id: usize,
+) -> String {
+    if let Some((win_idx, pos)) = crate::tree::find_pane_by_id_global(app, pane_id) {
+        expand_format_for_pane(fmt, app, win_idx, pos)
+    } else {
+        expand_format(fmt, app)
+    }
+}
+
 // ─────────────────── expression dispatcher ───────────────────────
 
 /// Expand a `#{...}` expression (the content between `#{` and `}`).
@@ -1136,11 +1151,40 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_height" => {
             if let Some(p) = target_pane() { p.last_rows.to_string() } else { "24".into() }
         }
+        // Milliseconds since this pane last received printable text on the
+        // INTERACTIVE input route (handle_key); empty if none yet. The injected
+        // route (send-keys / send-paste / send-text) does NOT update it. A
+        // read-only route signal — consumers own any policy on top.
+        "pane_last_text_input" => {
+            match target_pane().and_then(|p| p.last_text_input) {
+                Some(t) => t.elapsed().as_millis().to_string(),
+                None => String::new(),
+            }
+        }
+        // The last NON-text key received on the INTERACTIVE input route
+        // (handle_key), by canonical bind-key name (Escape, Enter, Up, F9,
+        // C-c, M-a, ...); companion _ms gives its age in ms. Empty if none yet.
+        // Like pane_last_text_input, the injected route (send-keys /
+        // send-paste / send-text) does NOT update it. A read-only route signal
+        // -- consumers own any policy on top.
+        "pane_last_special_key" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((_, name)) => name.clone(),
+                None => String::new(),
+            }
+        }
+        "pane_last_special_key_ms" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((t, _)) => t.elapsed().as_millis().to_string(),
+                None => String::new(),
+            }
+        }
         "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
         "pane_current_command" => {
             if let Some(p) = target_pane() {
                 if let Some(pid) = p.child_pid {
                     crate::platform::process_info::get_foreground_process_name(pid)
+                        .or_else(|| crate::platform::process_info::get_process_name(pid))
                         .unwrap_or_else(|| "shell".into())
                 } else if !p.title.is_empty() {
                     p.title.clone()
