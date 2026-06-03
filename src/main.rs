@@ -584,28 +584,32 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "a" | "at" | "attach" | "attach-session" => {
-                let name = args
+                // Search cmd_args (skips binary name + global flags). Skip
+                // cmd_args[0] which is the subcommand itself ("a"/"attach"/etc),
+                // otherwise argv[0] (the exe path or subcommand name) gets
+                // picked up as the target session name.
+                let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
+                let name = sub_args
                     .iter()
-                    .position(|a| a == "-t")
-                    .and_then(|i| args.get(i + 1))
+                    .position(|a| *a == "-t")
+                    .and_then(|i| sub_args.get(i + 1))
                     .map(|s| {
-                        // Apply -L namespace prefix when -t is specified
                         if let Some(ref l) = l_socket_name {
                             format!("{}__{}", l, s)
                         } else {
-                            s.clone()
+                            (*s).clone()
                         }
                     })
                     .or_else(|| {
                         // Accept positional argument as target session name
                         // (e.g. "psmux attach work" without -t flag)
-                        let t_val_idx = args.iter().position(|a| a == "-t").map(|i| i + 1);
-                        args.iter().enumerate().find_map(|(i, a)| {
+                        let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
+                        sub_args.iter().enumerate().find_map(|(i, a)| {
                             if !a.starts_with('-') && Some(i) != t_val_idx {
                                 Some(if let Some(ref l) = l_socket_name {
                                     format!("{}__{}", l, a)
                                 } else {
-                                    a.clone()
+                                    (*a).clone()
                                 })
                             } else {
                                 None
