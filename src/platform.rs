@@ -1046,7 +1046,9 @@ pub mod mouse_inject {
     /// EXCEPTION: when the pane's foreground process is a *live* raw-mode TUI
     /// (e.g. Copilot CLI, vim) that has cleared ENABLE_PROCESSED_INPUT to read
     /// Ctrl+C itself, this function skips the signal so the raw 0x03 byte the
-    /// caller already wrote reaches the app, which decides copy-vs-interrupt.
+    /// caller writes to the PTY reaches the app, which decides copy-vs-interrupt.
+    /// (Call sites write the raw 0x03 either just before or just after invoking
+    /// this function; the skip behavior is correct regardless of that ordering.)
     /// See `process_info::foreground_is_shell`.
     pub fn send_ctrl_c_event(child_pid: u32, reattach: bool) -> bool {
         const CTRL_C_EVENT: u32 = 0;
@@ -1120,12 +1122,12 @@ pub mod mouse_inject {
                         if !fg_is_shell {
                             // Live raw-mode TUI (Copilot CLI, vim, ...): it
                             // cleared ENABLE_PROCESSED_INPUT to read raw 0x03
-                            // itself and decide copy-vs-interrupt.  The caller
-                            // already wrote raw 0x03 to the pipe; firing
-                            // GenerateConsoleCtrlEvent would bypass the app and
-                            // kill it.  Skip the signal and detach cleanly.
-                            // (We have not installed the ignore-handler yet, so
-                            // there is nothing to restore here.)
+                            // itself and decide copy-vs-interrupt.  The call
+                            // site writes raw 0x03 to the PTY (just before or
+                            // just after this call); firing GenerateConsoleCtrlEvent
+                            // would bypass the app and kill it.  Skip the signal
+                            // and detach cleanly.  (We have not installed the
+                            // ignore-handler yet, so there is nothing to restore.)
                             log(&format!("raw-mode non-shell foreground pid={}: deliver raw 0x03, skip CTRL_C_EVENT", child_pid));
                             CloseHandle(handle);
                             FreeConsole();
@@ -2083,14 +2085,19 @@ pub mod process_info {
     /// purpose of Ctrl+C routing.
     ///
     /// Walks the process tree from `root_pid` down to the deepest foreground
-    /// leaf (newest child at each level), so nested wrapper chains such as
-    /// `pwsh -> cmd -> node` resolve to the actual running program rather than
-    /// stopping at the first wrapper.
+    /// leaf (the highest-PID child at each level — a most-recently-created
+    /// heuristic, since Windows exposes no real console foreground group), so
+    /// nested wrapper chains such as `pwsh -> cmd -> node` resolve to the
+    /// actual running program rather than stopping at the first wrapper.
+    ///
+    /// If `root_pid` has no non-system children, the root process itself is
+    /// classified.  This covers both a bare shell prompt (root is pwsh/cmd ->
+    /// shell) and a pane spawned via `create_window_raw` that directly exec'd a
+    /// program with no shell wrapper (root may be a live TUI -> not a shell).
     ///
     /// Returns:
-    ///   `Some(true)`  — the foreground is a shell, a VT bridge (wsl/ssh), or a
-    ///                   bare prompt with no foreground child.  These expect a
-    ///                   console `CTRL_C_EVENT`.
+    ///   `Some(true)`  — the foreground is a shell or a VT bridge (wsl/ssh).
+    ///                   These expect a console `CTRL_C_EVENT`.
     ///   `Some(false)` — a live non-shell program (Copilot CLI, vim, ...) owns
     ///                   the console; it should receive raw 0x03 and decide for
     ///                   itself (copy selection vs. interrupt).
@@ -2114,9 +2121,10 @@ pub mod process_info {
             }
             CloseHandle(snap);
 
-            // Descend to the deepest foreground leaf, skipping system processes.
-            // The iteration guard prevents pathological loops from PID-reuse
-            // cycles in the snapshot.
+            // Descend to the deepest foreground leaf, skipping system
+            // processes, by following the highest-PID child at each level
+            // (a most-recently-created heuristic).  The iteration guard
+            // prevents pathological loops from PID-reuse cycles in the snapshot.
             let mut cur = root_pid;
             let mut leaf_name: Option<String> = None;
             for _ in 0..64 {
@@ -2132,10 +2140,22 @@ pub mod process_info {
                 }
             }
 
-            match leaf_name {
-                // No foreground child: bare shell prompt -> wants the signal.
-                None => Some(true),
+            // The process whose Ctrl+C behavior matters is the deepest
+            // foreground leaf.  If the root has no children, classify the root
+            // itself — a bare shell prompt resolves to pwsh/cmd (shell), while a
+            // directly-exec'd pane (create_window_raw) resolves to the program
+            // it ran, which may be a live TUI that must NOT be force-signalled.
+            let fg_name = leaf_name.or_else(|| {
+                entries.iter()
+                    .find(|(pid, _, _)| *pid == root_pid)
+                    .map(|(_, _, name)| name.clone())
+            });
+
+            match fg_name {
                 Some(name) => Some(is_shell_exe(&name) || is_vt_bridge_exe(&name)),
+                // Root not present in the snapshot (rare race): default to shell
+                // so the established interrupt behavior is preserved.
+                None => Some(true),
             }
         }
     }
