@@ -3299,19 +3299,23 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 // Raw bytes do NOT start with \x1b so they never corrupt
                 // ConPTY's VT parser state.
                 //
-                // On Windows, also inject a KEY_EVENT via WriteConsoleInputW
-                // so PSReadLine sees the proper VK + LEFT_CTRL_PRESSED flags
-                // (ConPTY cannot reconstruct modifier state from a raw byte).
+                // ConPTY already reconstructs the proper VK + LEFT_CTRL_PRESSED
+                // console key event from this raw C0 byte, so console apps
+                // (PSReadLine, neovim) receive a correct Ctrl+<letter> event
+                // from the byte alone.  We must therefore NOT also inject a
+                // separate KEY_EVENT via WriteConsoleInputW for letters — doing
+                // both delivered the key TWICE (issue #363: a single <C-w>
+                // arrived as <C-w><C-w>, turning neovim's window command into a
+                // no-op and making `<C-w>s` behave like a bare `s`; PSReadLine's
+                // Ctrl+W likewise deleted two words instead of one).
                 let _ = p.writer.write_all(&[ctrl_char]);
                 let _ = p.writer.flush();
+                // Ctrl+C is the sole exception: a CTRL_C_EVENT must be raised so
+                // the child's console handler runs (SIGINT parity, issue #338).
                 #[cfg(windows)]
-                if c.is_ascii_alphabetic() {
+                if c.eq_ignore_ascii_case(&'c') {
                     if let Some(pid) = p.child_pid {
-                        if c.eq_ignore_ascii_case(&'c') {
-                            crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
-                        } else {
-                            crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, false);
-                        }
+                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                     }
                 }
             }
