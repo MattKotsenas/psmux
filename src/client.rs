@@ -2681,6 +2681,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 popup_rect_last = None;
                                 if choose_tree_preview_default { preview_enabled = true; }
                                 let dir = format!("{}\\.psmux", home);
+                                // Reap registry files for sessions whose server
+                                // is gone (crashed, or killed by a reboot) before
+                                // listing — otherwise their port files linger and
+                                // surface here as "(not responding)" zombies.
+                                crate::session::cleanup_stale_port_files();
                                 // Collect (label, addr, key) for every reachable port file first,
                                 // then fan out the per-session AUTH+session-info fetches in parallel.
                                 // Sequential fetches made the picker open in O(N * read_timeout);
