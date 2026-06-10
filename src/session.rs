@@ -200,6 +200,11 @@ where
                 if let Some(boot) = boot {
                     if let Some(mtime) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
                         if is_pre_boot(mtime, boot, BOOT_TIME_MARGIN) {
+                            if crate::debug_log::session_log_enabled() {
+                                crate::debug_log::session_log("cleanup", &format!(
+                                    "reaping '{}': port file predates last boot (server died on restart)",
+                                    registry_base(&path)));
+                            }
                             remove_session_registry_files(&path);
                             continue;
                         }
@@ -209,15 +214,30 @@ where
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let key = read_key_for_port_path(&path);
                         if probe(&key, port) == PortProbeResult::Stale {
+                            if crate::debug_log::session_log_enabled() {
+                                crate::debug_log::session_log("cleanup", &format!(
+                                    "reaping '{}' (port {}): no psmux server authenticated as ours (stale)",
+                                    registry_base(&path), port));
+                            }
                             remove_session_registry_files(&path);
                         }
                     } else {
+                        if crate::debug_log::session_log_enabled() {
+                            crate::debug_log::session_log("cleanup", &format!(
+                                "reaping '{}': unparseable port value {:?}",
+                                registry_base(&path), port_str.trim()));
+                        }
                         remove_session_registry_files(&path);
                     }
                 }
             }
         }
     }
+}
+
+/// Display name (file stem) of a registry path, for logging.
+fn registry_base(port_path: &Path) -> &str {
+    port_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
 }
 
 fn remove_session_registry_files(port_path: &Path) {
@@ -299,8 +319,20 @@ fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
 
     for attempt in 0..STALE_PORT_PROBE_ATTEMPTS {
         match probe_auth_identity(addr, key) {
-            Ok(AuthProbe::Authenticated) => return PortProbeResult::Alive,
-            Ok(AuthProbe::Rejected) => return PortProbeResult::Stale,
+            Ok(AuthProbe::Authenticated) => {
+                if crate::debug_log::session_log_enabled() {
+                    crate::debug_log::session_log("probe",
+                        &format!("port {}: AUTH accepted -> alive", port));
+                }
+                return PortProbeResult::Alive;
+            }
+            Ok(AuthProbe::Rejected) => {
+                if crate::debug_log::session_log_enabled() {
+                    crate::debug_log::session_log("probe", &format!(
+                        "port {}: AUTH rejected by a different server (reused port) -> stale", port));
+                }
+                return PortProbeResult::Stale;
+            }
             Ok(AuthProbe::Unknown) => saw_inconclusive = true,
             Err(ErrorKind::ConnectionRefused) => saw_refused = true,
             Err(_) => saw_inconclusive = true,
@@ -312,8 +344,16 @@ fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
     }
 
     if saw_refused && !saw_inconclusive {
+        if crate::debug_log::session_log_enabled() {
+            crate::debug_log::session_log("probe",
+                &format!("port {}: connection refused on all attempts -> stale", port));
+        }
         PortProbeResult::Stale
     } else {
+        if crate::debug_log::session_log_enabled() {
+            crate::debug_log::session_log("probe",
+                &format!("port {}: no definitive answer -> inconclusive (kept)", port));
+        }
         PortProbeResult::Inconclusive
     }
 }

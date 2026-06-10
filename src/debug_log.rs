@@ -12,6 +12,7 @@
 //! | `PSMUX_STYLE_DEBUG=1`  | `~/.psmux/style_debug.log`        | Style/theme parsing, inline styles   |/// | `PSMUX_INPUT_DEBUG=1`  | `~/.psmux/input_debug.log`        | Every crossterm event + console mode |//! | `PSMUX_MOUSE_DEBUG=1`  | `~/.psmux/mouse_debug.log`        | Mouse injection (existing)           |
 //! | `PSMUX_SSH_DEBUG=1`    | `~/.psmux/ssh_input.log`          | SSH input handling (existing)        |
 //! | `PSMUX_LATENCY_LOG=1`  | `~/.psmux/latency.log`            | Keypress-to-render latency (existing)|
+//! | `PSMUX_SESSION_DEBUG=1`| `~/.psmux/session_debug.log`      | Session-registry stale-port cleanup  |
 //!
 //! All loggers are:
 //! - **Off by default** — zero overhead when disabled (one atomic load per call)
@@ -219,4 +220,60 @@ pub fn server_log(component: &str, msg: &str) {
 /// Returns `true` if server debug logging is active.
 pub fn server_log_enabled() -> bool {
     SERVER_LOG.lock().ok().map_or(false, |g| g.is_some())
+}
+
+// ─── Session-registry debug log ─────────────────────────────────────────────
+
+/// Session-registry lifecycle log, gated by `PSMUX_SESSION_DEBUG=1`.
+/// Covers stale-port cleanup decisions: boot-time reaps, auth-rejected
+/// (reused-port) reaps, unparseable port files, and live/inconclusive
+/// probe verdicts — exactly the path that decided whether a session shows
+/// up as a `(not responding)` zombie.
+///
+/// Unlike the other loggers this **appends** rather than truncates, because
+/// registry cleanup runs in many short-lived CLI processes (every `psmux`
+/// invocation calls it at startup); truncating on open would clobber the
+/// log before it could be read.
+static SESSION_LOG: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| {
+    if !env_enabled("PSMUX_SESSION_DEBUG") { return Mutex::new(None); }
+    let dir = psmux_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}/session_debug.log", dir))
+        .ok();
+    Mutex::new(f)
+});
+
+static SESSION_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const SESSION_LOG_CAP: u32 = 5000;
+
+/// Log a session-registry message. No-op unless `PSMUX_SESSION_DEBUG=1`.
+pub fn session_log(component: &str, msg: &str) {
+    let n = SESSION_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= SESSION_LOG_CAP {
+        if n == SESSION_LOG_CAP {
+            if let Ok(mut guard) = SESSION_LOG.lock() {
+                if let Some(ref mut f) = *guard {
+                    let _ = writeln!(f, "[{}][log] --- log cap reached ---",
+                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                    let _ = f.flush();
+                }
+            }
+        }
+        return;
+    }
+    if let Ok(mut guard) = SESSION_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "[{}][{}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"), component, msg);
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Returns `true` if session-registry debug logging is active.
+pub fn session_log_enabled() -> bool {
+    SESSION_LOG.lock().ok().map_or(false, |g| g.is_some())
 }
