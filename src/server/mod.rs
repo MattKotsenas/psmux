@@ -1609,18 +1609,26 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let layout_json = dump_layout_json_fast(&mut app)?;
                     let _layout_ms = _t_layout.elapsed().as_micros();
                     combined_buf.clear();
-                    let ss_escaped = json_escape_string(&cached_status_style);
+                    // #372: style options must be format-expanded too, so a
+                    // #{@var} colour reference resolves before the client's
+                    // colour parser sees it (otherwise status-style falls back
+                    // to bright green). wsf/wscf stay raw: they are per-window
+                    // formats the client expands with each window's own context.
+                    let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
                     let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
                     let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-                    let pbs_escaped = json_escape_string(&app.pane_border_style);
-                    let pabs_escaped = json_escape_string(&app.pane_active_border_style);
-                    let pbhs_escaped = json_escape_string(&app.pane_border_hover_style);
+                    let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
+                    let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
+                    let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
                     let wsf_escaped = json_escape_string(&app.window_status_format);
                     let wscf_escaped = json_escape_string(&app.window_status_current_format);
-                    let wss_escaped = json_escape_string(&app.window_status_separator);
-                    let ws_style_escaped = json_escape_string(&app.window_status_style);
-                    let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
-                    let mode_style_escaped = json_escape_string(&app.mode_style);
+                    let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
+                    let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
+                    let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
+                    let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+                    // #372: message-style was never sent to the client (it
+                    // hard-coded bg=yellow,fg=black). Send it, format-expanded.
+                    let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
                     let status_position_escaped = json_escape_string(&app.status_position);
                     let status_justify_escaped = json_escape_string(&app.status_justify);
                     // Build status_format JSON array for multi-line status bar
@@ -1637,11 +1645,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                     let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
-                        mode_style_escaped, status_position_escaped, status_justify_escaped,
+                        mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                         cursor_style_code, app.status_visible, app.repeat_time_ms,
                         app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
                         app.defaults_suppressed,
@@ -4672,18 +4680,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
             let layout_json = dump_layout_json_fast(&mut app)?;
             combined_buf.clear();
-            let ss_escaped = json_escape_string(&cached_status_style);
+            // #372: style options must be format-expanded too (see persistent
+            // path above). wsf/wscf stay raw: per-window formats the client
+            // expands with each window's own context.
+            let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
             let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
             let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-            let pbs_escaped = json_escape_string(&app.pane_border_style);
-            let pabs_escaped = json_escape_string(&app.pane_active_border_style);
-            let pbhs_escaped = json_escape_string(&app.pane_border_hover_style);
+            let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
+            let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
+            let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
             let wsf_escaped = json_escape_string(&app.window_status_format);
             let wscf_escaped = json_escape_string(&app.window_status_current_format);
-            let wss_escaped = json_escape_string(&app.window_status_separator);
-            let ws_style_escaped = json_escape_string(&app.window_status_style);
-            let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
-            let mode_style_escaped = json_escape_string(&app.mode_style);
+            let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
+            let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
+            let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
+            let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+            // #372: message-style was never sent to the client (it hard-coded
+            // bg=yellow,fg=black). Send it, format-expanded.
+            let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
             let status_position_escaped = json_escape_string(&app.status_position);
             let status_justify_escaped = json_escape_string(&app.status_justify);
             let status_format_json = {
@@ -4699,11 +4713,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             };
             let cursor_style_code = crate::rendering::configured_cursor_code();
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
-                mode_style_escaped, status_position_escaped, status_justify_escaped,
+                mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                 cursor_style_code, app.status_visible, app.repeat_time_ms,
                 app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
                 app.pwsh_mouse_selection,

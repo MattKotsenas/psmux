@@ -1269,7 +1269,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut prefix2_raw_char: Option<char> = None;
     // Status bar style from server (parsed from tmux status-style format)
     let mut status_fg: Color = Color::Black;
-    let mut status_bg: Color = Color::Green;
+    // #372: terminal default until the server sends a parseable status-style.
+    let mut status_bg: Color = Color::Reset;
     let mut status_bold: bool = false;
     let mut custom_status_left: Option<String> = None;
     let mut custom_status_right: Option<String> = None;
@@ -1532,6 +1533,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// mode-style for copy mode selection highlighting
         #[serde(default)]
         mode_style: Option<String>,
+        /// message-style for the status-line message bar (display-message,
+        /// command prompt). #372: previously never sent, so the client
+        /// hard-coded bg=yellow,fg=black and ignored the user's option.
+        #[serde(default)]
+        message_style: Option<String>,
         /// status-position: "top" or "bottom"
         #[serde(default)]
         status_position: Option<String>,
@@ -4370,7 +4376,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             if !ss.is_empty() {
                 let (fg, bg, bold) = parse_tmux_style_components(ss);
                 status_fg = fg.unwrap_or(Color::Black);
-                status_bg = bg.unwrap_or(Color::Green);
+                // #372: fall back to the terminal default rather than bright
+                // green when a bg fails to parse, so any future parse miss is
+                // invisible instead of alarming.
+                status_bg = bg.unwrap_or(Color::Reset);
                 status_bold = bold;
             }
         }
@@ -5260,7 +5269,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             // instead of the normal status content (tmux parity).
             // Uses message-style (default: bg=yellow,fg=black) matching tmux.
             let status_bar = if let Some(ref msg) = state.status_message {
-                let msg_style = crate::rendering::parse_tmux_style("bg=yellow,fg=black");
+                // #372: honor the configured message-style (sent expanded by the
+                // server) instead of a hard-coded colour. Falls back to tmux's
+                // default bg=yellow,fg=black when unset/empty.
+                let msg_style = crate::rendering::parse_tmux_style(
+                    match state.message_style.as_deref() {
+                        Some(s) if !s.is_empty() => s,
+                        _ => "bg=yellow,fg=black",
+                    }
+                );
                 let padded = if msg.len() < status_chunk.width as usize {
                     format!("{}{}", msg, " ".repeat(status_chunk.width as usize - msg.len()))
                 } else {
