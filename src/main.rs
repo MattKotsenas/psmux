@@ -1310,6 +1310,21 @@ fn run_main() -> io::Result<()> {
                         i += 1;
                     }
                 }
+                // cwd parity: a command-line new-window with no -c must open in
+                // the CALLER's cwd, not the server's (session) cwd. tmux picks a
+                // new window's cwd from three cases — an explicit -c, an attached
+                // client (session start dir), or a detached client (the caller's
+                // dir); the three cases are spelled out in tmux's own source. Each
+                // psmux CLI call is a one-shot detached client, so default -c to
+                // our current dir when the user gave none. Tradeoff: this defeats
+                // the warm-pane fast path for command-line new-window (the warm
+                // pane lives in the server's cwd) — interactive prefix-c, which
+                // never routes through here, keeps it.
+                if start_dir.is_none() {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        start_dir = Some(cwd.to_string_lossy().into_owned());
+                    }
+                }
                 let cmd_arg = nw_positional.join(" ");
                 let cmd_arg = cmd_arg.as_str();
                 let mut cmd_line = "new-window".to_string();
@@ -1368,6 +1383,15 @@ fn run_main() -> io::Result<()> {
                             _ => { sw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
                         }
                         i += 1;
+                    }
+                }
+                // cwd parity (same as new-window): a command-line split with no
+                // -c must open in the CALLER's cwd, not the server's (session)
+                // cwd. Each psmux CLI call is a one-shot detached client, so
+                // default -c to our current dir when none given.
+                if start_dir.is_none() {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        start_dir = Some(cwd.to_string_lossy().into_owned());
                     }
                 }
                 let cmd_arg = sw_positional.join(" ");
