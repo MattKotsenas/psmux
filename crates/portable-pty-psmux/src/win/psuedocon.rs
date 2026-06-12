@@ -119,12 +119,26 @@ fn supports_passthrough_mode() -> bool {
     ver.dwBuildNumber >= 22621
 }
 
+/// The flag set passed to every CreatePseudoConsole call (passthrough is
+/// OR'ed on separately where supported).
+///
+/// PSUEDOCONSOLE_INHERIT_CURSOR is deliberately NOT set. With it, conhost emits
+/// an ESC[6n cursor-position request at startup and will not service a child's
+/// console connection until the host answers it. So if that reply is sent later
+/// than the child's connect attempt, the child blocks in
+/// ConsoleCreateConnectionObject during process initialization (a single
+/// thread, before any user code runs) until the reply arrives: a temporary
+/// stall if it is merely late, indefinite if it never comes. A multiplexer pane
+/// always starts on a fresh screen, so inheriting the host cursor row buys
+/// nothing here.
+fn base_flags() -> DWORD {
+    PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE
+}
+
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
-        let base_flags = PSUEDOCONSOLE_INHERIT_CURSOR
-            | PSEUDOCONSOLE_RESIZE_QUIRK
-            | PSEUDOCONSOLE_WIN32_INPUT_MODE;
+        let base_flags = base_flags();
 
         // Use PSEUDOCONSOLE_PASSTHROUGH_MODE on Windows 11 22H2+ to relay
         // VT sequences (including DECSCUSR cursor shapes) from child processes
@@ -172,9 +186,7 @@ impl PsuedoCon {
     /// rejects the passthrough ConPTY handle.
     pub fn new_without_passthrough(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
-        let base_flags = PSUEDOCONSOLE_INHERIT_CURSOR
-            | PSEUDOCONSOLE_RESIZE_QUIRK
-            | PSEUDOCONSOLE_WIN32_INPUT_MODE;
+        let base_flags = base_flags();
 
         let result = unsafe {
             (CONPTY.CreatePseudoConsole)(
@@ -271,5 +283,29 @@ impl PsuedoCon {
         Ok(WinChild {
             proc: Mutex::new(proc),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conpty_flags_do_not_include_inherit_cursor() {
+        // PSUEDOCONSOLE_INHERIT_CURSOR makes the new conhost emit ESC[6n at
+        // startup and block its own initialization until the host replies; an
+        // unanswered query leaves conhost unable to service the child's
+        // console connect, so the child hangs inside process initialization
+        // (single thread parked in ConsoleCreateConnectionObject). A
+        // multiplexer pane always starts on a fresh screen, so inheriting the
+        // host cursor row has no value here.
+        assert_eq!(
+            base_flags() & PSUEDOCONSOLE_INHERIT_CURSOR,
+            0,
+            "INHERIT_CURSOR must not be set: it makes conhost block startup waiting for an ESC[6n reply"
+        );
+        // The other flags are load-bearing and must stay.
+        assert_ne!(base_flags() & PSEUDOCONSOLE_RESIZE_QUIRK, 0);
+        assert_ne!(base_flags() & PSEUDOCONSOLE_WIN32_INPUT_MODE, 0);
     }
 }
