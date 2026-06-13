@@ -1,0 +1,60 @@
+name: Publish crates.io (manual)
+
+# Temporary, surgical workflow to publish ONLY the crates.io channel.
+# Used to complete v3.3.6 after the sub-crate version desync was fixed
+# (vt100-psmux 0.16.8 / portable-pty-psmux 0.9.5), without re-running the
+# full release (which would re-submit WinGet/Chocolatey for an existing tag).
+# Mirrors the proven publish-crates job from release.yml.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crate compiles
+        shell: pwsh
+        run: |
+          cargo check 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Crate fails to compile! Fix before publishing."
+            exit 1
+          }
+
+      - name: Publish sub-crates then main crate to crates.io
+        shell: pwsh
+        run: |
+          # Sub-crates must be published first so crates.io can resolve path deps.
+          cargo publish --allow-dirty -p portable-pty-psmux 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "portable-pty-psmux publish failed (may already be published)"
+          }
+          Start-Sleep 25
+          cargo publish --allow-dirty -p vt100-psmux 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "vt100-psmux publish failed (may already be published)"
+          }
+          Start-Sleep 25
+          $out = cargo publish --allow-dirty 2>&1
+          $out | Write-Output
+          if ($LASTEXITCODE -ne 0) {
+            # Treat "already exists" as a warning so re-runs don't break
+            if ($out -match "already exists") {
+              Write-Warning "psmux already published at this version -- skipping"
+            } else {
+              Write-Error "psmux publish failed!"
+              exit 1
+            }
+          }
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
