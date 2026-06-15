@@ -787,7 +787,7 @@ impl AppState {
             word_separators: " -_@".to_string(),
             renumber_windows: false,
             automatic_rename: true,
-            allow_rename: true,
+            allow_rename: false,
             allow_set_title: false,
             monitor_activity: false,
             visual_activity: false,

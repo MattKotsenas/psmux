@@ -1706,7 +1706,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         (None, String::new())
                                     };
                                     let new_name = if auto_rename {
-                                        // automatic-rename: use foreground process name
+                                        // automatic-rename: use foreground process name.
+                                        // Per tmux's design, automatic-rename NEVER reads
+                                        // pane.title: the OSC-title path is the
+                                        // allow-rename branch below, and a user who has
+                                        // automatic-rename on but allow-rename off does
+                                        // not want shell-emitted OSC titles to become
+                                        // window names. (psmux previously fell back to
+                                        // pane.title here when no foreground child was
+                                        // found, which surfaced the hostname-init default
+                                        // as the window name. tmux does not.)
                                         if let Some(pid) = p.child_pid {
                                             match crate::platform::process_info::get_foreground_process_name(pid) {
                                                 Some(name) => {
@@ -1733,19 +1742,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                                     continue;
                                                 }
                                             }
-                                        } else if allow_rename && !p.title.is_empty() {
-                                            if log {
-                                                crate::debug_log::auto_rename_log(
-                                                    "candidate",
-                                                    &format!("win[{}] branch=auto_pane_title_fallback pane_title='{}'", wi, p.title),
-                                                );
-                                            }
-                                            p.title.clone()
                                         } else {
                                             if log {
                                                 crate::debug_log::auto_rename_log(
                                                     "skip",
-                                                    &format!("win[{}] reason=no_child_pid_and_no_title cur_name='{}'", wi, win.name),
+                                                    &format!("win[{}] reason=no_child_pid cur_name='{}'", wi, win.name),
                                                 );
                                             }
                                             continue;
