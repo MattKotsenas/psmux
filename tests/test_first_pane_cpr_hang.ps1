@@ -31,14 +31,29 @@
 # PSMUX_TEST_READER_DELAY_MS hook is deleted from src/pane.rs, delete this test.
 
 $ErrorActionPreference = "Stop"
-# Prefer the local build under test; the injection hook exists only in
-# debug_assertions builds, so do NOT fall back to a psmux on PATH (an installed
-# release binary would make the injection a no-op and the test pass for free).
+# Resolve the binary under test. The injection hook is #[cfg(debug_assertions)],
+# so it exists only in a debug build; against a release build no reader delay is
+# injected and the pane comes up promptly regardless of the regression -- a false
+# GREEN. The shared runner (run_all_integration.ps1) prefers a release build and
+# exports it as PSMUX_EXE, so we cannot assume PSMUX_EXE is a debug binary.
 $PSMUX = $env:PSMUX_EXE
 if (-not $PSMUX -or -not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe" }
 if (-not (Test-Path $PSMUX)) { Write-Host "FATAL: could not resolve psmux ($PSMUX)" -ForegroundColor Red; exit 1 }
 $PSMUX = (Resolve-Path -LiteralPath $PSMUX).Path   # absolute, so the straggler backstop's ExecutablePath match is reliable
+
+# Guard against a false GREEN on a non-debug build. The delay hook is compiled out
+# of release builds, so without it this test would pass for free. PowerShell can't
+# read the binary's cfg flags, so this is a PATH HEURISTIC: a binary whose path
+# contains \debug\ is treated as a debug build, otherwise we SKIP. Tradeoffs: it
+# closes the PSMUX_EXE=>release path the runner creates (the real false-green risk),
+# but it leans on the build layout -- a debug binary at an unconventional path would
+# be skipped here (an error toward SKIP, never a false green or a false red). SKIP
+# (exit 0), not FATAL, so a release-only run leaves the suite green rather than red.
+if ($PSMUX -notmatch '\\debug\\') {
+    Write-Host "SKIPPED: requires a debug build (PSMUX_TEST_READER_DELAY_MS hook is #[cfg(debug_assertions)]); got $PSMUX" -ForegroundColor Yellow
+    exit 0
+}
 
 $DELAY_MS = 10000                  # injected reader-start delay (reader thread sleeps this long)
 $MAX_LIVENESS_MS = $DELAY_MS / 2   # post-fix the pane must come up well under the delay;
