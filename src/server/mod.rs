@@ -1654,33 +1654,100 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                         let auto_rename = app.automatic_rename;
                         let allow_rename = app.allow_rename;
+                        let log = crate::debug_log::auto_rename_log_enabled();
+                        if log {
+                            crate::debug_log::auto_rename_log(
+                                "enter",
+                                &format!("auto={} allow={} in_copy={} wins={}",
+                                    auto_rename, allow_rename, in_copy, app.windows.len()),
+                            );
+                        }
                         if (auto_rename || allow_rename) && !in_copy {
-                            for win in app.windows.iter_mut() {
-                                if win.manual_rename { continue; }
+                            for (wi, win) in app.windows.iter_mut().enumerate() {
+                                if win.manual_rename {
+                                    if log {
+                                        crate::debug_log::auto_rename_log(
+                                            "skip",
+                                            &format!("win[{}] reason=manual_rename name='{}'", wi, win.name),
+                                        );
+                                    }
+                                    continue;
+                                }
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                                    if p.dead { continue; }
-                                    if p.last_title_check.elapsed().as_millis() < 1000 { continue; }
+                                    if p.dead {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "skip",
+                                                &format!("win[{}] reason=pane_dead name='{}'", wi, win.name),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    let age_ms = p.last_title_check.elapsed().as_millis();
+                                    if age_ms < 1000 {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "skip",
+                                                &format!("win[{}] reason=throttle age_ms={} name='{}'", wi, age_ms, win.name),
+                                            );
+                                        }
+                                        continue;
+                                    }
                                     p.last_title_check = std::time::Instant::now();
                                     if p.child_pid.is_none() {
                                         p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                     }
+                                    let (foreground_proc_name, pane_title) = if log {
+                                        (
+                                            p.child_pid.and_then(crate::platform::process_info::get_foreground_process_name),
+                                            p.title.clone(),
+                                        )
+                                    } else {
+                                        (None, String::new())
+                                    };
                                     let new_name = if auto_rename {
                                         // automatic-rename: use foreground process name
                                         if let Some(pid) = p.child_pid {
                                             match crate::platform::process_info::get_foreground_process_name(pid) {
-                                                Some(name) => name,
+                                                Some(name) => {
+                                                    if log {
+                                                        crate::debug_log::auto_rename_log(
+                                                            "candidate",
+                                                            &format!("win[{}] branch=auto_foreground pid={} name='{}'", wi, pid, name),
+                                                        );
+                                                    }
+                                                    name
+                                                }
                                                 None => {
                                                     // No foreground child found.  Keep the current
                                                     // window name to avoid flashing to the shell
                                                     // name before a child process spawns (#229).
                                                     // Once a child appears, auto-rename will pick
                                                     // it up on the next tick.
+                                                    if log {
+                                                        crate::debug_log::auto_rename_log(
+                                                            "skip",
+                                                            &format!("win[{}] reason=no_foreground_child cur_name='{}' pane_title='{}'", wi, win.name, pane_title),
+                                                        );
+                                                    }
                                                     continue;
                                                 }
                                             }
                                         } else if allow_rename && !p.title.is_empty() {
+                                            if log {
+                                                crate::debug_log::auto_rename_log(
+                                                    "candidate",
+                                                    &format!("win[{}] branch=auto_pane_title_fallback pane_title='{}'", wi, p.title),
+                                                );
+                                            }
                                             p.title.clone()
                                         } else {
+                                            if log {
+                                                crate::debug_log::auto_rename_log(
+                                                    "skip",
+                                                    &format!("win[{}] reason=no_child_pid_and_no_title cur_name='{}'", wi, win.name),
+                                                );
+                                            }
                                             continue;
                                         }
                                     } else if allow_rename {
@@ -1688,8 +1755,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         if let Ok(parser) = p.term.lock() {
                                             let title = parser.screen().title();
                                             if !title.is_empty() {
-                                                title.to_string()
+                                                let t = title.to_string();
+                                                if log {
+                                                    crate::debug_log::auto_rename_log(
+                                                        "candidate",
+                                                        &format!("win[{}] branch=allow_rename_osc_title title='{}'", wi, t),
+                                                    );
+                                                }
+                                                t
                                             } else {
+                                                if log {
+                                                    crate::debug_log::auto_rename_log(
+                                                        "skip",
+                                                        &format!("win[{}] reason=allow_rename_empty_title cur_name='{}'", wi, win.name),
+                                                    );
+                                                }
                                                 continue;
                                             }
                                         } else {
@@ -1699,9 +1779,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         continue;
                                     };
                                     if !new_name.is_empty() && win.name != new_name {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "rename",
+                                                &format!("win[{}] '{}' -> '{}' (foreground={:?} pane_title='{}')",
+                                                    wi, win.name, new_name, foreground_proc_name, pane_title),
+                                            );
+                                        }
                                         win.name = new_name;
                                         meta_dirty = true;
                                         state_dirty = true;
+                                    } else if log {
+                                        crate::debug_log::auto_rename_log(
+                                            "noop",
+                                            &format!("win[{}] cur='{}' candidate='{}' (same or empty)", wi, win.name, new_name),
+                                        );
                                     }
                                 }
                             }

@@ -13,6 +13,7 @@
 //! | `PSMUX_SSH_DEBUG=1`    | `~/.psmux/ssh_input.log`          | SSH input handling (existing)        |
 //! | `PSMUX_LATENCY_LOG=1`  | `~/.psmux/latency.log`            | Keypress-to-render latency (existing)|
 //! | `PSMUX_SESSION_DEBUG=1`| `~/.psmux/session_debug.log`      | Session-registry stale-port cleanup  |
+//! | `PSMUX_AUTO_RENAME_DEBUG=1` | `~/.psmux/auto_rename_debug.log` | Auto-rename per-decision trace - input signals, throttle, format result, final action |
 //!
 //! All loggers are:
 //! - **Off by default** — zero overhead when disabled (one atomic load per call)
@@ -276,4 +277,54 @@ pub fn session_log(component: &str, msg: &str) {
 /// Returns `true` if session-registry debug logging is active.
 pub fn session_log_enabled() -> bool {
     SESSION_LOG.lock().ok().map_or(false, |g| g.is_some())
+}
+
+// ─── Auto-rename debug log ──────────────────────────────────────────────────
+
+/// Auto-rename decision trace, gated by `PSMUX_AUTO_RENAME_DEBUG=1`.
+/// One entry per auto-rename evaluation, recording:
+///
+///   - the input signals (foreground command, pane.title, current win.name)
+///   - the throttle/change-detection verdict (ran or skipped, why)
+///   - the format-expansion result
+///   - the final action (renamed, no-op, kept-current)
+///
+/// Used to diagnose flicker, sticky values, hostname leakage from OSC titles,
+/// and any other "why is my window named X" question. Mirrors tmux's
+/// `log_debug("@%u ...")` calls in `names.c::check_window_name`.
+static AUTO_RENAME_LOG: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| {
+    if !env_enabled("PSMUX_AUTO_RENAME_DEBUG") { return Mutex::new(None); }
+    Mutex::new(open_log("auto_rename_debug.log"))
+});
+
+static AUTO_RENAME_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const AUTO_RENAME_LOG_CAP: u32 = 10000;
+
+/// Log an auto-rename decision. No-op unless `PSMUX_AUTO_RENAME_DEBUG=1`.
+pub fn auto_rename_log(component: &str, msg: &str) {
+    let n = AUTO_RENAME_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= AUTO_RENAME_LOG_CAP {
+        if n == AUTO_RENAME_LOG_CAP {
+            if let Ok(mut guard) = AUTO_RENAME_LOG.lock() {
+                if let Some(ref mut f) = *guard {
+                    let _ = writeln!(f, "[{}][log] --- log cap reached ---",
+                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                    let _ = f.flush();
+                }
+            }
+        }
+        return;
+    }
+    if let Ok(mut guard) = AUTO_RENAME_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "[{}][{}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"), component, msg);
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Returns `true` if auto-rename debug logging is active.
+pub fn auto_rename_log_enabled() -> bool {
+    AUTO_RENAME_LOG.lock().ok().map_or(false, |g| g.is_some())
 }
