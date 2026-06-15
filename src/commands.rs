@@ -364,6 +364,7 @@ fn generate_show_options(app: &AppState) -> String {
     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
     output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
+    output.push_str(&format!("automatic-rename-format \"{}\"\n", app.automatic_rename_format));
     output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
     output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));

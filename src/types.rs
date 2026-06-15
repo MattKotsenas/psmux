@@ -517,6 +517,10 @@ pub struct AppState {
     pub renumber_windows: bool,
     /// automatic-rename: update window name from active pane's running command
     pub automatic_rename: bool,
+    /// automatic-rename-format: format string expanded to produce the new window
+    /// name when automatic-rename is on. Mirrors tmux's option of the same name.
+    /// Default matches tmux: `"#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}"`.
+    pub automatic_rename_format: String,
     /// allow-rename: allow programs to set window title via escape sequences
     pub allow_rename: bool,
     /// allow-set-title: allow programs to set pane title via OSC 0/2 escape sequences
@@ -787,6 +791,7 @@ impl AppState {
             word_separators: " -_@".to_string(),
             renumber_windows: false,
             automatic_rename: true,
+            automatic_rename_format: "#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}".to_string(),
             allow_rename: false,
             allow_set_title: false,
             monitor_activity: false,

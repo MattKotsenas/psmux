@@ -72,6 +72,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "claude-code-force-interactive", scope: "session", option_type: "boolean", default: "off", description: "Force interactive mode for Claude Code" },
     // ── Window options ──
     OptionDef { name: "automatic-rename", scope: "window", option_type: "boolean", default: "on", description: "Auto-rename windows based on running command" },
+    OptionDef { name: "automatic-rename-format", scope: "window", option_type: "string", default: "#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}", description: "Format expanded to produce the new window name when automatic-rename is on" },
     OptionDef { name: "monitor-activity", scope: "window", option_type: "boolean", default: "off", description: "Monitor for activity in window" },
     OptionDef { name: "remain-on-exit", scope: "window", option_type: "boolean", default: "off", description: "Keep pane open after command exits" },
     OptionDef { name: "aggressive-resize", scope: "window", option_type: "boolean", default: "off", description: "Resize window to smallest attached client" },

@@ -1650,6 +1650,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
 
                     // ── Automatic rename / allow-rename: resolve window names ──
+                    //
+                    // Three-phase to keep the borrow checker happy and let us
+                    // run format expansion (which takes &AppState) between the
+                    // mut-borrow phases:
+                    //
+                    //   Phase A: iterate windows by &mut. Do cheap/per-window
+                    //            checks (manual_rename, dead, throttle). Update
+                    //            last_title_check. Cache child_pid lazily. Collect
+                    //            (win_idx, active_pane_id, branch) for survivors.
+                    //
+                    //   Phase B: with no &mut on windows, expand the format string
+                    //            (auto branch) or read the OSC title (allow-rename
+                    //            branch) to produce the candidate name.
+                    //
+                    //   Phase C: re-acquire &mut and apply the renames that
+                    //            actually differ from the current name.
                     {
                         let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                         let auto_rename = app.automatic_rename;
@@ -1663,6 +1679,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             );
                         }
                         if (auto_rename || allow_rename) && !in_copy {
+                            // Snapshot the format string before we touch app.windows
+                            // (avoids borrow conflict; the value rarely changes).
+                            let rename_format = app.automatic_rename_format.clone();
+
+                            // Phase A: per-window gating + survivor collection.
+                            // Branch tag: "auto" -> use format expansion (auto-rename
+                            //                       cascade with OSC layer 1-5).
+                            //             "allow" -> use parser.screen().title()
+                            //                       (allow-rename only; auto-rename off).
+                            #[derive(Clone, Copy)]
+                            enum Branch { Auto, Allow }
+                            let mut survivors: Vec<(usize, usize, Branch)> = Vec::new();
                             for (wi, win) in app.windows.iter_mut().enumerate() {
                                 if win.manual_rename {
                                     if log {
@@ -1697,94 +1725,87 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     if p.child_pid.is_none() {
                                         p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                     }
-                                    let (foreground_proc_name, pane_title) = if log {
-                                        (
-                                            p.child_pid.and_then(crate::platform::process_info::get_foreground_process_name),
-                                            p.title.clone(),
-                                        )
-                                    } else {
-                                        (None, String::new())
-                                    };
-                                    let new_name = if auto_rename {
-                                        // automatic-rename: use foreground process name.
-                                        // Per tmux's design, automatic-rename NEVER reads
-                                        // pane.title: the OSC-title path is the
-                                        // allow-rename branch below, and a user who has
-                                        // automatic-rename on but allow-rename off does
-                                        // not want shell-emitted OSC titles to become
-                                        // window names. (psmux previously fell back to
-                                        // pane.title here when no foreground child was
-                                        // found, which surfaced the hostname-init default
-                                        // as the window name. tmux does not.)
-                                        if let Some(pid) = p.child_pid {
-                                            match crate::platform::process_info::get_foreground_process_name(pid) {
-                                                Some(name) => {
-                                                    if log {
-                                                        crate::debug_log::auto_rename_log(
-                                                            "candidate",
-                                                            &format!("win[{}] branch=auto_foreground pid={} name='{}'", wi, pid, name),
-                                                        );
-                                                    }
-                                                    name
-                                                }
-                                                None => {
-                                                    // No foreground child found.  Keep the current
-                                                    // window name to avoid flashing to the shell
-                                                    // name before a child process spawns (#229).
-                                                    // Once a child appears, auto-rename will pick
-                                                    // it up on the next tick.
-                                                    if log {
-                                                        crate::debug_log::auto_rename_log(
-                                                            "skip",
-                                                            &format!("win[{}] reason=no_foreground_child cur_name='{}' pane_title='{}'", wi, win.name, pane_title),
-                                                        );
-                                                    }
-                                                    continue;
-                                                }
-                                            }
-                                        } else {
+                                    let branch = if auto_rename { Branch::Auto } else { Branch::Allow };
+                                    survivors.push((wi, p.id, branch));
+                                }
+                            }
+
+                            // Phase B: produce candidate names (immutable borrow).
+                            let mut candidates: Vec<(usize, String)> = Vec::with_capacity(survivors.len());
+                            for (wi, pane_id, branch) in survivors {
+                                let new_name = match branch {
+                                    Branch::Auto => {
+                                        let n = crate::format::expand_format_for_pane_by_id(
+                                            &rename_format,
+                                            &app,
+                                            pane_id,
+                                        );
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "candidate",
+                                                &format!("win[{}] branch=auto_format result='{}'", wi, n),
+                                            );
+                                        }
+                                        // tmux's #229 anti-flash: if the format expansion
+                                        // produced nothing usable (e.g. pane_current_command
+                                        // returned the empty fallback before child_pid is
+                                        // bound), keep the existing name rather than blanking it.
+                                        if n.is_empty() {
                                             if log {
                                                 crate::debug_log::auto_rename_log(
                                                     "skip",
-                                                    &format!("win[{}] reason=no_child_pid cur_name='{}'", wi, win.name),
+                                                    &format!("win[{}] reason=empty_format_result", wi),
                                                 );
                                             }
                                             continue;
                                         }
-                                    } else if allow_rename {
-                                        // allow-rename only: use OSC title from child
-                                        if let Ok(parser) = p.term.lock() {
-                                            let title = parser.screen().title();
-                                            if !title.is_empty() {
-                                                let t = title.to_string();
-                                                if log {
-                                                    crate::debug_log::auto_rename_log(
-                                                        "candidate",
-                                                        &format!("win[{}] branch=allow_rename_osc_title title='{}'", wi, t),
-                                                    );
-                                                }
-                                                t
-                                            } else {
-                                                if log {
-                                                    crate::debug_log::auto_rename_log(
-                                                        "skip",
-                                                        &format!("win[{}] reason=allow_rename_empty_title cur_name='{}'", wi, win.name),
-                                                    );
-                                                }
-                                                continue;
+                                        n
+                                    }
+                                    Branch::Allow => {
+                                        // allow-rename only branch: read OSC 0/2 title from
+                                        // the active pane's terminal parser. tmux's
+                                        // automatic-rename-off + allow-rename-on mode pins
+                                        // the window name to whatever the shell sets.
+                                        let parser_title = app
+                                            .windows
+                                            .iter()
+                                            .find(|w| crate::tree::get_pane_position_in_window(&w.root, pane_id).is_some())
+                                            .and_then(|w| {
+                                                crate::tree::active_pane(&w.root, &w.active_path)
+                                                    .and_then(|p| {
+                                                        p.term.lock().ok().map(|g| g.screen().title().to_string())
+                                                    })
+                                            })
+                                            .unwrap_or_default();
+                                        if parser_title.is_empty() {
+                                            if log {
+                                                crate::debug_log::auto_rename_log(
+                                                    "skip",
+                                                    &format!("win[{}] reason=allow_rename_empty_title", wi),
+                                                );
                                             }
-                                        } else {
                                             continue;
                                         }
-                                    } else {
-                                        continue;
-                                    };
-                                    if !new_name.is_empty() && win.name != new_name {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "candidate",
+                                                &format!("win[{}] branch=allow_rename_osc_title title='{}'", wi, parser_title),
+                                            );
+                                        }
+                                        parser_title
+                                    }
+                                };
+                                candidates.push((wi, new_name));
+                            }
+
+                            // Phase C: apply renames.
+                            for (wi, new_name) in candidates {
+                                if let Some(win) = app.windows.get_mut(wi) {
+                                    if win.name != new_name {
                                         if log {
                                             crate::debug_log::auto_rename_log(
                                                 "rename",
-                                                &format!("win[{}] '{}' -> '{}' (foreground={:?} pane_title='{}')",
-                                                    wi, win.name, new_name, foreground_proc_name, pane_title),
+                                                &format!("win[{}] '{}' -> '{}'", wi, win.name, new_name),
                                             );
                                         }
                                         win.name = new_name;
@@ -1793,7 +1814,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     } else if log {
                                         crate::debug_log::auto_rename_log(
                                             "noop",
-                                            &format!("win[{}] cur='{}' candidate='{}' (same or empty)", wi, win.name, new_name),
+                                            &format!("win[{}] cur='{}' (same as candidate)", wi, win.name),
                                         );
                                     }
                                 }
@@ -3465,6 +3486,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
                     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
                     output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
+                    output.push_str(&format!("automatic-rename-format \"{}\"\n", app.automatic_rename_format));
                     output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
                     output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
                     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));

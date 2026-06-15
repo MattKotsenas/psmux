@@ -980,6 +980,9 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "automatic-rename" => {
             app.automatic_rename = matches!(value, "on" | "true" | "1");
         }
+        "automatic-rename-format" => {
+            app.automatic_rename_format = value.to_string();
+        }
         "synchronize-panes" => {
             app.sync_input = matches!(value, "on" | "true" | "1");
         }
