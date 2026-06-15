@@ -1046,6 +1046,9 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                 "session_name" => app.session_name.clone(),
                 "session_windows" => app.windows.len().to_string(),
                 "session_id" => format!("${}", app.session_id),
+                "session_path" => std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 "pid" | "server_pid" => std::process::id().to_string(),
                 "version" => VERSION.to_string(),
                 "host" | "hostname" => hostname_cached(),
@@ -1095,7 +1098,9 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         }
         "session_grouped" => if app.session_group.is_some() { "1".into() } else { "0".into() },
         "session_format" | "session_many_attached" => if app.attached_clients > 1 { "1".into() } else { "0".into() },
-        "session_path" => env::var("HOME").or_else(|_| env::var("USERPROFILE")).unwrap_or_default(),
+        "session_path" => std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
 
         // ── Window ──
         "window_index" => (win_idx + app.window_base_index).to_string(),
