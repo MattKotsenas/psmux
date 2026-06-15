@@ -194,6 +194,45 @@ fn detach_last_client_without_destroy_unattached_does_not_signal_shutdown() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  Directive-channel gating (grace-sleep precondition)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The detach handlers take the 50 ms grace sleep only when
+// `send_directive_to_client` reports the directive was queued.  A client with no
+// registered channel is already gone, so the send reports false and the handler
+// skips the sleep instead of stalling the server loop for nothing.  These tests
+// pin that true/false contract directly, without spinning up a server.
+
+/// Absent channel → the directive cannot be queued, so the send reports false
+/// and the handler skips the grace sleep.
+#[test]
+fn send_directive_reports_false_without_channel() {
+    use crate::types::{remove_directive_channel, send_directive_to_client};
+    let cid = 0xDEAD_0001u64;
+    remove_directive_channel(cid); // drop any entry a prior run might have left
+    assert!(!send_directive_to_client(cid, "DETACH"),
+        "absent channel must report not-queued so the handler skips the sleep");
+}
+
+/// Registered channel → the directive is queued (send reports true) and the
+/// exact string is delivered; after removal the send reports false again.
+#[test]
+fn send_directive_delivers_then_stops_after_removal() {
+    use crate::types::{register_directive_channel, remove_directive_channel, send_directive_to_client};
+    let cid = 0xDEAD_0002u64;
+    let rx = register_directive_channel(cid);
+
+    assert!(send_directive_to_client(cid, "DETACH"),
+        "registered channel must report queued so the handler takes the grace sleep");
+    assert_eq!(rx.recv().ok().as_deref(), Some("DETACH"),
+        "the exact directive string must reach the client's writer thread");
+
+    remove_directive_channel(cid);
+    assert!(!send_directive_to_client(cid, "DETACH"),
+        "after channel removal the send must report not-queued again");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  CLI flag-parsing tests (mirror the parser in main.rs detach-client branch)
 // ════════════════════════════════════════════════════════════════════════════
 

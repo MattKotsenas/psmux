@@ -3699,13 +3699,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if app.latest_client_id == Some(target_cid) {
                         app.latest_client_id = app.client_registry.keys().max().copied();
                     }
-                    // Send a clean DETACH directive first so the client exits cleanly
-                    // instead of treating the stream drop as a transient disconnect and
-                    // reconnecting. Give it a moment to act on the directive.
-let sent = crate::types::send_directive_to_client(target_cid, "DETACH");
-if sent {
-    std::thread::sleep(Duration::from_millis(50));
-}
+                    // Send a clean DETACH directive first so the client exits instead
+                    // of treating the stream drop as a transient disconnect and
+                    // reconnecting. Only wait if the directive was actually queued; a
+                    // failed send means the client is already gone, so blocking the
+                    // server loop would buy nothing.
+                    if crate::types::send_directive_to_client(target_cid, "DETACH") {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     // Shut down the TCP stream to force disconnect
                     crate::types::shutdown_client_stream(target_cid);
                     // Recompute effective size from remaining clients
@@ -3740,14 +3741,14 @@ if sent {
                         .find(|(_, ci)| ci.tty_name == tty)
                         .map(|(cid, _)| *cid);
                     if let Some(cid) = target_cid {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(cid, "DETACH-KILL-PARENT");
-                        } else {
-                            // Clean detach: tell the client to exit so it does not treat
-                            // the stream drop as a transient disconnect and reconnect.
-                            crate::types::send_directive_to_client(cid, "DETACH");
+                        // Send a clean directive first so the client exits instead of
+                        // reconnecting on the stream drop. -P also kills the parent.
+                        // Only wait if the directive was actually queued; a failed send
+                        // means the client is already gone.
+                        let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                        if crate::types::send_directive_to_client(cid, directive) {
+                            std::thread::sleep(Duration::from_millis(50));
                         }
-                        std::thread::sleep(Duration::from_millis(50));
                         app.client_sizes.remove(&cid);
                         let was_present = app.client_registry.remove(&cid).is_some();
                         if was_present {
@@ -3774,16 +3775,15 @@ if sent {
                         .filter(|(cid, _)| **cid != except_cid)
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
-                    for (cid, _tty) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        } else {
-                            // Clean detach: tell each client to exit so it does not treat
-                            // the stream drop as a transient disconnect and reconnect.
-                            crate::types::send_directive_to_client(*cid, "DETACH");
-                        }
+                    // Send a clean directive to each target first so they exit instead
+                    // of reconnecting on the stream drop. -P also kills the parent.
+                    let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                    let mut any_sent = false;
+                    for (cid, _) in &targets {
+                        any_sent |= crate::types::send_directive_to_client(*cid, directive);
                     }
-                    if !targets.is_empty() {
+                    // Only wait if at least one directive was actually queued.
+                    if any_sent {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
@@ -3827,16 +3827,15 @@ if sent {
                     let targets: Vec<(u64, String)> = app.client_registry.iter()
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
+                    // Send a clean directive to each client first so they exit instead
+                    // of reconnecting on the stream drop. -P also kills the parent.
+                    let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                    let mut any_sent = false;
                     for (cid, _) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        } else {
-                            // Clean detach: tell each client to exit so it does not treat
-                            // the stream drop as a transient disconnect and reconnect.
-                            crate::types::send_directive_to_client(*cid, "DETACH");
-                        }
+                        any_sent |= crate::types::send_directive_to_client(*cid, directive);
                     }
-                    if !targets.is_empty() {
+                    // Only wait if at least one directive was actually queued.
+                    if any_sent {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
