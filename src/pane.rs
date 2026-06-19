@@ -1199,6 +1199,54 @@ fn scan_cpr_query(data: &[u8]) -> bool {
     data.contains(&0x1b) && data.windows(CPR.len()).any(|w| w == CPR)
 }
 
+/// Detects ESC[6n across batch boundaries. The parser thread scans output in
+/// coalesced batches; a cursor-position request split across two batches is
+/// invisible to the per-batch `scan_cpr_query` (no carry-over), so `cpr_pending`
+/// is never set, the reply is never written, and whatever issued the request
+/// waits for it forever. The asker can be pwsh after a lock/unlock, or conhost
+/// at pane startup (PSUEDOCONSOLE_INHERIT_CURSOR) -- in that case the pane's
+/// child hangs permanently in ConsoleCreateConnectionObject, before any user
+/// code runs (reproduced deterministically: split the request and the per-batch
+/// scan misses it, the pane never starts on an idle machine). This scanner
+/// carries the last KEEP bytes between batches (one less than the sequence
+/// length -- the most a boundary can hide) and rescans the boundary region, so
+/// a split query is still detected.
+struct CprScanner {
+    tail: Vec<u8>,
+}
+
+impl CprScanner {
+    /// One less than the query length: a 4-byte sequence not contained in a
+    /// single batch has at most 3 bytes on either side of the boundary.
+    const KEEP: usize = 3;
+
+    fn new() -> Self {
+        Self {
+            tail: Vec::with_capacity(Self::KEEP),
+        }
+    }
+
+    fn scan(&mut self, batch: &[u8]) -> bool {
+        let mut hit = scan_cpr_query(batch);
+        if !hit && !self.tail.is_empty() {
+            // A match crossing the boundary has ≤KEEP bytes in the tail and
+            // ≤KEEP bytes at the start of this batch.
+            let mut boundary = self.tail.clone();
+            boundary.extend_from_slice(&batch[..batch.len().min(Self::KEEP)]);
+            hit = scan_cpr_query(&boundary);
+        }
+        if batch.len() >= Self::KEEP {
+            self.tail.clear();
+            self.tail.extend_from_slice(&batch[batch.len() - Self::KEEP..]);
+        } else {
+            self.tail.extend_from_slice(batch);
+            let excess = self.tail.len().saturating_sub(Self::KEEP);
+            self.tail.drain(..excess);
+        }
+        hit
+    }
+}
+
 // TODO: The 7 Arc parameters below should be grouped into a `ReaderSignals`
 // struct the next time a new signal is added, to keep the call-site manageable.
 pub fn spawn_reader_thread(
@@ -1290,6 +1338,7 @@ pub fn spawn_reader_thread(
 
     // ── Parser thread: coalesces staged bytes, processes under one lock ──
     thread::spawn(move || {
+        let mut cpr_scanner = CprScanner::new();
         loop {
             // Wait for at least one byte (or shutdown).
             {
@@ -1361,7 +1410,7 @@ pub fn spawn_reader_thread(
                 cursor_shape.store(shape, Ordering::Release);
             }
             let rmcup = scan_rmcup(&bytes);
-            let has_cpr_query = scan_cpr_query(&bytes);
+            let has_cpr_query = cpr_scanner.scan(&bytes);
 
             if let Ok(mut parser) = term_reader.lock() {
                 parser.process(&bytes);

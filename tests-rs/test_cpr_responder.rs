@@ -87,3 +87,58 @@ fn cpr_response_fallback_produces_valid_sequence() {
     let response = format!("\x1b[{};{}R", r + 1, c + 1);
     assert_eq!(response, "\x1b[1;1R");
 }
+
+// ── CprScanner — detection across batch boundaries ───────────────────────
+//
+// The parser thread scans output in coalesced batches. A query that straddles
+// a batch boundary is invisible to the per-batch scan_cpr_query (the
+// partial-sequence tests above pin that a lone prefix must NOT match), so the
+// boundary hides the query, cpr_pending is never set, and the reply is never
+// sent. An unanswered ESC[6n then leaves the asker waiting forever — for
+// conhost's PSUEDOCONSOLE_INHERIT_CURSOR startup query that means the pane's
+// child hangs permanently in ConsoleCreateConnectionObject (reproduced
+// deterministically). CprScanner carries the last bytes of the stream between
+// scans so a boundary cannot hide the query.
+
+#[test]
+fn scanner_detects_in_batch_query() {
+    let mut s = CprScanner::new();
+    assert!(s.scan(b"\x1b[6n"));
+}
+
+#[test]
+fn scanner_detects_query_split_at_every_boundary() {
+    let q = b"\x1b[6n";
+    for cut in 1..q.len() {
+        let mut s = CprScanner::new();
+        assert!(!s.scan(&q[..cut]), "prefix alone must not fire (cut={})", cut);
+        assert!(s.scan(&q[cut..]), "suffix must complete the query (cut={})", cut);
+    }
+}
+
+#[test]
+fn scanner_detects_query_split_across_four_batches() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(b"\x1b"));
+    assert!(!s.scan(b"["));
+    assert!(!s.scan(b"6"));
+    assert!(s.scan(b"n"));
+}
+
+#[test]
+fn scanner_partial_never_completed_does_not_fire() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(b"\x1b[6"));
+    assert!(!s.scan(b"hello world"));
+    assert!(!s.scan(b"n")); // the 'n' no longer completes anything
+}
+
+#[test]
+fn scanner_detects_query_split_after_long_noise_batches() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(&vec![b'X'; 1024]));
+    let mut batch = vec![b'Y'; 512];
+    batch.extend_from_slice(b"\x1b[6");
+    assert!(!s.scan(&batch));
+    assert!(s.scan(b"n"));
+}
