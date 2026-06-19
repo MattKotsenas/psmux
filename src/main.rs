@@ -1210,8 +1210,14 @@ fn run_main() -> io::Result<()> {
                                 break;
                             }
                             // Detached: also require the initial window to exist.
+                            // A non-empty, non-error reply means >0 windows: the
+                            // default (tmux-text) list-windows is "" for zero
+                            // windows (not the `-J` JSON form, whose empty value
+                            // "[]" is non-empty), and only the main loop answers
+                            // it, after create_window. The non-error guard rejects
+                            // a racing auth failure — see detached_list_windows_ready.
                             if let Ok(resp) = send_control_with_response("list-windows\n".to_string()) {
-                                if !resp.trim().is_empty() { ready = true; break; }
+                                if detached_list_windows_ready(&resp) { ready = true; break; }
                             }
                         }
                     } else if port_seen {
@@ -4324,4 +4330,38 @@ fn is_ssh_session() -> bool {
     env::var("SSH_CLIENT").is_ok()
         || env::var("SSH_CONNECTION").is_ok()
         || env::var("SSH_TTY").is_ok()
+}
+
+/// Decide whether a detached-session readiness probe's `list-windows` reply
+/// means the initial window exists. A non-empty body is >0 windows (the
+/// tmux-text form is "" for zero windows) — EXCEPT a protocol-level error
+/// reply, which is also non-empty. The startup .key write can race the
+/// client's read, so the server may answer with an "ERROR: ..." auth failure;
+/// that must NOT be mistaken for a ready window list.
+fn detached_list_windows_ready(resp: &str) -> bool {
+    let t = resp.trim();
+    !t.is_empty() && !t.starts_with("ERROR:")
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::detached_list_windows_ready;
+
+    #[test]
+    fn nonempty_window_list_is_ready() {
+        assert!(detached_list_windows_ready("0: bash* (1 panes) [80x24]\n"));
+    }
+
+    #[test]
+    fn empty_reply_is_not_ready() {
+        assert!(!detached_list_windows_ready(""));
+        assert!(!detached_list_windows_ready("   \n"));
+    }
+
+    #[test]
+    fn auth_error_reply_is_not_ready() {
+        // The key read can race the server's .key write; an auth failure is
+        // a non-empty reply but is NOT a ready window list.
+        assert!(!detached_list_windows_ready("ERROR: Invalid session key\n"));
+    }
 }
