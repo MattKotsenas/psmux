@@ -1295,6 +1295,26 @@ pub fn spawn_reader_thread(
     let reader_done_r = reader_done.clone();
     let output_ring_r = output_ring.clone();
     thread::spawn(move || {
+        // TEST-ONLY (PSMUX_TEST_READER_DELAY_MS): hold off this reader's first
+        // read by a fixed duration. The reader is what drains conhost's startup
+        // ESC[6n cursor-position request; with PSEUDOCONSOLE_INHERIT_CURSOR set,
+        // conhost will not service the child's console connection until that
+        // request is read and answered, so delaying the reader stalls the child
+        // in ConsoleCreateConnectionObject for the duration -- the exact race
+        // otherwise hit only under concurrent load. Without the flag conhost
+        // issues no such request, so the delay only postpones psmux's parse of
+        // the pane while the child comes up promptly. Placed here, not in
+        // create_window, so it delays only the reader and not window
+        // registration. Inert unless the env var is set; compiled out of release
+        // builds. REMOVE with tests/test_first_pane_cpr_hang.ps1.
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(ms) = std::env::var("PSMUX_TEST_READER_DELAY_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    if ms > 0 { thread::sleep(Duration::from_millis(ms)); }
+                }
+            }
+        }
         let mut local = vec![0u8; 65536];
         let mut zero_reads: u32 = 0;
         loop {
