@@ -2868,15 +2868,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::SwapPane(dir) => {
                     // tmux: swap-pane without -Z permanently unzooms (#82)
                     unzoom_if_zoomed(&mut app);
-                    match dir.as_str() {
-                        "U" => { swap_pane(&mut app, FocusDir::Up); }
-                        "D" => { swap_pane(&mut app, FocusDir::Down); }
-                        "L" => { swap_pane(&mut app, FocusDir::Left); }
-                        "R" => { swap_pane(&mut app, FocusDir::Right); }
-                        _ => { swap_pane(&mut app, FocusDir::Down); }
+                    let swapped = match dir.as_str() {
+                        "U" => swap_pane(&mut app, FocusDir::Up),
+                        "D" => swap_pane(&mut app, FocusDir::Down),
+                        "L" => swap_pane(&mut app, FocusDir::Left),
+                        "R" => swap_pane(&mut app, FocusDir::Right),
+                        _ => swap_pane(&mut app, FocusDir::Down),
+                    };
+                    if swapped {
+                        meta_dirty = true;
+                        hook_event = Some("after-swap-pane");
                     }
-                    meta_dirty = true;
-                    hook_event = Some("after-swap-pane");
                 }
                 CtrlReq::SwapPaneTarget(target, is_id) => {
                     // tmux: swap-pane without -Z permanently unzooms (#82)
@@ -2886,23 +2888,32 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if is_id {
                             crate::tree::find_path_by_id(&win.root, target)
                         } else {
-                            crate::tree::path_by_position(&win.root, target.saturating_sub(app.pane_base_index))
+                            match target.checked_sub(app.pane_base_index) {
+                                Some(idx) => crate::tree::path_by_position(&win.root, idx),
+                                None => None,
+                            }
                         }
                     };
                     if let Some(path) = path {
-                        swap_pane_with_path(&mut app, path);
+                        if swap_pane_with_path(&mut app, path) {
+                            meta_dirty = true;
+                            hook_event = Some("after-swap-pane");
+                        }
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", target), std::time::Instant::now(), None));
                     }
-                    meta_dirty = true;
-                    hook_event = Some("after-swap-pane");
                 }
                 CtrlReq::SwapPanePosition(token) => {
                     // tmux: swap-pane without -Z permanently unzooms (#82)
                     unzoom_if_zoomed(&mut app);
                     if let Some(path) = crate::window_ops::pane_path_at_position(&app, &token) {
-                        swap_pane_with_path(&mut app, path);
+                        if swap_pane_with_path(&mut app, path) {
+                            meta_dirty = true;
+                            hook_event = Some("after-swap-pane");
+                        }
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", token), std::time::Instant::now(), None));
                     }
-                    meta_dirty = true;
-                    hook_event = Some("after-swap-pane");
                 }
                 CtrlReq::ResizePane(dir, amount) => {
                     unzoom_if_zoomed(&mut app);

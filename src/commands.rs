@@ -1262,21 +1262,11 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 if let Some(port) = app.control_port {
                     let _ = send_control_to_port(port, &format!("swap-pane -t {}\n", tgt), &app.session_key);
                 } else {
-                    let path = if tgt.starts_with('{') {
-                        // Layout position token like {top-right} — resolve to
-                        // whatever pane currently occupies that corner.
-                        crate::window_ops::pane_path_at_position(app, &tgt)
-                    } else {
-                        let parsed = crate::cli::parse_target(&tgt);
-                        let win = &app.windows[app.active_idx];
-                        match parsed.pane {
-                            Some(p) if parsed.pane_is_id => crate::tree::find_path_by_id(&win.root, p),
-                            Some(p) => crate::tree::path_by_position(&win.root, p.saturating_sub(app.pane_base_index)),
-                            None => None,
-                        }
-                    };
+                    let path = resolve_swap_pane_target_path(app, &tgt);
                     if let Some(path) = path {
                         crate::window_ops::swap_pane_with_path(app, path);
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", tgt), Instant::now(), None));
                     }
                 }
             } else if let Some(port) = app.control_port {
@@ -2375,6 +2365,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     Ok(())
 }
 
+fn resolve_swap_pane_target_path(app: &AppState, target: &str) -> Option<Vec<usize>> {
+    if target.starts_with('{') {
+        return crate::window_ops::pane_path_at_position(app, target);
+    }
+    if app.windows.is_empty() {
+        return None;
+    }
+    let parsed = crate::cli::parse_target(target);
+    let win = &app.windows[app.active_idx];
+    match parsed.pane {
+        Some(p) if parsed.pane_is_id => crate::tree::find_path_by_id(&win.root, p),
+        Some(p) => p.checked_sub(app.pane_base_index)
+            .and_then(|idx| crate::tree::path_by_position(&win.root, idx)),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests-rs/test_commands.rs"]
 mod tests;
@@ -2474,3 +2481,7 @@ mod tests_named_buffers;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue273_send_prefix.rs"]
 mod tests_issue273_send_prefix;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue383_swap_pane_targets.rs"]
+mod tests_issue383_swap_pane_targets;

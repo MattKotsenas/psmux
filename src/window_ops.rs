@@ -1072,7 +1072,7 @@ pub fn handle_split_resize_done(app: &mut AppState) {
     resize_all_panes(app);
 }
 
-pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
+pub fn swap_pane(app: &mut AppState, dir: FocusDir) -> bool {
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -1081,7 +1081,7 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
     for (i, (path, _)) in rects.iter().enumerate() { 
         if *path == win.active_path { active_idx = Some(i); break; } 
     }
-    let Some(ai) = active_idx else { return; };
+    let Some(ai) = active_idx else { return false; };
     let (_, arect) = &rects[ai];
     
     // Collect pane IDs for MRU-based tie-breaking (issue #70)
@@ -1099,38 +1099,41 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
         // sizes) instead of merely moving focus.  This is the real swap-pane
         // behaviour expected from tmux.
         if crate::tree::swap_nodes(&mut win.root, &active_path, &target_path) {
-            if let Some(new_pane_id) = pane_ids.get(ni) {
-                crate::tree::touch_mru(&mut win.pane_mru, *new_pane_id);
-            }
             // Focus follows the pane that was just moved into the new slot.
             win.active_path = target_path;
+            if let Some(focused_id) = crate::tree::get_active_pane_id(&win.root, &win.active_path) {
+                crate::tree::touch_mru(&mut win.pane_mru, focused_id);
+            }
             swapped = true;
         }
     }
     // Resize the moved panes' PTYs to fit their new slots (tmux re-lays-out
     // after a swap).  Without this the program keeps its old terminal size.
     if swapped { crate::tree::resize_all_panes(app); }
+    swapped
 }
 
 /// Swap the active pane with the pane at an explicit tree `path`
 /// (used by `swap-pane -t <target>`).  Geometry is preserved; focus follows
 /// the moved pane to its new slot.
-pub fn swap_pane_with_path(app: &mut AppState, target_path: Vec<usize>) {
+pub fn swap_pane_with_path(app: &mut AppState, target_path: Vec<usize>) -> bool {
     let swapped = {
         let win = &mut app.windows[app.active_idx];
         let active_path = win.active_path.clone();
         if active_path == target_path { false }
         else {
-            let new_id = crate::tree::get_active_pane_id(&win.root, &target_path);
             if crate::tree::swap_nodes(&mut win.root, &active_path, &target_path) {
-                if let Some(id) = new_id { crate::tree::touch_mru(&mut win.pane_mru, id); }
                 win.active_path = target_path;
+                if let Some(focused_id) = crate::tree::get_active_pane_id(&win.root, &win.active_path) {
+                    crate::tree::touch_mru(&mut win.pane_mru, focused_id);
+                }
                 true
             } else { false }
         }
     };
     // Resize moved panes to fit their new slots (see swap_pane).
     if swapped { crate::tree::resize_all_panes(app); }
+    swapped
 }
 
 /// Resolve a tmux-style position token (e.g. `{top-right}`) to the path of the
@@ -1202,6 +1205,79 @@ mod position_token_tests {
     fn unknown_token_is_none() {
         let (area, rects) = layout();
         assert_eq!(resolve_position_token("{active}", area, &rects), None);
+    }
+}
+
+#[cfg(test)]
+mod swap_mru_tests {
+    use super::swap_pane_with_path;
+    use crate::proxy_pane::create_proxy_pane;
+    use crate::types::{AppState, LayoutKind, Node, Window};
+    use ratatui::layout::Rect;
+    use std::net::{TcpListener, TcpStream};
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let accept_thr = std::thread::spawn(move || listener.accept().expect("accept").0);
+        let client = TcpStream::connect(addr).expect("connect");
+        let server = accept_thr.join().expect("join accept thread");
+        (client, server)
+    }
+
+    fn proxy_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
+        let (reader, _peer1) = tcp_pair();
+        let (writer, _peer2) = tcp_pair();
+        create_proxy_pane(
+            reader,
+            writer,
+            "127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-session".to_string(),
+            id as u64,
+            None,
+            format!("pane-{}", id),
+            rows,
+            cols,
+            id,
+            None,
+        ).expect("create proxy pane")
+    }
+
+    fn make_window_with_two_panes(left_id: usize, right_id: usize) -> Window {
+        Window {
+            root: Node::Split {
+                kind: LayoutKind::Horizontal,
+                sizes: vec![1, 1],
+                children: vec![Node::Leaf(proxy_pane(left_id, 10, 5)), Node::Leaf(proxy_pane(right_id, 10, 5))],
+            },
+            active_path: vec![0],
+            name: "w0".to_string(),
+            id: 0,
+            activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+            last_output_time: std::time::Instant::now(),
+            last_seen_version: 0,
+            manual_rename: false,
+            layout_index: 0,
+            pane_mru: vec![right_id, left_id],
+            zoom_saved: None,
+            linked_from: None,
+        }
+    }
+
+    #[test]
+    fn swap_with_path_updates_mru_for_focused_pane_after_swap() {
+        let mut app = AppState::new("swap-mru".to_string());
+        app.last_window_area = Rect { x: 0, y: 0, width: 10, height: 10 };
+        app.windows.push(make_window_with_two_panes(11, 22));
+        app.active_idx = 0;
+
+        let swapped = swap_pane_with_path(&mut app, vec![1]);
+        assert!(swapped, "swap should succeed");
+        assert_eq!(app.windows[0].active_path, vec![1], "focus should follow moved active pane");
+        assert_eq!(app.windows[0].pane_mru.first().copied(), Some(11), "MRU should be the focused pane id after swap");
     }
 }
 

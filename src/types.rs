@@ -1034,7 +1034,8 @@ pub enum CtrlReq {
     SwapPane(String),
     /// swap-pane -t <target>: swap the active pane with the pane identified by
     /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id
-    /// (`%N`); otherwise it is a 0-based positional pane index.
+    /// (`%N`); otherwise it is a user-facing pane index that is normalized
+    /// using pane-base-index before resolving a positional pane path.
     SwapPaneTarget(usize, bool),
     /// swap-pane -t <token>: swap the active pane with the pane at a layout
     /// position token (e.g. `{top-right}`).  Layout-independent.
