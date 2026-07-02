@@ -1216,13 +1216,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    // Hide the warm pane when an explicit start dir is requested
-                    // so create_window spawns a fresh shell in the correct CWD.
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref()) {
                         eprintln!("psmux: new-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
                     if detached { app.active_idx = prev_idx; }
@@ -1241,11 +1237,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref()) {
                         eprintln!("psmux: new-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
                     // Use full format engine for -P output (tmux compatible)
@@ -1271,8 +1265,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    // Hide warm pane when explicit start_dir is given (wrong CWD)
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref()) {
                         let msg = format!("split-window: {e}");
                         app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
@@ -1280,7 +1272,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         let _ = resp.send(String::new());
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     // Apply size if specified: (value, true) = percentage, (value, false) = cell count
                     if let Some((val, is_pct)) = split_size {
                         let pct = if is_pct {
@@ -1338,12 +1329,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref()) {
                         app.status_message = Some((format!("split-window: {e}"), std::time::Instant::now(), None));
                         eprintln!("psmux: split-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     // Apply size if specified: (value, true) = percentage, (value, false) = cell count
                     if let Some((val, is_pct)) = split_size {
                         let pct = if is_pct {
@@ -2807,30 +2796,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 .unwrap_or(true);
                             if server_cwd_differs {
                                 env::set_current_dir(cwd_path).ok();
-                                // Inject cd + clear into the active pane so
-                                // the directory change is invisible to the
-                                // user.  Leading space keeps it out of shell
-                                // history; the clear wipes visible traces.
-                                //
-                                // The vt100 parser watches for the CSI 2J
-                                // that cls/clear generates, which tells the
-                                // layout serialiser the clear finished
-                                // (event-driven, no guessing).  A safety
-                                // timeout is a fallback for unusual shells.
+                                // Silently re-home the warm server's active pane
+                                // to the client's CWD (invisible cd + clear), so
+                                // the shell it pre-spawned adopts the right dir.
                                 if let Some(win) = app.windows.last_mut() {
                                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                                        use std::io::Write as _;
-                                        let escaped = cwd.replace('\'', "''");
-                                        let clear = if cfg!(windows) { "cls" } else { "clear" };
-                                        let cd_cmd = format!(" cd '{}'; {}\r", escaped, clear);
-                                        // Tell the vt100 parser to watch for the
-                                        // next screen-clear event (CSI 2J/3J).
-                                        if let Ok(mut parser) = p.term.lock() {
-                                            parser.screen_mut().set_squelch_clear_pending(true);
-                                        }
-                                        p.squelch_until = Some(Instant::now() + Duration::from_millis(500));
-                                        let _ = p.writer.write_all(cd_cmd.as_bytes());
-                                        let _ = p.writer.flush();
+                                        crate::pane::silent_rehome(p, cwd);
                                     }
                                 }
                             }

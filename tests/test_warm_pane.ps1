@@ -458,44 +458,50 @@ Kill-TestSession $session
 Write-Host ""
 
 # =============================================================================
-# TEST 9: Start-dir stash — warm pane preserved when -c specified
+# TEST 9: Start-dir re-home — warm pane honours -c (transplant + silent cd)
 # =============================================================================
-Write-Host "--- TEST 9: Start-dir stash (warm pane preserved for later) ---" -ForegroundColor Yellow
+Write-Host "--- TEST 9: Start-dir re-home (warm pane honours -c) ---" -ForegroundColor Yellow
 $session = "wp_test_9"
 $proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session", "-s", $session, "-d", "-x", "120", "-y", "30" -PassThru -WindowStyle Hidden
 $null = Wait-ServerReady -SessionName $session -TimeoutSec 15
 $null = Wait-PanePrompt -SessionName $session -TimeoutMs ($PromptTimeoutSec * 1000)
-Start-Sleep -Milliseconds 600   # Warm pane replenishment + loading
+Start-Sleep -Milliseconds 1500   # let the warm pane finish loading before we consume it
 
-# Create window with -c (custom start dir) — warm pane should be STASHED, not consumed
+# new-window -c transplants the warm pane and silently re-homes its shell to the
+# requested dir.
 $testDir = $env:USERPROFILE
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 & $PSMUX new-window -t $session -c $testDir 2>&1 | Out-Null
 $dirResult = Wait-PanePrompt -SessionName $session -TimeoutMs ($PromptTimeoutSec * 1000)
 $sw.Stop()
 if ($dirResult.Found) {
-    # This should be a cold spawn (warm pane was stashed due to -c)
-    Write-Metric "  new-window -c (cold, stash)" $sw.ElapsedMilliseconds
-    Write-Pass "new-window with -c completed in $($sw.ElapsedMilliseconds)ms"
+    Write-Metric "  new-window -c (warm re-home)" $sw.ElapsedMilliseconds
+    # The shell's prompt should reflect the requested directory (re-home worked).
+    if ($dirResult.Output -match [regex]::Escape($testDir.TrimEnd('\'))) {
+        Write-Pass "new-window -c re-homed the shell to $testDir ($($sw.ElapsedMilliseconds)ms)"
+    } else {
+        Write-Fail "new-window -c prompt not at ${testDir}: $($dirResult.Output.Trim())"
+    }
 } else {
     Write-Fail "new-window with -c — prompt never appeared"
 }
 
-# Now create a DEFAULT window — the warm pane should be RESTORED and used
-Start-Sleep -Milliseconds 100  # Warm pane was stashed, should be ready immediately
+# The -c consumed the warm pane; a replenished warm pane should still serve the
+# next default window quickly (replenishment chain intact).
+Start-Sleep -Milliseconds 1500
 $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
 & $PSMUX new-window -t $session 2>&1 | Out-Null
 $defaultResult = Wait-PanePrompt -SessionName $session -TimeoutMs ($PromptTimeoutSec * 1000)
 $sw2.Stop()
 if ($defaultResult.Found) {
-    Write-Metric "  new-window default (stashed warm)" $sw2.ElapsedMilliseconds
+    Write-Metric "  new-window default (replenished warm)" $sw2.ElapsedMilliseconds
     if ($sw2.ElapsedMilliseconds -lt 2000) {
-        Write-Pass "Stashed warm pane consumed on default new-window ($($sw2.ElapsedMilliseconds)ms)"
+        Write-Pass "Replenished warm pane consumed on default new-window ($($sw2.ElapsedMilliseconds)ms)"
     } else {
-        Write-Fail "Default new-window after stash took $($sw2.ElapsedMilliseconds)ms (stash may have failed)"
+        Write-Fail "Default new-window after -c took $($sw2.ElapsedMilliseconds)ms (replenish may have failed)"
     }
 } else {
-    Write-Fail "Default new-window after stash — prompt never appeared"
+    Write-Fail "Default new-window after -c — prompt never appeared"
 }
 Kill-TestSession $session
 Write-Host ""
