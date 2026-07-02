@@ -5,6 +5,7 @@ fn is_window_option(name: &str) -> bool {
     matches!(
         name,
         "automatic-rename"
+            | "automatic-rename-format"
             | "monitor-activity"
             | "remain-on-exit"
             | "window-status-format"
@@ -50,6 +51,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "focus-events" => if app.focus_events { "on".into() } else { "off".into() },
         "renumber-windows" => if app.renumber_windows { "on".into() } else { "off".into() },
         "automatic-rename" => if app.automatic_rename { "on".into() } else { "off".into() },
+        "automatic-rename-format" => app.automatic_rename_format.clone(),
         "allow-rename" => if app.allow_rename { "on".into() } else { "off".into() },
         "allow-set-title" => if app.allow_set_title { "on".into() } else { "off".into() },
         "monitor-activity" => if app.monitor_activity { "on".into() } else { "off".into() },
@@ -171,6 +173,7 @@ pub(crate) fn get_window_option_value_for(
 pub(crate) fn render_window_options(app: &AppState) -> String {
     let names = [
         "automatic-rename",
+        "automatic-rename-format",
         "monitor-activity",
         "remain-on-exit",
         "window-status-format",
@@ -396,6 +399,9 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                     w.manual_rename = false;
                 }
             }
+        }
+        "automatic-rename-format" => {
+            app.automatic_rename_format = value.to_string();
         }
         "allow-rename" => { app.allow_rename = matches!(value, "on" | "true" | "1"); }
         "allow-set-title" => { app.allow_set_title = matches!(value, "on" | "true" | "1"); }

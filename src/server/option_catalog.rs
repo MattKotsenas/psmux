@@ -58,7 +58,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "set-titles-string", scope: "session", option_type: "string", default: "#S:#I:#W", description: "Terminal title format string" },
     OptionDef { name: "word-separators", scope: "session", option_type: "string", default: " -_@", description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: "session", option_type: "choice", default: "off", description: "Allow passthrough escape sequences" },
-    OptionDef { name: "allow-rename", scope: "session", option_type: "boolean", default: "on", description: "Allow programs to rename windows" },
+    OptionDef { name: "allow-rename", scope: "session", option_type: "boolean", default: "off", description: "Allow programs to rename windows via OSC 2 escape sequence" },
     OptionDef { name: "allow-set-title", scope: "session", option_type: "boolean", default: "off", description: "Allow programs to set pane title via escape sequences" },
     OptionDef { name: "update-environment", scope: "session", option_type: "string", default: "", description: "Environment variables to update on attach" },
     OptionDef { name: "synchronize-panes", scope: "session", option_type: "boolean", default: "off", description: "Send input to all panes simultaneously" },
@@ -72,6 +72,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "claude-code-force-interactive", scope: "session", option_type: "boolean", default: "off", description: "Force interactive mode for Claude Code" },
     // ── Window options ──
     OptionDef { name: "automatic-rename", scope: "window", option_type: "boolean", default: "on", description: "Auto-rename windows based on running command" },
+    OptionDef { name: "automatic-rename-format", scope: "window", option_type: "string", default: "#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}", description: "Format expanded to produce the new window name when automatic-rename is on" },
     OptionDef { name: "monitor-activity", scope: "window", option_type: "boolean", default: "off", description: "Monitor for activity in window" },
     OptionDef { name: "remain-on-exit", scope: "window", option_type: "boolean", default: "off", description: "Keep pane open after command exits" },
     OptionDef { name: "aggressive-resize", scope: "window", option_type: "boolean", default: "off", description: "Resize window to smallest attached client" },

@@ -1650,58 +1650,172 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
 
                     // ── Automatic rename / allow-rename: resolve window names ──
+                    //
+                    // Three-phase to keep the borrow checker happy and let us
+                    // run format expansion (which takes &AppState) between the
+                    // mut-borrow phases:
+                    //
+                    //   Phase A: iterate windows by &mut. Do cheap/per-window
+                    //            checks (manual_rename, dead, throttle). Update
+                    //            last_title_check. Cache child_pid lazily. Collect
+                    //            (win_idx, active_pane_id, branch) for survivors.
+                    //
+                    //   Phase B: with no &mut on windows, expand the format string
+                    //            (auto branch) or read the OSC title (allow-rename
+                    //            branch) to produce the candidate name.
+                    //
+                    //   Phase C: re-acquire &mut and apply the renames that
+                    //            actually differ from the current name.
                     {
                         let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                         let auto_rename = app.automatic_rename;
                         let allow_rename = app.allow_rename;
+                        let log = crate::debug_log::auto_rename_log_enabled();
+                        if log {
+                            crate::debug_log::auto_rename_log(
+                                "enter",
+                                &format!("auto={} allow={} in_copy={} wins={}",
+                                    auto_rename, allow_rename, in_copy, app.windows.len()),
+                            );
+                        }
                         if (auto_rename || allow_rename) && !in_copy {
-                            for win in app.windows.iter_mut() {
-                                if win.manual_rename { continue; }
+                            // Snapshot the format string before we touch app.windows
+                            // (avoids borrow conflict; the value rarely changes).
+                            let rename_format = app.automatic_rename_format.clone();
+
+                            // Phase A: per-window gating + survivor collection.
+                            // Branch tag: "auto" -> use format expansion (auto-rename
+                            //                       cascade with OSC layer 1-5).
+                            //             "allow" -> use parser.screen().title()
+                            //                       (allow-rename only; auto-rename off).
+                            #[derive(Clone, Copy)]
+                            enum Branch { Auto, Allow }
+                            let mut survivors: Vec<(usize, usize, Branch)> = Vec::new();
+                            for (wi, win) in app.windows.iter_mut().enumerate() {
+                                if win.manual_rename {
+                                    if log {
+                                        crate::debug_log::auto_rename_log(
+                                            "skip",
+                                            &format!("win[{}] reason=manual_rename name='{}'", wi, win.name),
+                                        );
+                                    }
+                                    continue;
+                                }
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                                    if p.dead { continue; }
-                                    if p.last_title_check.elapsed().as_millis() < 1000 { continue; }
+                                    if p.dead {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "skip",
+                                                &format!("win[{}] reason=pane_dead name='{}'", wi, win.name),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    let age_ms = p.last_title_check.elapsed().as_millis();
+                                    if age_ms < 1000 {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "skip",
+                                                &format!("win[{}] reason=throttle age_ms={} name='{}'", wi, age_ms, win.name),
+                                            );
+                                        }
+                                        continue;
+                                    }
                                     p.last_title_check = std::time::Instant::now();
                                     if p.child_pid.is_none() {
                                         p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                     }
-                                    let new_name = if auto_rename {
-                                        // automatic-rename: use foreground process name
-                                        if let Some(pid) = p.child_pid {
-                                            match crate::platform::process_info::get_foreground_process_name(pid) {
-                                                Some(name) => name,
-                                                None => {
-                                                    // No foreground child found.  Keep the current
-                                                    // window name to avoid flashing to the shell
-                                                    // name before a child process spawns (#229).
-                                                    // Once a child appears, auto-rename will pick
-                                                    // it up on the next tick.
-                                                    continue;
-                                                }
+                                    let branch = if auto_rename { Branch::Auto } else { Branch::Allow };
+                                    survivors.push((wi, p.id, branch));
+                                }
+                            }
+
+                            // Phase B: produce candidate names (immutable borrow).
+                            let mut candidates: Vec<(usize, String)> = Vec::with_capacity(survivors.len());
+                            for (wi, pane_id, branch) in survivors {
+                                let new_name = match branch {
+                                    Branch::Auto => {
+                                        let n = crate::format::expand_format_for_pane_by_id(
+                                            &rename_format,
+                                            &app,
+                                            pane_id,
+                                        );
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "candidate",
+                                                &format!("win[{}] branch=auto_format result='{}'", wi, n),
+                                            );
+                                        }
+                                        // tmux's #229 anti-flash: if the format expansion
+                                        // produced nothing usable (e.g. pane_current_command
+                                        // returned the empty fallback before child_pid is
+                                        // bound), keep the existing name rather than blanking it.
+                                        if n.is_empty() {
+                                            if log {
+                                                crate::debug_log::auto_rename_log(
+                                                    "skip",
+                                                    &format!("win[{}] reason=empty_format_result", wi),
+                                                );
                                             }
-                                        } else if allow_rename && !p.title.is_empty() {
-                                            p.title.clone()
-                                        } else {
                                             continue;
                                         }
-                                    } else if allow_rename {
-                                        // allow-rename only: use OSC title from child
-                                        if let Ok(parser) = p.term.lock() {
-                                            let title = parser.screen().title();
-                                            if !title.is_empty() {
-                                                title.to_string()
-                                            } else {
-                                                continue;
+                                        n
+                                    }
+                                    Branch::Allow => {
+                                        // allow-rename only branch: read OSC 0/2 title from
+                                        // the active pane's terminal parser. tmux's
+                                        // automatic-rename-off + allow-rename-on mode pins
+                                        // the window name to whatever the shell sets.
+                                        let parser_title = app
+                                            .windows
+                                            .iter()
+                                            .find(|w| crate::tree::get_pane_position_in_window(&w.root, pane_id).is_some())
+                                            .and_then(|w| {
+                                                crate::tree::active_pane(&w.root, &w.active_path)
+                                                    .and_then(|p| {
+                                                        p.term.lock().ok().map(|g| g.screen().title().to_string())
+                                                    })
+                                            })
+                                            .unwrap_or_default();
+                                        if parser_title.is_empty() {
+                                            if log {
+                                                crate::debug_log::auto_rename_log(
+                                                    "skip",
+                                                    &format!("win[{}] reason=allow_rename_empty_title", wi),
+                                                );
                                             }
-                                        } else {
                                             continue;
                                         }
-                                    } else {
-                                        continue;
-                                    };
-                                    if !new_name.is_empty() && win.name != new_name {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "candidate",
+                                                &format!("win[{}] branch=allow_rename_osc_title title='{}'", wi, parser_title),
+                                            );
+                                        }
+                                        parser_title
+                                    }
+                                };
+                                candidates.push((wi, new_name));
+                            }
+
+                            // Phase C: apply renames.
+                            for (wi, new_name) in candidates {
+                                if let Some(win) = app.windows.get_mut(wi) {
+                                    if win.name != new_name {
+                                        if log {
+                                            crate::debug_log::auto_rename_log(
+                                                "rename",
+                                                &format!("win[{}] '{}' -> '{}'", wi, win.name, new_name),
+                                            );
+                                        }
                                         win.name = new_name;
                                         meta_dirty = true;
                                         state_dirty = true;
+                                    } else if log {
+                                        crate::debug_log::auto_rename_log(
+                                            "noop",
+                                            &format!("win[{}] cur='{}' (same as candidate)", wi, win.name),
+                                        );
                                     }
                                 }
                             }
@@ -3412,6 +3526,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
                     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
                     output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
+                    output.push_str(&format!("automatic-rename-format \"{}\"\n", app.automatic_rename_format));
                     output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
                     output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
                     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
