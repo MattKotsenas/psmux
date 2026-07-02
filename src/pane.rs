@@ -71,11 +71,49 @@ fn default_shell_name(command: Option<&str>, configured_shell: Option<&str>) -> 
     }
 }
 
+/// Build the command injected to silently re-home a pane's shell to `dir`.
+///
+/// The trailing clear (`cls` on Windows, `clear` elsewhere) wipes the visible
+/// echo; single quotes in the path are doubled so the single-quoted string
+/// stays well-formed; the trailing `\r` submits it as one command line. The
+/// leading space asks shells that ignore space-prefixed commands to skip the
+/// history entry (best-effort — not every shell honours it).
+pub(crate) fn rehome_command(dir: &str) -> String {
+    let escaped = dir.replace('\'', "''");
+    let clear = if cfg!(windows) { "cls" } else { "clear" };
+    format!(" cd '{}'; {}\r", escaped, clear)
+}
+
+/// Silently re-home an already-running pane's shell to `dir`: inject
+/// [`rehome_command`] and squelch the pane's rendering until the resulting
+/// screen-clear (CSI 2J) fires or a 500ms safety timeout elapses, so the user
+/// never sees the injected command or its echo.
+///
+/// A pre-spawned shell (warm pane or warm server) starts in the server CWD;
+/// since a running process's CWD cannot be set externally, the shell moves
+/// itself with `cd`. The shell must be at a fresh prompt so the injected line
+/// runs immediately.
+pub(crate) fn silent_rehome(pane: &mut Pane, dir: &str) {
+    use std::io::Write as _;
+    let cd_cmd = rehome_command(dir);
+    // Tell the vt100 parser to watch for the next screen-clear (CSI 2J/3J);
+    // its arrival tells the layout serialiser the clear finished (event-driven).
+    if let Ok(mut parser) = pane.term.lock() {
+        parser.screen_mut().set_squelch_clear_pending(true);
+    }
+    // Reveal the pane when that clear arrives, or after 500ms as a fallback for
+    // shells that never emit one — whichever happens first.
+    pane.squelch_until = Some(Instant::now() + Duration::from_millis(500));
+    let _ = pane.writer.write_all(cd_cmd.as_bytes());
+    let _ = pane.writer.flush();
+}
+
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>, start_dir: Option<&str>) -> io::Result<()> {
     // ── Fast path: use pre-spawned warm pane when creating a default shell ──
     // The warm pane has its shell already loaded (~470ms for pwsh), so the
     // prompt appears instantly — matching wezterm's "instant tab" feel.
-    if command.is_none() && start_dir.is_none() && app.warm_pane.is_some() {
+    // A `-c <dir>` is honoured by re-homing the transplanted shell (below).
+    if command.is_none() && app.warm_pane.is_some() {
         let wp = app.warm_pane.take().unwrap();
         // Resize to current terminal dimensions if they changed since pre-spawn
         let area = app.last_window_area;
@@ -98,7 +136,12 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         }
         let epoch = std::time::Instant::now() - Duration::from_secs(2);
         let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-        let pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
+        let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
+        // Honour `-c <dir>`: the warm pane was spawned in the server CWD, so
+        // silently re-home its already-running shell to the requested dir.
+        if let Some(dir) = start_dir {
+            silent_rehome(&mut pane, dir);
+        }
         let win_name = default_shell_name(None, configured_shell);
         let initial_pane_id = wp.pane_id;
         app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![initial_pane_id], zoom_saved: None, linked_from: None });
@@ -370,9 +413,8 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     // though its ConPTY was created at full-window size, resizing to the
     // split dimensions only costs a ConPTY repaint (~10-50ms) vs a full
     // cold spawn (~500ms).  Net result: split feels nearly instant.
-    // Skip warm pane when start_dir is set — the warm pane was spawned
-    // in the server's CWD, not the requested directory (#107).
-    if command.is_none() && start_dir.is_none() && app.warm_pane.is_some() {
+    // A `-c <dir>` is honoured by re-homing the transplanted shell (below).
+    if command.is_none() && app.warm_pane.is_some() {
         let wp = app.warm_pane.take().unwrap();
         let need_resize = rows != wp.rows || cols != wp.cols;
         if need_resize {
@@ -389,7 +431,12 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         }
         let epoch = std::time::Instant::now() - Duration::from_secs(2);
         let new_pane_id = wp.pane_id;
-        let new_leaf = Node::Leaf(Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring });
+        let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
+        // Honour `-c <dir>`: silently re-home the transplanted warm shell.
+        if let Some(dir) = start_dir {
+            silent_rehome(&mut new_pane, dir);
+        }
+        let new_leaf = Node::Leaf(new_pane);
         let win = &mut app.windows[app.active_idx];
         replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
         let mut new_path = win.active_path.clone();
@@ -1471,6 +1518,10 @@ mod test_issue165_prediction_view_style;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue271_warm_pane_history.rs"]
 mod test_issue271_warm_pane_history;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_warm_pane_start_dir.rs"]
+mod test_warm_pane_start_dir;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue88_alt_screen_toggle.rs"]
