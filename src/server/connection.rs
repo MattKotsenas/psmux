@@ -607,6 +607,19 @@ if control_echo || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
+        if let Err(message) =
+            crate::cli::reject_trailing_kill_window_target_flag(cmd_name, &cmd_args)
+        {
+            let mut ws = write_lock.lock().unwrap();
+            if control_echo {
+                let _ = writeln!(ws, "{}", trimmed);
+            }
+            let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
+            let _ = writeln!(ws, "{message}");
+            let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
+            let _ = ws.flush();
+            continue;
+        }
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -843,6 +856,13 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
+    if let Err(message) = crate::cli::reject_trailing_kill_window_target_flag(cmd, &args) {
+        let _ = writeln!(write_stream, "psmux: {message}");
+        let _ = write_stream.flush();
+        if !persistent { break; }
+        line.clear();
+        continue;
+    }
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;
@@ -4058,6 +4078,69 @@ fn dispatch_control_command(
             let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}unknown command: {}", cmd));
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod trailing_kill_window_target_flag_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, RwLock};
+
+    fn assert_rejected(mode: Option<&str>, command: &str) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(
+                stream,
+                request_tx,
+                "test-key",
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+            );
+        });
+
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        writeln!(client, "AUTH test-key").unwrap();
+        client.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "OK\n");
+
+        if let Some(mode) = mode {
+            writeln!(client, "{mode}").unwrap();
+            client.flush().unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "\n");
+        }
+
+        writeln!(client, "{command}").unwrap();
+        client.flush().unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        reader.read_to_string(&mut response).unwrap();
+        handler.join().unwrap();
+
+        if mode.is_some() {
+            assert!(response.contains("%error"));
+        } else {
+            assert!(!response.trim().is_empty());
+        }
+        let requests = request_rx.try_iter().collect::<Vec<_>>();
+        assert!(!requests.iter().any(|request| matches!(request, CtrlReq::KillWindow)));
+    }
+
+    #[test]
+    fn socket_ingress_rejects_trailing_target_flag() {
+        assert_rejected(None, "kill-window -t");
+    }
+
+    #[test]
+    fn control_mode_rejects_killw_alias() {
+        assert_rejected(Some("CONTROL"), "killw -t");
     }
 }
 

@@ -205,8 +205,45 @@ fn main() {
     }
 }
 
+fn parse_cli_command(args: &[String]) -> io::Result<(&str, Vec<&String>)> {
+    let cmd_args: Vec<&String> = {
+        let mut result = Vec::new();
+        let mut i = 1; // skip binary name
+        let mut found_subcommand = false;
+        while i < args.len() {
+            if !found_subcommand {
+                // Before subcommand: skip global flags with values.
+                if (args[i] == "-t" || args[i] == "-L" || args[i] == "-f" || args[i] == "-S") && i + 1 < args.len() {
+                    i += 2;
+                    continue;
+                } else if args[i] == "-h" || args[i] == "--help"
+                       || args[i] == "-V" || args[i] == "-v" || args[i] == "--version" {
+                    found_subcommand = true;
+                } else if args[i].starts_with('-') {
+                    i += 1; // skip a global boolean flag
+                    continue;
+                } else {
+                    found_subcommand = true;
+                }
+            } else if args[i] == "-t" && i + 1 < args.len() {
+                i += 2;
+                continue;
+            }
+            result.push(&args[i]);
+            i += 1;
+        }
+        result
+    };
+    let cmd = cmd_args.first().map(|argument| argument.as_str()).unwrap_or("");
+    let subcommand_args: Vec<&str> = cmd_args.iter().skip(1).map(|argument| argument.as_str()).collect();
+    crate::cli::reject_trailing_kill_window_target_flag(cmd, &subcommand_args)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok((cmd, cmd_args))
+}
+
 fn run_main() -> io::Result<()> {
     let args: Vec<String> = crate::cli::normalize_flag_equals(env::args().collect());
+    let (cmd, cmd_args) = parse_cli_command(&args)?;
     
     // Set console code page to UTF-8 early so ALL output paths (CLI commands
     // like capture-pane, list-sessions, display-message, etc.) correctly
@@ -330,47 +367,6 @@ fn run_main() -> io::Result<()> {
             env::set_var("PSMUX_TARGET_SESSION", &name);
         }
     }
-    
-    // Find the actual command by skipping global -t/-L and their arguments.
-    // -t is stripped everywhere (the global handler already set PSMUX_TARGET_SESSION).
-    // -L is only stripped BEFORE the subcommand (global socket namespace flag);
-    // after the subcommand, -L is kept (e.g. select-pane -L, resize-pane -L).
-    let cmd_args: Vec<&String> = {
-        let mut result = Vec::new();
-        let mut i = 1; // skip binary name
-        let mut found_subcommand = false;
-        while i < args.len() {
-            if !found_subcommand {
-                // Before subcommand: skip global flags with values
-                if (args[i] == "-t" || args[i] == "-L" || args[i] == "-f" || args[i] == "-S") && i + 1 < args.len() {
-                    i += 2; // skip flag and its value
-                    continue;
-                } else if args[i] == "-h" || args[i] == "--help"
-                       || args[i] == "-V" || args[i] == "-v" || args[i] == "--version" {
-                    // Treat help/version flags as the subcommand itself
-                    found_subcommand = true;
-                    // fall through to push
-                } else if args[i].starts_with('-') {
-                    i += 1; // skip single global flags (e.g. -v)
-                    continue;
-                } else {
-                    found_subcommand = true;
-                    // fall through to push the subcommand name
-                }
-            } else {
-                // After subcommand: strip only -t (and its value)
-                if args[i] == "-t" && i + 1 < args.len() {
-                    i += 2;
-                    continue;
-                }
-            }
-            result.push(&args[i]);
-            i += 1;
-        }
-        result
-    };
-    
-    let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
     
     // Handle help and version flags first
     match cmd {

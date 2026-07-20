@@ -34,6 +34,16 @@ pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
     out
 }
 
+pub fn reject_trailing_kill_window_target_flag(
+    command: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    if matches!(command, "kill-window" | "killw") && args.last() == Some(&"-t") {
+        return Err("-t expects an argument".to_string());
+    }
+    Ok(())
+}
+
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
 /// owned strings (needed where the caller already has borrowed slices).
 pub fn normalize_flag_equals_borrowed(args: &[&str]) -> Vec<String> {
@@ -690,6 +700,20 @@ pub fn has_short_flag(args: &[&str], flag_char: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_only_trailing_kill_window_target_flag() {
+        assert!(reject_trailing_kill_window_target_flag("kill-window", &["-t"]).is_err());
+        assert_eq!(
+            reject_trailing_kill_window_target_flag("kill-window", &["-t", "@22"]),
+            Ok(())
+        );
+        assert_eq!(
+            reject_trailing_kill_window_target_flag("split-window", &["tool", "-t"]),
+            Ok(())
+        );
+        assert!(reject_trailing_kill_window_target_flag("killw", &["-t"]).is_err());
+    }
 
     #[test]
     fn parse_target_window_name() {

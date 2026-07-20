@@ -983,6 +983,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let _ = kill_active_pane(app);
         }
         "kill-window" | "killw" => {
+            crate::cli::reject_trailing_kill_window_target_flag(parts[0], &parts[1..])
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             if app.windows.len() > 1 {
                 let removed_pos = app.active_idx;
                 let mut win = app.windows.remove(removed_pos);

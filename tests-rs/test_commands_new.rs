@@ -584,6 +584,20 @@ fn kill_window_refuses_last_window() {
 }
 
 #[test]
+fn trailing_kill_window_target_flag_preserves_windows() {
+    let mut app = mock_app_with_windows(&["alpha", "beta"]);
+    let before = app.windows.iter().map(|window| window.name.clone()).collect::<Vec<_>>();
+
+    let error = execute_command_string(&mut app, "kill-window -t").unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        app.windows.iter().map(|window| window.name.clone()).collect::<Vec<_>>(),
+        before
+    );
+}
+
+#[test]
 fn killw_alias_works() {
     let mut app = mock_app_with_windows(&["x", "y"]);
     execute_command_string(&mut app, "killw").unwrap();

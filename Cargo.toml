@@ -66,6 +66,10 @@ path = "tests-rs/test_issue299_pwsh_snippet_integration.rs"
 name = "test_pr469_osc_command_safety"
 path = "tests-rs/test_pr469_osc_command_safety.rs"
 
+[[test]]
+name = "test_kill_window_missing_target"
+path = "tests-rs/test_kill_window_missing_target.rs"
+
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
 [target.'cfg(windows)'.dependencies]
