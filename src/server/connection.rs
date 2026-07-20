@@ -4102,6 +4102,9 @@ mod trailing_kill_window_target_flag_tests {
         });
 
         let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
         writeln!(client, "AUTH test-key").unwrap();
         client.flush().unwrap();
@@ -4119,16 +4122,28 @@ mod trailing_kill_window_target_flag_tests {
 
         writeln!(client, "{command}").unwrap();
         client.flush().unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut response = String::new();
-        reader.read_to_string(&mut response).unwrap();
-        handler.join().unwrap();
-
         if mode.is_some() {
-            assert!(response.contains("%error"));
+            loop {
+                let mut response_line = String::new();
+                let bytes = reader.read_line(&mut response_line).unwrap();
+                assert_ne!(bytes, 0, "control connection closed without an error");
+                if response_line.starts_with("%error") {
+                    break;
+                }
+                assert!(
+                    !response_line.starts_with("%end"),
+                    "command unexpectedly succeeded: {response_line:?}"
+                );
+            }
+            client.shutdown(std::net::Shutdown::Write).unwrap();
         } else {
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            reader.read_to_string(&mut response).unwrap();
             assert!(!response.trim().is_empty());
         }
+        handler.join().unwrap();
+
         let requests = request_rx.try_iter().collect::<Vec<_>>();
         assert!(!requests.iter().any(|request| matches!(request, CtrlReq::KillWindow)));
     }
