@@ -279,6 +279,14 @@ fn split_window_fixtures() {
     assert_eq!(count(&parsed, 'd'), 1);
     assert_eq!(count(&parsed, 'Z'), 1);
     assert_eq!(count(&parsed, 'h'), 1);
+    assert_eq!(
+        parsed
+            .options
+            .iter()
+            .map(|occurrence| occurrence.name)
+            .collect::<Vec<_>>(),
+        ['d', 'Z', 'h', 'p', 't']
+    );
     assert_eq!(values(&parsed, 'p'), ["50"]);
     assert_eq!(values(&parsed, 't'), ["%3"]);
     assert_eq!(parsed.positionals, ["tuicr", "-r", "HEAD~1..HEAD"]);
