@@ -66,6 +66,10 @@ path = "tests-rs/test_issue299_pwsh_snippet_integration.rs"
 name = "test_pr469_osc_command_safety"
 path = "tests-rs/test_pr469_osc_command_safety.rs"
 
+[[test]]
+name = "prototype_lexopt_command_parser"
+path = "tests-rs/prototype_lexopt_command_parser.rs"
+
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
 [target.'cfg(windows)'.dependencies]
@@ -107,3 +111,6 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = "symbols"
+
+[dev-dependencies]
+lexopt = "0.3.2"
