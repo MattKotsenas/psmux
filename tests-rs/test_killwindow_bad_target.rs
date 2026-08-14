@@ -136,6 +136,19 @@ fn no_target_still_kills_the_active_window() {
 }
 
 #[test]
+fn missing_target_value_kills_nothing() {
+    let mut app = app_with_windows(&["alpha", "beta"]);
+    app.active_idx = 1;
+
+    let error = execute_command_string(&mut app, "kill-window -t").unwrap_err();
+
+    assert_eq!(window_names(&app), vec!["alpha", "beta"]);
+    assert_eq!(app.active_idx, 1);
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "kill-window: -t expects an argument");
+}
+
+#[test]
 fn bare_session_target_kills_the_active_window() {
     // `kill-window -t kwtest` names only the session; tmux kills the session's
     // current window in that case.

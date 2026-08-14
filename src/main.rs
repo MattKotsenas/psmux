@@ -32,6 +32,7 @@ mod ssh_input;
 mod debug_log;
 mod control;
 mod resize_window;
+mod window_command_options;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
@@ -1741,6 +1742,8 @@ fn run_main() -> io::Result<()> {
                 }
             }
             "new-window" | "neww" => {
+                crate::window_command_options::validate_required_values(cmd, &cmd_args[1..])
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 // Strict getopt-style parsing for new-window flags.
                 // tmux template: "ac:dDe:F:kn:Pt:S:"
                 let mut name_arg: Option<String> = None;
@@ -1835,6 +1838,8 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "split-window" | "splitw" | "split-pane" | "splitp" => {
+                crate::window_command_options::validate_required_values(cmd, &cmd_args[1..])
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 // split-pane / splitp are tmux's default command-aliases for
                 // split-window (options-table.c). psmux handles them as arm
                 // synonyms, matching how info/server-info and choose-window/
@@ -2391,6 +2396,8 @@ fn run_main() -> io::Result<()> {
             }
             // kill-window - Kill a window
             "kill-window" | "killw" => {
+                crate::window_command_options::validate_required_values(cmd, &cmd_args[1..])
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 let mut cmd = "kill-window".to_string();
                 let mut i = 1;
                 while i < cmd_args.len() {

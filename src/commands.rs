@@ -996,6 +996,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let _ = kill_active_pane(app);
         }
         "kill-window" | "killw" => {
+            crate::window_command_options::validate_required_values(parts[0], &parts[1..])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             // Resolve an explicit -t here; an unresolvable target is an error,
             // not a fallback to the active window (tmux: "can't find window").
             let mut removed_pos = Some(app.active_idx);
