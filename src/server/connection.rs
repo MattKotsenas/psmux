@@ -711,6 +711,8 @@ if control_echo || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
+        let command_error =
+            crate::window_command_options::validate_required_values(cmd_name, &cmd_args).err();
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -719,7 +721,7 @@ if control_echo || control_noecho {
         let mut ctrl_target_pane: Option<usize> = None;
         let mut ctrl_pane_is_id = false;
         let mut ctrl_raw_target: Option<String> = None;
-        {
+        if command_error.is_none() {
             let target_scan_end = crate::cli::outer_target_scan_end(cmd_name, &cmd_args);
             let mut i = 0;
             while i < target_scan_end {
@@ -761,42 +763,44 @@ if control_echo || control_noecho {
         // and turn the swap into a no-op).
         let ctrl_capture_by_id = matches!(cmd_name, "capture-pane" | "capturep") && ctrl_pane_is_id && ctrl_target_pane.is_some();
         let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id;
-        let mut focus_err: Option<String> = None;
-        if is_focus_cmd {
-            if let Some(wid) = ctrl_target_win {
-                if ctrl_target_win_is_id {
-                    let _ = tx_ctrl.send(CtrlReq::FocusWindowById(wid));
-                } else {
-                    let _ = tx_ctrl.send(CtrlReq::FocusWindow(wid));
+        let mut focus_err = command_error;
+        if focus_err.is_none() {
+            if is_focus_cmd {
+                if let Some(wid) = ctrl_target_win {
+                    if ctrl_target_win_is_id {
+                        let _ = tx_ctrl.send(CtrlReq::FocusWindowById(wid));
+                    } else {
+                        let _ = tx_ctrl.send(CtrlReq::FocusWindow(wid));
+                    }
+                } else if let Some(ref wname) = ctrl_target_win_name {
+                    let _ = tx_ctrl.send(CtrlReq::FocusWindowByName(wname.clone()));
                 }
-            } else if let Some(ref wname) = ctrl_target_win_name {
-                let _ = tx_ctrl.send(CtrlReq::FocusWindowByName(wname.clone()));
-            }
-            if let Some(pid) = ctrl_target_pane {
-                if ctrl_pane_is_id {
-                    let _ = tx_ctrl.send(CtrlReq::FocusPane(pid));
-                } else {
-                    let _ = tx_ctrl.send(CtrlReq::FocusPaneByIndex(pid));
+                if let Some(pid) = ctrl_target_pane {
+                    if ctrl_pane_is_id {
+                        let _ = tx_ctrl.send(CtrlReq::FocusPane(pid));
+                    } else {
+                        let _ = tx_ctrl.send(CtrlReq::FocusPaneByIndex(pid));
+                    }
                 }
-            }
-        } else {
-            // Validated temporary focus (issue #545): on an unresolvable
-            // window/pane target the command must not run — reply %error
-            // instead of silently executing against the active window.
-            let want_win = (ctrl_target_win.is_some() || ctrl_target_win_name.is_some()) && !skip_target_focus;
-            let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
-            if want_win || want_pane {
-                let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
-                let _ = tx_ctrl.send(CtrlReq::FocusTargetTemp {
-                    win: if want_win { ctrl_target_win } else { None },
-                    win_is_id: ctrl_target_win_is_id,
-                    win_name: if want_win { ctrl_target_win_name.clone() } else { None },
-                    pane: if want_pane { ctrl_target_pane } else { None },
-                    pane_is_id: ctrl_pane_is_id,
-                    resp: focus_s,
-                });
-                if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
-                    focus_err = Some(e);
+            } else {
+                // Validated temporary focus (issue #545): on an unresolvable
+                // window/pane target the command must not run — reply %error
+                // instead of silently executing against the active window.
+                let want_win = (ctrl_target_win.is_some() || ctrl_target_win_name.is_some()) && !skip_target_focus;
+                let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
+                if want_win || want_pane {
+                    let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
+                    let _ = tx_ctrl.send(CtrlReq::FocusTargetTemp {
+                        win: if want_win { ctrl_target_win } else { None },
+                        win_is_id: ctrl_target_win_is_id,
+                        win_name: if want_win { ctrl_target_win_name.clone() } else { None },
+                        pane: if want_pane { ctrl_target_pane } else { None },
+                        pane_is_id: ctrl_pane_is_id,
+                        resp: focus_s,
+                    });
+                    if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
+                        focus_err = Some(e);
+                    }
                 }
             }
         }
@@ -964,6 +968,15 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
+if let Err(error) = crate::window_command_options::validate_required_values(cmd, &args) {
+    let _ = writeln!(write_stream, "ERROR: {error}");
+    let _ = write_stream.flush();
+    pending_chain.clear();
+    if persistent {
+        continue;
+    }
+    break;
+}
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;
