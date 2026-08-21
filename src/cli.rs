@@ -153,6 +153,42 @@ pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
     out
 }
 
+pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Option<usize> {
+    let value_options: &[&str] = match command {
+        "bind-key" | "bind" => &["-T"],
+        "set-hook" => &["-t"],
+        "confirm-before" | "confirm" => &["-p", "-t"],
+        _ => return None,
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let token = args[i].as_ref();
+        if token == "--" {
+            i += 1;
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            break;
+        }
+        i += if value_options.contains(&token) { 2 } else { 1 };
+    }
+
+    match command {
+        "bind-key" | "bind" | "set-hook" => (i < args.len()).then_some(i + 1),
+        "confirm-before" | "confirm" => (i < args.len()).then_some(i),
+        _ => None,
+    }
+}
+
+pub fn outer_target_scan_end<S: AsRef<str>>(command: &str, args: &[S]) -> usize {
+    deferred_command_start(command, args)
+        .into_iter()
+        .chain(args.iter().position(|arg| arg.as_ref() == "--"))
+        .min()
+        .unwrap_or(args.len())
+}
+
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
 /// owned strings (needed where the caller already has borrowed slices).
 pub fn normalize_flag_equals_borrowed(args: &[&str]) -> Vec<String> {

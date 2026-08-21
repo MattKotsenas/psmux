@@ -77,3 +77,25 @@ fn format_condition_token_stays_bare() {
     assert_eq!(out[3], "send-keys C-h");
     assert_eq!(out[4], "select-pane -L");
 }
+
+#[test]
+fn target_filter_stops_at_deferred_command_boundaries() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        ("bind-key", &["-n", "x", "kill-window", "-t"], &["-n", "x", "kill-window", "-t"]),
+        (
+            "set-hook",
+            &["-g", "-t", "0", "after-split-window", "kill-window", "-t"],
+            &["-g", "after-split-window", "kill-window", "-t"],
+        ),
+        (
+            "confirm-before",
+            &["-p", "Kill?", "-t", "0", "kill-window", "-t"],
+            &["-p", "Kill?", "kill-window", "-t"],
+        ),
+        ("kill-window", &["-t", "0", "-a"], &["-a"]),
+    ];
+
+    for (command, args, expected) in cases {
+        assert_eq!(without_outer_target(command, args), *expected, "{command}");
+    }
+}

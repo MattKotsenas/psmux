@@ -462,6 +462,75 @@ fn main() {
     }
 }
 
+fn process_command_index(args: &[String]) -> Option<usize> {
+    let mut i = 1;
+    while i < args.len() {
+        if matches!(args[i].as_str(), "-t" | "-L" | "-f" | "-S") && i + 1 < args.len() {
+            i += 2;
+        } else if matches!(args[i].as_str(), "-h" | "--help" | "-V" | "-v" | "--version") {
+            return Some(i);
+        } else if args[i].starts_with('-') {
+            i += 1;
+        } else {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn process_target_position(args: &[String], command_index: usize) -> Option<usize> {
+    if let Some(position) = args[1..command_index].iter().position(|arg| arg == "-t") {
+        return Some(position + 1);
+    }
+
+    let command = &args[command_index];
+    let command_args = &args[command_index + 1..];
+    let scan_end = crate::cli::outer_target_scan_end(command, command_args);
+    command_args[..scan_end]
+        .iter()
+        .position(|arg| arg == "-t")
+        .map(|position| command_index + 1 + position)
+}
+
+#[cfg(test)]
+mod process_command_arg_tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn child_target_after_separator_does_not_route_client() {
+        let args = strings(&[
+            "psmux",
+            "new-window",
+            "-t",
+            "outer",
+            "--",
+            "program",
+            "-t",
+            "child",
+        ]);
+        let command = process_command_index(&args).unwrap();
+        assert_eq!(process_target_position(&args, command), Some(2));
+    }
+
+    #[test]
+    fn deferred_target_does_not_route_client() {
+        let args = strings(&["psmux", "bind-key", "x", "kill-window", "-t", "child"]);
+        let command = process_command_index(&args).unwrap();
+        assert_eq!(process_target_position(&args, command), None);
+    }
+
+    #[test]
+    fn global_target_before_command_routes_client() {
+        let args = strings(&["psmux", "-t", "outer", "new-window"]);
+        let command = process_command_index(&args).unwrap();
+        assert_eq!(process_target_position(&args, command), Some(1));
+    }
+}
+
 fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
@@ -540,8 +609,13 @@ fn run_main() -> io::Result<()> {
     // $TMUX-based resolution below so a stale PSMUX_TARGET_SESSION inherited from
     // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
     // hijack the current session. See issue #485.
+    let command_index = process_command_index(&args);
+    let target_position = command_index.and_then(|index| process_target_position(&args, index));
+    let strip_target_position = command_index
+        .filter(|index| !matches!(args[*index].as_str(), "detach-client" | "detach"))
+        .and(target_position);
     let mut explicit_session_target = false;
-    if let Some(pos) = args.iter().position(|a| a == "-t") {
+    if let Some(pos) = target_position {
         if let Some(target) = args.get(pos + 1) {
             // move-window/swap-window: a bare numeric -t is a WINDOW index (tmux
             // target-window semantics), not a session. Coerce "N" -> ":N" so the
@@ -620,49 +694,22 @@ fn run_main() -> io::Result<()> {
         }
     }
     
-    // Find the actual command by skipping global -t/-L and their arguments.
-    // -t is stripped everywhere (the global handler already set PSMUX_TARGET_SESSION).
-    // -L is only stripped BEFORE the subcommand (global socket namespace flag);
-    // after the subcommand, -L is kept (e.g. select-pane -L, resize-pane -L).
-    let cmd_args: Vec<&String> = {
-        let mut result = Vec::new();
-        let mut i = 1; // skip binary name
-        let mut found_subcommand = false;
-        while i < args.len() {
-            if !found_subcommand {
-                // Before subcommand: skip global flags with values
-                if (args[i] == "-t" || args[i] == "-L" || args[i] == "-f" || args[i] == "-S") && i + 1 < args.len() {
-                    i += 2; // skip flag and its value
-                    continue;
-                } else if args[i] == "-h" || args[i] == "--help"
-                       || args[i] == "-V" || args[i] == "-v" || args[i] == "--version" {
-                    // Treat help/version flags as the subcommand itself
-                    found_subcommand = true;
-                    // fall through to push
-                } else if args[i].starts_with('-') {
-                    i += 1; // skip single global flags (e.g. -v)
-                    continue;
-                } else {
-                    found_subcommand = true;
-                    // fall through to push the subcommand name
-                }
-            } else {
-                // After subcommand: strip only -t (and its value). Exception:
-                // detach-client's -t is a client spec (tty or %id) that the
-                // handler itself must read, so leave it in place. Stripping it
-                // made the handler see no target and widen to detach-all
-                // (issue #565).
-                let is_detach = result.first().map_or(false, |s| *s == "detach-client" || *s == "detach");
-                if args[i] == "-t" && i + 1 < args.len() && !is_detach {
-                    i += 2;
-                    continue;
-                }
-            }
-            result.push(&args[i]);
-            i += 1;
-        }
-        result
-    };
+    // Keep command tails verbatim. Only the outer target consumed for routing
+    // is removed; nested commands and argv after `--` retain their own `-t`.
+    let cmd_args: Vec<&String> = command_index
+        .map(|index| {
+            args[index..]
+                .iter()
+                .enumerate()
+                .filter(|(offset, _)| {
+                    let absolute = index + *offset;
+                    strip_target_position
+                        .map_or(true, |target| absolute != target && absolute != target + 1)
+                })
+                .map(|(_, arg)| arg)
+                .collect()
+        })
+        .unwrap_or_default();
     
     let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
 

@@ -203,6 +203,21 @@ fn requote_command_tail(args: &[&str]) -> String {
     }).collect::<Vec<String>>().join(" ")
 }
 
+fn without_outer_target<'a>(cmd: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let scan_end = crate::cli::outer_target_scan_end(cmd, args);
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if i < scan_end && args[i] == "-t" {
+            i += 2;
+        } else {
+            filtered.push(args[i]);
+            i += 1;
+        }
+    }
+    filtered
+}
+
 /// Walk the sub-commands produced by `split_top_level_semicolons` and merge
 /// any consecutive run of `send`/`send-keys` commands targeting the same
 /// pane into a single synthesized `send -lt <target> <bytes>` command.
@@ -705,8 +720,9 @@ if control_echo || control_noecho {
         let mut ctrl_pane_is_id = false;
         let mut ctrl_raw_target: Option<String> = None;
         {
+            let target_scan_end = crate::cli::outer_target_scan_end(cmd_name, &cmd_args);
             let mut i = 0;
-            while i < cmd_args.len() {
+            while i < target_scan_end {
                 if cmd_args[i] == "-t" {
                     if let Some(v) = cmd_args.get(i+1) {
                         // Issue #558: drop the '=' exact-match marker (see TARGET capture).
@@ -725,17 +741,7 @@ if control_echo || control_noecho {
             }
         }
 
-        // Build filtered args (without -t)
-        let filtered_args: Vec<&str> = {
-            let mut filtered = Vec::new();
-            let mut i = 0;
-            while i < cmd_args.len() {
-                if cmd_args[i] == "-t" { i += 2; continue; }
-                filtered.push(cmd_args[i]);
-                i += 1;
-            }
-            filtered
-        };
+        let filtered_args = without_outer_target(cmd_name, &cmd_args);
 
         // Apply target focus
         let is_focus_cmd = matches!(cmd_name, "select-window" | "selectw" | "select-pane" | "selectp");
@@ -968,11 +974,9 @@ let mut pane_is_id = global_pane_is_id;
 // Save raw -t value for relative pane targets like :.+ or :.-
 // Falls back to global_raw_target from TARGET protocol line
 let mut raw_target: Option<String> = global_raw_target.clone();
+let target_scan_end = crate::cli::outer_target_scan_end(cmd, &args);
 let mut i = 0;
-while i < args.len() {
-    // `--` ends option parsing: a `-t` after it is command/value data, not a
-    // target flag (#583).
-    if args[i] == "--" { break; }
+while i < target_scan_end {
     if args[i] == "-t" {
         if let Some(v) = args.get(i+1) {
             // Issue #558: drop the '=' exact-match marker (see TARGET capture).
@@ -990,31 +994,8 @@ while i < args.len() {
     }
     i += 1;
 }
-// Build args without -t and its value so command handlers get clean positional args
-let args: Vec<&str> = {
-    let mut filtered = Vec::new();
-    let mut i = 0;
-    let mut end_of_opts = false;
-    while i < args.len() {
-        if !end_of_opts {
-            if args[i] == "--" {
-                // Keep the `--` itself (arms that understand it use it as the
-                // end-of-options marker) but stop eating -t pairs after it.
-                end_of_opts = true;
-                filtered.push(args[i]);
-                i += 1;
-                continue;
-            }
-            if args[i] == "-t" {
-                i += 2; // skip -t and its value
-                continue;
-            }
-        }
-        filtered.push(args[i]);
-        i += 1;
-    }
-    filtered
-};
+// Remove this command's target while retaining targets in deferred commands.
+let args = without_outer_target(cmd, &args);
 // Commands that should permanently change focus when used with -t
 let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp");
 // Commands that handle -t internally and should NOT get FocusWindowTemp.
@@ -3105,8 +3086,9 @@ match cmd {
             }
             i += 1;
         }
-        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && Some(&a.to_string()) != prompt.as_ref()).copied().collect();
-        let command = non_flag.join(" ");
+        let command = crate::cli::deferred_command_start(cmd, &args)
+            .map(|i| requote_command_tail(&args[i..]))
+            .unwrap_or_default();
         let prompt_str = prompt.unwrap_or_else(|| format!("Run '{}'", command));
         let _ = tx.send(CtrlReq::ConfirmBefore(prompt_str, command));
     }
@@ -4529,21 +4511,19 @@ fn dispatch_control_command(
             true
         }
         "set-hook" => {
-            let positional: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-            if positional.len() >= 2 {
-                let name = positional[0].to_string();
-                // Re-quote tokens that contain spaces to preserve paths like "Psmux Plugins"
-                let command = positional[1..].iter().map(|s| {
-                    if s.contains(' ') { format!("'{}'", s) } else { s.to_string() }
-                }).collect::<Vec<_>>().join(" ");
-                let has_append = args.iter().any(|a| {
-                    if *a == "-a" { return true; }
-                    a.starts_with('-') && a.len() > 2 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) && a.contains('a')
-                });
-                if has_append {
-                    let _ = tx.send(CtrlReq::AppendHook(name, command));
-                } else {
-                    let _ = tx.send(CtrlReq::SetHook(name, command));
+            if let Some(command_start) = crate::cli::deferred_command_start(cmd, args) {
+                if command_start < args.len() {
+                    let name = args[command_start - 1].to_string();
+                    let command = requote_command_tail(&args[command_start..]);
+                    let has_append = args.iter().any(|a| {
+                        if *a == "-a" { return true; }
+                        a.starts_with('-') && a.len() > 2 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) && a.contains('a')
+                    });
+                    if has_append {
+                        let _ = tx.send(CtrlReq::AppendHook(name, command));
+                    } else {
+                        let _ = tx.send(CtrlReq::SetHook(name, command));
+                    }
                 }
             }
             let _ = resp_tx.send(String::new());
