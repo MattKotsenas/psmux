@@ -1439,21 +1439,31 @@ fn split_spawn_tokens(cmd: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
+    let mut token_started = false;
     for c in cmd.chars() {
         match quote {
             Some(q) => {
                 if c == q { quote = None; } else { cur.push(c); }
             }
             None => match c {
-                '"' | '\'' => quote = Some(c),
-                c if c.is_whitespace() => {
-                    if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); }
+                '"' | '\'' => {
+                    quote = Some(c);
+                    token_started = true;
                 }
-                _ => cur.push(c),
+                c if c.is_whitespace() => {
+                    if token_started {
+                        tokens.push(std::mem::take(&mut cur));
+                        token_started = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    token_started = true;
+                }
             },
         }
     }
-    if !cur.is_empty() { tokens.push(cur); }
+    if token_started { tokens.push(cur); }
     tokens
 }
 

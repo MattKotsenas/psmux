@@ -18,6 +18,8 @@ fn tokens_split_on_whitespace_and_quotes() {
     assert_eq!(t, vec!["cmd.exe", "/k", "echo", "hi"]);
     let t = split_spawn_tokens("'a b' c");
     assert_eq!(t, vec!["a b", "c"]);
+    let t = split_spawn_tokens("cmd.exe '' tail");
+    assert_eq!(t, vec!["cmd.exe", "", "tail"]);
 }
 
 #[test]
