@@ -165,7 +165,7 @@ See [claude-code.md](claude-code.md) for detailed setup and troubleshooting.
 - `choose-buffer` (`Prefix + =`): pick from paste buffers with preview
 - `choose-client`: view connected clients
 - `customize-mode`: interactive options editor
-- **Digit-jump** (all pickers): type a number and press `Enter` to jump directly to that row (1-based). A `go to N` indicator appears at the bottom; `Backspace` edits the number, `Esc` cancels. Every row is numbered so the mapping is visible at a glance. See [keybindings.md](keybindings.md#picker-navigation-choose-session-choose-tree-choose-buffer-list-keys-customize) for the full key reference.
+- **Digit-jump** (all pickers): type a number and press `Enter` to jump directly to that row (1-based). A `go to N` indicator appears at the bottom; `Backspace` edits the number, `Esc` cancels. Every row is numbered so the mapping is visible at a glance. See [keybindings.md](keybindings.md#overlay-keys) for the full key reference.
 
 ## Multi-Shell Support
 
