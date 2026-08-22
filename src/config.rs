@@ -2203,27 +2203,7 @@ fn parse_tmux_entry_script(app: &mut AppState, path: &std::path::Path) {
             .replace("${CURRENT_DIR}", &script_plugin_dir)
             .replace("$CURRENT_DIR", &script_plugin_dir);
 
-        // Now parse the tmux subcommand as a psmux config line
-        let expanded = expanded.trim();
-        if expanded.starts_with("source-file ") || expanded.starts_with("source ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("set-option ") || expanded.starts_with("set ")
-            || expanded.starts_with("set -g ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("setw ") || expanded.starts_with("set-window-option ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("run-shell ") || expanded.starts_with("run ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("bind-key ") || expanded.starts_with("bind ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("if-shell ") || expanded.starts_with("if ") {
-            parse_config_line(app, expanded);
-        } else if expanded.starts_with("set-hook ") {
-            parse_config_line(app, expanded);
-        } else {
-            // Try to parse it anyway — it might be a valid config directive
-            parse_config_line(app, expanded);
-        }
+        parse_config_line(app, expanded.trim());
     }
 
     // Fallback: if we didn't find any tmux commands in the script, try to
