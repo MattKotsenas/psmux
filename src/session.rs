@@ -1631,72 +1631,6 @@ pub fn fetch_authed_response_multi(
     read_authed_all(&mut br)
 }
 
-/// Fetch a one-line `session-info` response from a session server.
-///
-/// Thin wrapper over `fetch_authed_response` retained for the call site
-/// in `client.rs` (and the regression tests added in PR #251 for #250).
-pub fn fetch_session_info(
-    addr: &str,
-    key: &str,
-    connect_timeout: Duration,
-    read_timeout: Duration,
-) -> Option<String> {
-    fetch_authed_response(addr, key, b"session-info\n", connect_timeout, read_timeout)
-}
-
-/// Fan out `fetch_session_info` across many sessions in parallel.
-///
-/// The session picker used to call `fetch_session_info` sequentially, so
-/// opening the picker with N sessions was bounded by `N * read_timeout`
-/// in the worst case. With this helper, N concurrent threads share that
-/// bound: total wall time is roughly `read_timeout`, regardless of N.
-///
-/// `inputs` is `(label, addr, key)`. Output preserves input order and
-/// pairs each label with the fetched info or the supplied `fallback`
-/// (typically `"<label>: (not responding)"`).
-///
-/// Retained for the #250 regression suite; the picker now uses
-/// `classify_sessions_parallel`, which both lists and prunes in one pass.
-#[allow(dead_code)]
-pub fn fetch_session_infos_parallel<F>(
-    inputs: Vec<(String, String, String)>,
-    connect_timeout: Duration,
-    read_timeout: Duration,
-    fallback: F,
-) -> Vec<(String, String)>
-where
-    F: Fn(&str) -> String + Send + Sync,
-{
-    if inputs.is_empty() {
-        return Vec::new();
-    }
-    // Single session: skip thread spawn overhead entirely.
-    if inputs.len() == 1 {
-        let (label, addr, key) = &inputs[0];
-        let info = fetch_session_info(addr, key, connect_timeout, read_timeout)
-            .unwrap_or_else(|| fallback(label));
-        return vec![(label.clone(), info)];
-    }
-    let results: Vec<(String, String)> = std::thread::scope(|scope| {
-        let fallback_ref = &fallback;
-        let handles: Vec<_> = inputs
-            .iter()
-            .map(|(label, addr, key)| {
-                let label = label.clone();
-                let addr = addr.clone();
-                let key = key.clone();
-                scope.spawn(move || {
-                    let info = fetch_session_info(&addr, &key, connect_timeout, read_timeout)
-                        .unwrap_or_else(|| fallback_ref(&label));
-                    (label, info)
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
-    results
-}
-
 /// Liveness verdict for one session, produced by a single bounded probe.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionLiveness {
@@ -1783,12 +1717,9 @@ fn probe_session_liveness(
 
 /// Classify many sessions in parallel with a single bounded probe each.
 ///
-/// Like `fetch_session_infos_parallel`, total wall time is ~one probe window
-/// regardless of N (each session runs on its own thread). Returns the liveness
-/// verdict per input label, preserving order, so the caller can reap the dead
-/// ones and render the rest. This is what keeps the session picker responsive:
-/// it replaces a sequential cleanup pass (O(N * timeout)) with one parallel
-/// round-trip that both lists and prunes.
+/// Total wall time is roughly one probe window regardless of N because each
+/// session runs on its own thread. Results preserve input order so the caller
+/// can reap dead sessions and render the rest.
 pub fn classify_sessions_parallel(
     inputs: Vec<(String, String, String)>,
     connect_timeout: Duration,

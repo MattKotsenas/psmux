@@ -198,13 +198,12 @@ if (Test-Path $portFile) {
     else { Write-Fail "Bad key leaked payload: '$bad'" }
 }
 
-# --- Test 4: parallel fetch wall time bound (PERFORMANCE) ---
+# --- Test 4: parallel classification wall time bound (PERFORMANCE) ---
 Write-Host "`n[Test 4] Performance: choose-session reaches all sessions quickly" -ForegroundColor Yellow
-# We cannot easily call fetch_session_infos_parallel from PowerShell, but we
-# CAN time how long the equivalent serial fetches take and assert that the
-# READ_TIMEOUT * N upper bound is respected for serial too. The Rust unit
-# test 'parallel_fetch_runs_n_servers_within_one_read_timeout' covers the
-# parallel speedup directly with controllable delays. Here we just assert
+# We can time how long the equivalent serial fetches take and assert that the
+# READ_TIMEOUT * N upper bound is respected for serial too. The Rust unit test
+# 'parallel_classification_runs_n_servers_within_one_read_timeout' covers the
+# picker classifier directly with controllable delays. Here we just assert
 # the real-world serial fetch of $created sessions finishes well within
 # their cumulative read_timeout (150ms each, picker uses parallel internally).
 $walls = @()

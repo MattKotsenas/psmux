@@ -1,21 +1,17 @@
-// Root-cause regression tests for issue #250 (session picker AUTH ack race).
+// Regression tests for authenticated session discovery.
 //
-// Issue #250 was patched in PR #251 by adding a one-shot `fetch_session_info`
-// helper that explicitly skips the AUTH `OK\n` ack. That fixed the symptom
-// at one call site, but the underlying smell — every TCP picker fetch
-// reimplementing AUTH+command framing by hand — remained. This file tests
-// the deeper fix: a centralized `fetch_authed_response` /
-// `fetch_authed_response_multi` helper that:
+// All TCP picker requests use the centralized `fetch_authed_response` /
+// `fetch_authed_response_multi` helpers, and session liveness is classified by
+// `classify_sessions_parallel`. This file verifies that these production paths:
 //
-//   1. Validates the session key against CRLF/NUL injection (security).
-//   2. Caps response payloads at MAX_AUTHED_RESPONSE_BYTES (DoS guard).
-//   3. Handles every AUTH-ack timing race uniformly (the same correctness
-//      property #251 added for `session-info`, but for ALL command sites).
-//   4. Fans out picker fetches in parallel across N sessions with a wall
+//   1. Validate the session key against CRLF/NUL injection (security).
+//   2. Cap response payloads at MAX_AUTHED_RESPONSE_BYTES (DoS guard).
+//   3. Handle every AUTH-ack timing race uniformly for all command sites.
+//   4. Fan out picker probes in parallel across N sessions with a wall
 //      time bounded by a single read_timeout (performance).
 //
 // Tests use real TCP listeners on 127.0.0.1:0 and call the production
-// helpers directly — no parser re-implementation.
+// helpers directly; no parser re-implementation.
 
 use super::*;
 
@@ -168,10 +164,30 @@ fn fetch_authed_response_late_ack_does_not_leak_as_payload() {
         "key",
         b"session-info\n",
         Duration::from_millis(200),
-        Duration::from_millis(500), // generous so we catch the real line
+        Duration::from_millis(80),
     );
     assert_ne!(info.as_deref(), Some("OK"), "late ack leaked as payload");
-    // With a generous read_timeout, the payload SHOULD make it through.
+    let _ = done.recv_timeout(Duration::from_secs(2));
+}
+
+#[test]
+fn fetch_authed_response_delayed_ack_returns_payload_within_timeout() {
+    let (addr, done) = spawn_fake(|mut s| {
+        drain_two_lines(&mut s);
+        thread::sleep(Duration::from_millis(120));
+        let _ = s.write_all(b"OK\n");
+        let _ = s.flush();
+        thread::sleep(Duration::from_millis(20));
+        let _ = s.write_all(b"real-payload-line\n");
+        let _ = s.flush();
+    });
+    let info = fetch_authed_response(
+        &addr,
+        "key",
+        b"session-info\n",
+        Duration::from_millis(200),
+        Duration::from_millis(500),
+    );
     assert_eq!(info.as_deref(), Some("real-payload-line"));
     let _ = done.recv_timeout(Duration::from_secs(2));
 }
@@ -322,15 +338,12 @@ fn fetch_authed_response_caps_runaway_response() {
     );
 }
 
-// ---- Parallel fetch (PERFORMANCE) -------------------------------------------
+// ---- Parallel classification (PERFORMANCE) ----------------------------------
 
 #[test]
-fn parallel_fetch_runs_n_servers_within_one_read_timeout() {
-    // PERFORMANCE: the picker used to call fetch_session_info sequentially,
-    // so opening with N sessions took O(N * read_timeout) in the worst case.
-    // The new parallel helper must complete in ~one read_timeout regardless
-    // of N. We spin up 8 fake servers that each delay 120 ms before replying,
-    // and assert the wall time is well under N * delay.
+fn parallel_classification_runs_n_servers_within_one_read_timeout() {
+    // Eight fake servers each delay 120 ms before replying. Classification
+    // must complete within one probe window rather than N sequential delays.
     const N: usize = 8;
     const DELAY_MS: u64 = 120;
     const READ_TIMEOUT_MS: u64 = 400;
@@ -349,18 +362,20 @@ fn parallel_fetch_runs_n_servers_within_one_read_timeout() {
     }
 
     let start = Instant::now();
-    let results = fetch_session_infos_parallel(
+    let results = classify_sessions_parallel(
         inputs,
         Duration::from_millis(200),
         Duration::from_millis(READ_TIMEOUT_MS),
-        |label| format!("{}: (not responding)", label),
     );
     let elapsed = start.elapsed();
 
     assert_eq!(results.len(), N);
-    for (i, (label, info)) in results.iter().enumerate() {
+    for (i, (label, verdict)) in results.iter().enumerate() {
         assert_eq!(label, &format!("sess{}", i));
-        assert_eq!(info, &format!("sess{}: 1 windows", i));
+        assert_eq!(
+            verdict,
+            &SessionLiveness::Alive(format!("sess{}: 1 windows", i))
+        );
     }
     // Sequential would be N * DELAY_MS = 960 ms. Parallel should be roughly
     // DELAY_MS plus thread spawn overhead. Allow plenty of slack but still
@@ -368,7 +383,7 @@ fn parallel_fetch_runs_n_servers_within_one_read_timeout() {
     let sequential_bound_ms = (N as u64) * DELAY_MS;
     assert!(
         elapsed.as_millis() < (sequential_bound_ms / 2) as u128,
-        "parallel fetch took {:?}, expected < {}ms (sequential would be {}ms)",
+        "parallel classification took {:?}, expected < {}ms (sequential would be {}ms)",
         elapsed,
         sequential_bound_ms / 2,
         sequential_bound_ms
@@ -380,10 +395,10 @@ fn parallel_fetch_runs_n_servers_within_one_read_timeout() {
 }
 
 #[test]
-fn parallel_fetch_handles_mixed_success_and_failure() {
-    // Two responsive sessions, one connect-refused (port immediately closed),
-    // one that returns only OK (no payload). All four must be present in the
-    // output, in input order, with the unhappy two replaced by the fallback.
+fn parallel_classification_handles_mixed_liveness() {
+    // Two responsive sessions, one connect-refused, one that returns only OK,
+    // and one with no usable key. All inputs must retain their order and carry
+    // the classifier's corresponding verdict.
     let (good1_addr, d1) = spawn_fake(|mut s| {
         drain_two_lines(&mut s);
         let _ = s.write_all(b"OK\nalpha: 1 windows\n");
@@ -409,20 +424,27 @@ fn parallel_fetch_handles_mixed_success_and_failure() {
         ("dead".to_string(), dead_addr, "k".to_string()),
         ("beta".to_string(), good2_addr, "k".to_string()),
         ("hush".to_string(), only_ok_addr, "k".to_string()),
+        ("nokey".to_string(), "127.0.0.1:1".to_string(), String::new()),
     ];
 
-    let results = fetch_session_infos_parallel(
+    let results = classify_sessions_parallel(
         inputs,
         Duration::from_millis(100),
         Duration::from_millis(150),
-        |label| format!("{}: (not responding)", label),
     );
 
-    assert_eq!(results.len(), 4);
-    assert_eq!(results[0], ("alpha".into(), "alpha: 1 windows".into()));
-    assert_eq!(results[1], ("dead".into(), "dead: (not responding)".into()));
-    assert_eq!(results[2], ("beta".into(), "beta: 2 windows".into()));
-    assert_eq!(results[3], ("hush".into(), "hush: (not responding)".into()));
+    assert_eq!(results.len(), 5);
+    assert_eq!(
+        results[0],
+        ("alpha".into(), SessionLiveness::Alive("alpha: 1 windows".into()))
+    );
+    assert_eq!(results[1], ("dead".into(), SessionLiveness::Dead));
+    assert_eq!(
+        results[2],
+        ("beta".into(), SessionLiveness::Alive("beta: 2 windows".into()))
+    );
+    assert_eq!(results[3], ("hush".into(), SessionLiveness::Dead));
+    assert_eq!(results[4], ("nokey".into(), SessionLiveness::Unreachable));
 
     let _ = d1.recv_timeout(Duration::from_secs(2));
     let _ = d2.recv_timeout(Duration::from_secs(2));
@@ -430,18 +452,17 @@ fn parallel_fetch_handles_mixed_success_and_failure() {
 }
 
 #[test]
-fn parallel_fetch_empty_input_returns_empty() {
-    let out = fetch_session_infos_parallel(
+fn parallel_classification_empty_input_returns_empty() {
+    let out = classify_sessions_parallel(
         Vec::new(),
         Duration::from_millis(50),
         Duration::from_millis(50),
-        |_| "x".into(),
     );
     assert!(out.is_empty());
 }
 
 #[test]
-fn parallel_fetch_single_input_skips_thread_spawn() {
+fn parallel_classification_single_input_returns_liveness() {
     // Single-input path takes the fast non-scoped branch. Just verify it
     // produces correct output with the same semantics.
     let (addr, done) = spawn_fake(|mut s| {
@@ -449,12 +470,14 @@ fn parallel_fetch_single_input_skips_thread_spawn() {
         let _ = s.write_all(b"OK\nlonely: 0 windows\n");
         let _ = s.flush();
     });
-    let out = fetch_session_infos_parallel(
+    let out = classify_sessions_parallel(
         vec![("lonely".into(), addr, "k".into())],
         Duration::from_millis(200),
         Duration::from_millis(300),
-        |label| format!("{}: (not responding)", label),
     );
-    assert_eq!(out, vec![("lonely".into(), "lonely: 0 windows".into())]);
+    assert_eq!(
+        out,
+        vec![("lonely".into(), SessionLiveness::Alive("lonely: 0 windows".into()))]
+    );
     let _ = done.recv_timeout(Duration::from_secs(2));
 }
