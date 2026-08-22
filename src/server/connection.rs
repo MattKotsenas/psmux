@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::net::TcpStream;
@@ -902,11 +903,11 @@ let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(10)));
 
 // Process commands in a loop to handle batching
 let mut attached_sent = false;
-let mut pending_chain: Vec<String> = Vec::new();
+let mut pending_chain = VecDeque::new();
 loop {
     // Check pending chained commands before reading from socket
-    if !pending_chain.is_empty() {
-        line = pending_chain.remove(0);
+    if let Some(command) = pending_chain.pop_front() {
+        line = command;
     } else if line.trim().is_empty() {
         // Try to read another command with timeout
         line.clear();
@@ -3744,8 +3745,8 @@ match cmd {
     _ => {}
 }
     // Process pending chained commands before reading from socket
-    if !pending_chain.is_empty() {
-        line = pending_chain.remove(0);
+    if let Some(command) = pending_chain.pop_front() {
+        line = command;
         continue;
     }
     // Try to read next command for batching (with timeout)
