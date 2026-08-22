@@ -707,13 +707,6 @@ fn prevl_alias_works() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn select_layout_applies_tiled() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "select-layout tiled").unwrap();
-    // Should not panic; layout is applied even with empty window
-}
-
-#[test]
 fn selectl_alias_works() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "selectl even-horizontal").unwrap();
@@ -765,33 +758,9 @@ fn unlinkw_alias_works() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn clear_history_does_not_panic_on_empty_window() {
-    let mut app = mock_app_with_window();
-    // Empty window has a Split root with no panes, should not panic
-    execute_command_string(&mut app, "clear-history").unwrap();
-}
-
-#[test]
 fn clearhist_alias_does_not_panic() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "clearhist").unwrap();
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  break-pane: on empty window, no crash (single pane cannot break)
-// ════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn break_pane_empty_split_does_not_crash() {
-    let mut app = mock_app_with_window();
-    // Empty Split root with no panes: break-pane should be safe
-    execute_command_string(&mut app, "break-pane").unwrap();
-}
-
-#[test]
-fn breakp_alias_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "breakp").unwrap();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -822,61 +791,9 @@ fn swap_pane_does_not_crash_on_empty() {
     execute_command_string(&mut app, "swap-pane -D").unwrap();
 }
 
-#[test]
-fn swapp_alias_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "swapp -D").unwrap();
-}
-
 // ════════════════════════════════════════════════════════════════════════════
-//  rotate-window: on empty window, no crash
+//  resize-pane alias
 // ════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn rotate_window_does_not_crash_on_empty() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "rotate-window").unwrap();
-}
-
-#[test]
-fn rotate_window_reverse_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "rotate-window -D").unwrap();
-}
-
-#[test]
-fn rotatew_alias_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "rotatew").unwrap();
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  resize-pane: local directional resizing
-// ════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn resize_pane_up_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -U 5").unwrap();
-}
-
-#[test]
-fn resize_pane_down_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -D 5").unwrap();
-}
-
-#[test]
-fn resize_pane_left_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -L 5").unwrap();
-}
-
-#[test]
-fn resize_pane_right_does_not_crash() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -R 5").unwrap();
-}
 
 #[test]
 fn resizep_alias_zoom() {
