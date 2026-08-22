@@ -197,6 +197,7 @@ fn config_unbind_cv_scenario_from_reporter() {
     populate_default_bindings(&mut app);
 
     let prefix_count_before = app.key_tables.get("prefix").map(|v| v.len()).unwrap_or(0);
+    assert!(prefix_count_before > 0, "precondition: default prefix bindings exist");
 
     // "unbind-key -a C-v" is parsed as "unbind all" (the -a flag), ignoring C-v
     // This would CLEAR the entire prefix table, not unbind just C-v!
