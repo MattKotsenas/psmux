@@ -41,6 +41,21 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+  clippy-portable-pty:
+    name: Clippy portable-pty
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy -p portable-pty-psmux --all-targets --no-deps -- -D warnings
+
   test:
     name: Test Windows x64
     runs-on: windows-latest

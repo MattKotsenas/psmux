@@ -22,6 +22,7 @@ use winapi::um::winbase::{
 use winapi::um::wincon::COORD;
 use winapi::um::winnt::HANDLE;
 
+#[allow(clippy::upper_case_acronyms)]
 pub type HPCON = HANDLE;
 
 /// Deliberately absent from base_flags() (see the doc comment there): only the
