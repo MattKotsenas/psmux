@@ -1854,7 +1854,7 @@ pub fn send_control(line: String) -> io::Result<()> {
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = crate::paths::port_file(&target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?;
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     // 1s connect timeout: a busy-but-alive server must not be mistaken for a
@@ -1911,7 +1911,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = crate::paths::port_file(&target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?;
     let session_key = read_session_key(&target).unwrap_or_default();
     // Bounded connect: against a saturated listen backlog, a bare connect()
     // fails only after the ~21s Windows SYN-retransmit and surfaces as the
