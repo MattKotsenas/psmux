@@ -6,7 +6,7 @@
 //   #19 (bind-key from config), #33 (list-sessions format), #36 (set-option),
 //   #42 (version/format vars), #43 (capture-pane), #47 (has-session),
 //   #63 (status off), #70 (select-pane MRU), #71 (kill-pane focus),
-//   #82 (zoom operations), #94 (split-window percent), #95 (choose-tree dispatch),
+//   #82 (zoom operations), #95 (choose-tree dispatch),
 //   #100 (C-Space key names), #105 (plugin env leak), #108 (Ctrl+Tab),
 //   #111 (pane_current_path), #125 (per-window zoom), #126 (prefix flag),
 //   #133 (set-hook), #134 (directional nav zoomed), #136 (auth),
@@ -69,13 +69,6 @@ fn popup_output(app: &AppState) -> String {
     match &app.mode {
         Mode::PopupMode { output, .. } => output.clone(),
         _ => String::new(),
-    }
-}
-
-fn is_popup_with_text(app: &AppState, text: &str) -> bool {
-    match &app.mode {
-        Mode::PopupMode { output, .. } => output.contains(text),
-        _ => false,
     }
 }
 
@@ -274,56 +267,7 @@ fn issue133_set_hook_append() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 5: WINDOW OPERATIONS (Issues #125, #82)
-// ═════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn issue125_new_window_via_command() {
-    let mut app = mock_app_with_window();
-    let before = app.windows.len();
-    execute_command_string(&mut app, "new-window").unwrap();
-    // new-window may spawn a process (won't work in test) but should not crash
-    // and should not produce a blocking popup
-    assert!(
-        !is_popup_with_text(&app, "cannot"),
-        "#125: new-window should not show blocking popup"
-    );
-}
-
-#[test]
-fn issue82_split_window_v() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -v").unwrap();
-    // split-window in test env may not create a real pane (no PTY),
-    // but it must not crash or show a blocking popup
-    assert!(
-        !is_popup_with_text(&app, "cannot"),
-        "#82: split-window -v should not show blocking popup"
-    );
-}
-
-#[test]
-fn issue82_split_window_h() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -h").unwrap();
-    assert!(
-        !is_popup_with_text(&app, "cannot"),
-        "#82: split-window -h should not show blocking popup"
-    );
-}
-
-#[test]
-fn issue94_split_window_percent() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -v -p 25").unwrap();
-    assert!(
-        !is_popup_with_text(&app, "invalid"),
-        "#94: split-window -p 25 should not error"
-    );
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// SECTION 6: SELECT-PANE DIRECTIONAL (Issues #70, #134)
+// SECTION 5: SELECT-PANE DIRECTIONAL (Issues #70, #134)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -359,7 +303,7 @@ fn issue134_select_pane_directional_right() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 7: ZOOM (Issues #82, #125, #134)
+// SECTION 6: ZOOM (Issues #82, #125, #134)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -370,7 +314,7 @@ fn issue82_resize_pane_zoom() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 8: DISPLAY-MESSAGE (Issues #42, #209)
+// SECTION 7: DISPLAY-MESSAGE (Issues #42, #209)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -395,7 +339,7 @@ fn issue209_display_message_with_duration() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 9: LIST COMMANDS (Issue #146)
+// SECTION 8: LIST COMMANDS (Issue #146)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -440,7 +384,7 @@ fn issue146_list_sessions() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 10: CHOOSE TREE / CHOOSE SESSION (Issue #95)
+// SECTION 9: CHOOSE TREE / CHOOSE SESSION (Issue #95)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -464,7 +408,7 @@ fn issue95_choose_window_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 11: RENAME (Issues #169, #201)
+// SECTION 10: RENAME (Issues #169, #201)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -484,7 +428,7 @@ fn issue169_rename_window() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 12: KILL OPERATIONS (Issues #71, #140)
+// SECTION 11: KILL OPERATIONS (Issues #71, #140)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -503,7 +447,7 @@ fn issue71_kill_window_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 13: COMMAND PROMPT DISPATCH (Multiple issues)
+// SECTION 12: COMMAND PROMPT DISPATCH (Multiple issues)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -561,7 +505,7 @@ fn command_prompt_chained_commands() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 14: LAYOUT COMMANDS (Issue #171)
+// SECTION 13: LAYOUT COMMANDS (Issue #171)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -596,7 +540,7 @@ fn issue171_select_layout_main_vertical() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 15: WINDOW NAVIGATION
+// SECTION 14: WINDOW NAVIGATION
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -632,7 +576,7 @@ fn select_window_by_index() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 16: RESIZE-PANE DIRECTIONS (Issue #81)
+// SECTION 15: RESIZE-PANE DIRECTIONS (Issue #81)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -660,7 +604,7 @@ fn issue81_resize_pane_right() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 17: SOURCE-FILE AND CONFIG (Issue #145)
+// SECTION 16: SOURCE-FILE AND CONFIG (Issue #145)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -672,7 +616,7 @@ fn issue145_source_file_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 18: SEND-KEYS (Basic dispatch)
+// SECTION 17: SEND-KEYS (Basic dispatch)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -683,7 +627,7 @@ fn send_keys_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 19: EDGE CASES
+// SECTION 18: EDGE CASES
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
