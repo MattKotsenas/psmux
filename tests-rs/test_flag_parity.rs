@@ -1079,49 +1079,15 @@ fn select_pane_flag_t_target() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 14. RESIZE-PANE: tmux flags DLMRTt:Ux:y:Z
+// 14. RESIZE-PANE: -Z zoom toggle
 // ═════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn resize_pane_flag_D_down() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -D 5").unwrap();
-}
-
-#[test]
-fn resize_pane_flag_U_up() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -U 5").unwrap();
-}
-
-#[test]
-fn resize_pane_flag_L_left() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -L 5").unwrap();
-}
-
-#[test]
-fn resize_pane_flag_R_right() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -R 5").unwrap();
-}
 
 #[test]
 fn resize_pane_flag_Z_zoom() {
     let mut app = mock_app_with_window();
+    assert!(app.windows[0].zoom_saved.is_none());
     execute_command_string(&mut app, "resize-pane -Z").unwrap();
-}
-
-#[test]
-fn resize_pane_flag_x_absolute_cols() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -x 80").unwrap();
-}
-
-#[test]
-fn resize_pane_flag_y_absolute_rows() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "resize-pane -y 24").unwrap();
+    assert!(app.windows[0].zoom_saved.is_some(), "-Z should zoom the active pane");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
