@@ -3666,9 +3666,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::LastWindow => {
                     if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
                         switch_with_copy_save(&mut app, |app| {
-                            let tmp = app.active_idx;
-                            app.active_idx = app.last_window_idx;
-                            app.last_window_idx = tmp;
+                            std::mem::swap(&mut app.active_idx, &mut app.last_window_idx);
                         });
                     }
                     meta_dirty = true;

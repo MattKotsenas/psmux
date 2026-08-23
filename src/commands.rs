@@ -1056,9 +1056,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "last-window" | "last" => {
             if app.last_window_idx < app.windows.len() {
                 switch_with_copy_save(app, |app| {
-                    let tmp = app.active_idx;
-                    app.active_idx = app.last_window_idx;
-                    app.last_window_idx = tmp;
+                    std::mem::swap(&mut app.active_idx, &mut app.last_window_idx);
                 });
             }
         }
