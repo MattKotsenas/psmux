@@ -243,7 +243,7 @@ pub fn truncate_spans_to_width(spans: &mut Vec<Span<'static>>, max_width: usize)
     let mut remaining = max_width;
     let mut keep = 0;
     for (i, span) in spans.iter().enumerate() {
-        let sw = spans_visual_width(&[span.clone()]);
+        let sw = spans_visual_width(std::slice::from_ref(span));
         if sw <= remaining {
             remaining -= sw;
             keep = i + 1;
@@ -472,7 +472,7 @@ fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usiz
     let mut remaining = max_width;
 
     for span in spans {
-        let sw = spans_visual_width(&[span.clone()]);
+        let sw = spans_visual_width(std::slice::from_ref(span));
         if col + sw <= col_start {
             col += sw;
             continue;
@@ -516,7 +516,7 @@ pub fn layout_format_line(text: &str, width: usize, base_style: Style) -> Layout
     impl Section {
         fn new() -> Self { Section { spans: Vec::new(), width: 0 } }
         fn push(&mut self, span: Span<'static>) {
-            self.width += spans_visual_width(&[span.clone()]);
+            self.width += spans_visual_width(std::slice::from_ref(&span));
             self.spans.push(span);
         }
     }
