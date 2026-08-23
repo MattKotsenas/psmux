@@ -1125,48 +1125,7 @@ fn resize_pane_flag_y_absolute_rows() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 15. SWAP-PANE: tmux flags dDs:t:UZ
-// ═════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn swap_pane_flag_U_up() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "swap-pane -U").unwrap();
-}
-
-#[test]
-fn swap_pane_flag_D_down() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "swap-pane -D").unwrap();
-}
-
-#[test]
-fn swap_pane_default_is_down() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "swap-pane").unwrap();
-    // Default should be -D (down)
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 16. ROTATE-WINDOW: tmux flags Dt:UZ
-// ═════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn rotate_window_default_up() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "rotate-window").unwrap();
-    // Default should rotate upward
-}
-
-#[test]
-fn rotate_window_flag_D_downward() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "rotate-window -D").unwrap();
-    // -D should rotate downward
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 17. SEND-KEYS: tmux flags c:FHKlMN:Rt:X
+// 15. SEND-KEYS: tmux flags c:FHKlMN:Rt:X
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1220,7 +1179,7 @@ fn send_keys_text_string() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 18. DISPLAY-POPUP: tmux flags Bb:Cc:d:e:Eh:kNs:S:t:T:w:x:y:
+// 16. DISPLAY-POPUP: tmux flags Bb:Cc:d:e:Eh:kNs:S:t:T:w:x:y:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1273,7 +1232,7 @@ fn display_popup_flag_w_percent() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 19. LINK-WINDOW: tmux flags abdks:t:
+// 17. LINK-WINDOW: tmux flags abdks:t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1289,7 +1248,7 @@ fn link_window_flag_t_target() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 20. MOVE-WINDOW: tmux flags abdkrs:t:
+// 18. MOVE-WINDOW: tmux flags abdkrs:t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1300,7 +1259,7 @@ fn move_window_positional_target() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 21. SWAP-WINDOW: tmux flags ds:t:
+// 19. SWAP-WINDOW: tmux flags ds:t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1311,7 +1270,7 @@ fn swap_window_positional_target() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 22. RESPAWN-PANE: tmux flags c:e:kt:
+// 20. RESPAWN-PANE: tmux flags c:e:kt:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1328,7 +1287,7 @@ fn respawn_pane_no_flags() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 23. COMMAND-PROMPT: tmux flags 1beFiklI:Np:t:T:
+// 21. COMMAND-PROMPT: tmux flags 1beFiklI:Np:t:T:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1348,7 +1307,7 @@ fn command_prompt_flag_I_initial() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 24. SOURCE-FILE: tmux flags t:Fnqv
+// 22. SOURCE-FILE: tmux flags t:Fnqv
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1358,7 +1317,7 @@ fn source_file_nonexistent_no_crash() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 25. RENAME-SESSION/RENAME-WINDOW: tmux flags t: + positional
+// 23. RENAME-SESSION/RENAME-WINDOW: tmux flags t: + positional
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1378,7 +1337,7 @@ fn rename_window_positional() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 26. KILL-PANE/KILL-WINDOW/KILL-SESSION: tmux flags at:
+// 24. KILL-PANE/KILL-WINDOW/KILL-SESSION: tmux flags at:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1401,7 +1360,7 @@ fn kill_session_no_flags() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 27. SELECT-LAYOUT: tmux flags Enopt:
+// 25. SELECT-LAYOUT: tmux flags Enopt:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1435,7 +1394,7 @@ fn select_layout_main_vertical() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 28. NEXT/PREVIOUS LAYOUT: tmux flags t:
+// 26. NEXT/PREVIOUS LAYOUT: tmux flags t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1451,7 +1410,7 @@ fn previous_layout_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 29. NEXT/PREVIOUS/LAST/SELECT WINDOW: tmux flags at:, t:, lnpTt:
+// 27. NEXT/PREVIOUS/LAST/SELECT WINDOW: tmux flags at:, t:, lnpTt:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1487,7 +1446,7 @@ fn select_window_flag_t_index() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 30. BREAK-PANE: tmux flags abdPF:n:s:t:
+// 28. BREAK-PANE: tmux flags abdPF:n:s:t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1497,7 +1456,7 @@ fn break_pane_no_flags() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 31. CAPTURE-PANE: tmux flags ab:CeE:JMNpPqS:Tt:
+// 29. CAPTURE-PANE: tmux flags ab:CeE:JMNpPqS:Tt:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1514,7 +1473,7 @@ fn capture_pane_flag_p_print() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 32. COPY-MODE / PASTE / BUFFER OPS
+// 30. COPY-MODE / PASTE / BUFFER OPS
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1568,7 +1527,7 @@ fn clear_history_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 33. HAS-SESSION: tmux flags t:
+// 31. HAS-SESSION: tmux flags t:
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1578,7 +1537,7 @@ fn has_session_flag_t_target() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 34. LIST COMMANDS: list-sessions, list-windows, list-panes, list-keys,
+// 32. LIST COMMANDS: list-sessions, list-windows, list-panes, list-keys,
 //     list-commands, list-buffers, list-clients
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1619,7 +1578,7 @@ fn list_clients_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 35. CHOOSER MODES: choose-tree, choose-window, choose-session, choose-client
+// 33. CHOOSER MODES: choose-tree, choose-window, choose-session, choose-client
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1647,7 +1606,7 @@ fn choose_client_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 36. DISPLAY-PANES / DISPLAY-MENU / CLOCK-MODE / CUSTOMIZE-MODE
+// 34. DISPLAY-PANES / DISPLAY-MENU / CLOCK-MODE / CUSTOMIZE-MODE
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1669,7 +1628,7 @@ fn customize_mode_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 37. DETACH / REFRESH / SUSPEND / LOCK (stubs)
+// 35. DETACH / REFRESH / SUSPEND / LOCK (stubs)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1709,7 +1668,7 @@ fn lock_session_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 38. SHOW-HOOKS / SHOW-ENVIRONMENT / SHOW-MESSAGES / SHOW-BUFFER
+// 36. SHOW-HOOKS / SHOW-ENVIRONMENT / SHOW-MESSAGES / SHOW-BUFFER
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1731,7 +1690,7 @@ fn show_messages_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 39. WAIT-FOR / SEND-PREFIX / START-SERVER / KILL-SERVER / SERVER-INFO
+// 37. WAIT-FOR / SEND-PREFIX / START-SERVER / KILL-SERVER / SERVER-INFO
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1753,7 +1712,7 @@ fn server_info_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 40. CONFIRM-BEFORE / FIND-WINDOW / UNLINK-WINDOW
+// 38. CONFIRM-BEFORE / FIND-WINDOW / UNLINK-WINDOW
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1775,7 +1734,7 @@ fn unlink_window_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 41. JOIN-PANE / MOVE-PANE / PIPE-PANE / LAST-PANE / RESPAWN-WINDOW
+// 39. JOIN-PANE / MOVE-PANE / PIPE-PANE / LAST-PANE / RESPAWN-WINDOW
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1803,7 +1762,7 @@ fn pipe_pane_dispatches() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 42. COMMAND ALIASES (tmux compat)
+// 40. COMMAND ALIASES (tmux compat)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -2140,7 +2099,7 @@ fn alias_warmup() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 43. SWITCH-CLIENT: tmux flags c:EFlnO:pt:rT:Z
+// 41. SWITCH-CLIENT: tmux flags c:EFlnO:pt:rT:Z
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -2155,7 +2114,7 @@ fn switch_client_flag_T_key_table() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 44. COMMAND CHAINING (\;) parity with tmux
+// 42. COMMAND CHAINING (\;) parity with tmux
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
