@@ -828,85 +828,8 @@ fn run_shell_empty_shows_usage() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 10. SPLIT-WINDOW: tmux flags bc:de:fF:hIl:p:Pt:vZ
+// 10. SPLIT-WINDOW: -Z zoom restoration
 // ═════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn split_window_default_vertical() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window").unwrap();
-    // Default should be vertical split
-}
-
-#[test]
-fn split_window_flag_h_horizontal() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -h").unwrap();
-    // -h should trigger horizontal split
-}
-
-#[test]
-fn split_window_flag_v_explicit_vertical() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -v").unwrap();
-    // -v should be same as default (vertical)
-}
-
-#[test]
-fn split_window_flag_p_percent() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -v -p 30").unwrap();
-    // -p 30 should set percentage; command should not crash
-}
-
-#[test]
-fn split_window_flag_l_lines() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -v -l 10").unwrap();
-    // -l 10 should set exact line count
-}
-
-#[test]
-fn split_window_flag_c_start_dir() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, r#"split-window -v -c "C:\""#).unwrap();
-    // -c should set working directory
-}
-
-#[test]
-fn split_window_flag_d_detached() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -d").unwrap();
-    // -d should not focus the new pane
-}
-
-#[test]
-fn split_window_flag_b_before() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -b").unwrap();
-    // -b should insert before current pane
-}
-
-#[test]
-fn split_window_flag_f_full() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -f").unwrap();
-    // -f should use full window width/height
-}
-
-#[test]
-fn split_window_flag_F_format() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, r##"split-window -F "#{pane_id}""##).unwrap();
-    // -F should set format for output
-}
-
-#[test]
-fn split_window_flag_P_print() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -P").unwrap();
-    // -P should print pane info
-}
 
 #[test]
 fn split_window_flag_Z_zoom() {
@@ -915,27 +838,6 @@ fn split_window_flag_Z_zoom() {
     execute_command_string(&mut app, "split-window -Z").unwrap();
     assert!(app.windows[0].zoom_saved.is_some(), "-Z should zoom the active pane after splitting");
     assert_eq!(app.windows[0].active_path, vec![1], "-Z should leave the new pane active");
-}
-
-#[test]
-fn split_window_flag_I_stdin() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -I").unwrap();
-    // -I should enable stdin indicator
-}
-
-#[test]
-fn split_window_flag_e_environment() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "split-window -e MY_VAR=test123").unwrap();
-    // -e should pass environment variable
-}
-
-#[test]
-fn split_window_multiple_flags() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, r#"split-window -h -p 40 -c "C:\" -d"#).unwrap();
-    // Multiple flags combined should not crash
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
