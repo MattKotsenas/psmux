@@ -69,6 +69,33 @@ use crate::cli::{extract_flag_value, parse_set_option_args, parse_target};
 use crate::util::base64_decode;
 use crate::control;
 
+/// Applies a `-t` specification to a connection's current target fields.
+fn apply_target_spec(
+    target: &str,
+    raw_target: &mut Option<String>,
+    target_win: &mut Option<usize>,
+    target_win_is_id: &mut bool,
+    target_win_name: &mut Option<String>,
+    target_pane: &mut Option<usize>,
+    pane_is_id: &mut bool,
+) {
+    *raw_target = Some(crate::cli::strip_exact_match_prefix(target).to_string());
+    let parsed_target = parse_target(target);
+    if parsed_target.window.is_some() {
+        *target_win = parsed_target.window;
+        *target_win_is_id = parsed_target.window_is_id;
+        *target_win_name = None;
+    } else if parsed_target.window_name.is_some() {
+        *target_win_name = parsed_target.window_name;
+        *target_win = None;
+        *target_win_is_id = false;
+    }
+    if parsed_target.pane.is_some() {
+        *target_pane = parsed_target.pane;
+        *pane_is_id = parsed_target.pane_is_id;
+    }
+}
+
 /// Append-only AUTH diagnostics, gated by PSMUX_AUTH_DEBUG=1. Written to
 /// %TEMP%\psmux_auth_debug.log so concurrent processes never truncate each
 /// other (issue #496 forensics).
@@ -238,11 +265,22 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].to_string())
 }
 
+struct ParsedIngress {
+    kill_window: Option<crate::kill_window::KillWindowCommand>,
+    new_window: Option<crate::new_window::NewWindowCommand>,
+}
+
 fn parse_and_validate_ingress(
     command: &str,
     args: &[&str],
-) -> Result<Option<crate::kill_window::KillWindowCommand>, String> {
-    let parsed = crate::kill_window::KillWindowCommand::parse(
+) -> Result<ParsedIngress, String> {
+    let kill_window = crate::kill_window::KillWindowCommand::parse(
+        command,
+        args.iter().copied(),
+    )
+    .transpose()
+    .map_err(|error| error.to_string())?;
+    let new_window = crate::new_window::NewWindowCommand::parse(
         command,
         args.iter().copied(),
     )
@@ -251,7 +289,10 @@ fn parse_and_validate_ingress(
 
     crate::commands::validate_deferred_command(command, args)?;
 
-    Ok(parsed)
+    Ok(ParsedIngress {
+        kill_window,
+        new_window,
+    })
 }
 
 fn dispatch_kill_window(
@@ -812,7 +853,7 @@ if control_echo || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
-        let kill_window = match parse_and_validate_ingress(cmd_name, &cmd_args) {
+        let ingress = match parse_and_validate_ingress(cmd_name, &cmd_args) {
             Ok(command) => command,
             Err(error) => {
                 let mut ws = write_lock.lock().unwrap();
@@ -842,28 +883,33 @@ if control_echo || control_noecho {
             matches!(cmd_name, "set-window-option" | "setw");
         let ctrl_set_args = ctrl_set_option
             .then(|| parse_set_option_args(&cmd_args));
-        if let Some(command) = kill_window.as_ref() {
+        if let Some(command) = ingress.kill_window.as_ref() {
             ctrl_raw_target = command
                 .effective_target(None)
                 .map(|target| crate::cli::strip_exact_match_prefix(&target).to_string());
+        } else if let Some(command) = ingress.new_window.as_ref() {
+            if let Some(target) = command.target() {
+                apply_target_spec(
+                    target,
+                    &mut ctrl_raw_target,
+                    &mut ctrl_target_win,
+                    &mut ctrl_target_win_is_id,
+                    &mut ctrl_target_win_name,
+                    &mut ctrl_target_pane,
+                    &mut ctrl_pane_is_id,
+                );
+            }
         } else if let Some(parsed_set) = ctrl_set_args.as_ref() {
             if let Some(value) = parsed_set.target {
-                ctrl_raw_target =
-                    Some(crate::cli::strip_exact_match_prefix(value).to_string());
-                let parsed_target = parse_target(value);
-                if parsed_target.window.is_some() {
-                    ctrl_target_win = parsed_target.window;
-                    ctrl_target_win_is_id = parsed_target.window_is_id;
-                    ctrl_target_win_name = None;
-                } else if parsed_target.window_name.is_some() {
-                    ctrl_target_win_name = parsed_target.window_name;
-                    ctrl_target_win = None;
-                    ctrl_target_win_is_id = false;
-                }
-                if parsed_target.pane.is_some() {
-                    ctrl_target_pane = parsed_target.pane;
-                    ctrl_pane_is_id = parsed_target.pane_is_id;
-                }
+                apply_target_spec(
+                    value,
+                    &mut ctrl_raw_target,
+                    &mut ctrl_target_win,
+                    &mut ctrl_target_win_is_id,
+                    &mut ctrl_target_win_name,
+                    &mut ctrl_target_pane,
+                    &mut ctrl_pane_is_id,
+                );
             }
         } else {
             let target_scan_end = crate::cli::outer_target_scan_end(cmd_name, &cmd_args);
@@ -872,14 +918,15 @@ if control_echo || control_noecho {
                 if cmd_args[i] == "-t" {
                     if let Some(v) = cmd_args.get(i+1) {
                         // Issue #558: drop the '=' exact-match marker (see TARGET capture).
-                        ctrl_raw_target = Some(crate::cli::strip_exact_match_prefix(v).to_string());
-                        let pt = parse_target(v);
-                        if pt.window.is_some() { ctrl_target_win = pt.window; ctrl_target_win_is_id = pt.window_is_id; ctrl_target_win_name = None; }
-                        else if pt.window_name.is_some() { ctrl_target_win_name = pt.window_name; ctrl_target_win = None; ctrl_target_win_is_id = false; }
-                        if pt.pane.is_some() {
-                            ctrl_target_pane = pt.pane;
-                            ctrl_pane_is_id = pt.pane_is_id;
-                        }
+                        apply_target_spec(
+                            v,
+                            &mut ctrl_raw_target,
+                            &mut ctrl_target_win,
+                            &mut ctrl_target_win_is_id,
+                            &mut ctrl_target_win_name,
+                            &mut ctrl_target_pane,
+                            &mut ctrl_pane_is_id,
+                        );
                     }
                     i += 2; continue;
                 }
@@ -887,7 +934,9 @@ if control_echo || control_noecho {
             }
         }
 
-        let filtered_args = if ctrl_set_option {
+        // Control dispatch reparses new-window, so keep the validated argument
+        // sequence intact.
+        let filtered_args = if ctrl_set_option || ingress.new_window.is_some() {
             cmd_args.clone()
         } else {
             without_outer_target(cmd_name, &cmd_args)
@@ -1127,7 +1176,7 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
-    let kill_window = match parse_and_validate_ingress(cmd, &args) {
+    let ingress = match parse_and_validate_ingress(cmd, &args) {
         Ok(command) => command,
         Err(error) => {
             let _ = writeln!(write_stream, "psmux: {}", error);
@@ -1153,27 +1202,33 @@ let set_option_command = matches!(
     cmd,
     "set-option" | "set" | "set-window-option" | "setw"
 );
-if let Some(command) = kill_window.as_ref() {
+if let Some(command) = ingress.kill_window.as_ref() {
     raw_target = command
         .effective_target(global_raw_target.as_deref())
         .map(|target| crate::cli::strip_exact_match_prefix(&target).to_string());
+} else if let Some(command) = ingress.new_window.as_ref() {
+    if let Some(target) = command.target() {
+        apply_target_spec(
+            target,
+            &mut raw_target,
+            &mut target_win,
+            &mut target_win_is_id,
+            &mut target_win_name,
+            &mut target_pane,
+            &mut pane_is_id,
+        );
+    }
 } else if set_option_command {
     if let Some(value) = parse_set_option_args(&args).target {
-        raw_target = Some(crate::cli::strip_exact_match_prefix(value).to_string());
-        let parsed_target = parse_target(value);
-        if parsed_target.window.is_some() {
-            target_win = parsed_target.window;
-            target_win_is_id = parsed_target.window_is_id;
-            target_win_name = None;
-        } else if parsed_target.window_name.is_some() {
-            target_win_name = parsed_target.window_name;
-            target_win = None;
-            target_win_is_id = false;
-        }
-        if parsed_target.pane.is_some() {
-            target_pane = parsed_target.pane;
-            pane_is_id = parsed_target.pane_is_id;
-        }
+        apply_target_spec(
+            value,
+            &mut raw_target,
+            &mut target_win,
+            &mut target_win_is_id,
+            &mut target_win_name,
+            &mut target_pane,
+            &mut pane_is_id,
+        );
     }
 } else {
     let target_scan_end = crate::cli::outer_target_scan_end(cmd, &args);
@@ -1182,15 +1237,15 @@ if let Some(command) = kill_window.as_ref() {
         if args[i] == "-t" {
             if let Some(v) = args.get(i+1) {
             // Issue #558: drop the '=' exact-match marker (see TARGET capture).
-                raw_target = Some(crate::cli::strip_exact_match_prefix(v).to_string());
-                // Parse the -t value using parse_target for consistent handling
-                let pt = parse_target(v);
-                if pt.window.is_some() { target_win = pt.window; target_win_is_id = pt.window_is_id; target_win_name = None; }
-                else if pt.window_name.is_some() { target_win_name = pt.window_name; target_win = None; target_win_is_id = false; }
-                if pt.pane.is_some() {
-                    target_pane = pt.pane;
-                    pane_is_id = pt.pane_is_id;
-                }
+                apply_target_spec(
+                    v,
+                    &mut raw_target,
+                    &mut target_win,
+                    &mut target_win_is_id,
+                    &mut target_win_name,
+                    &mut target_pane,
+                    &mut pane_is_id,
+                );
             }
             i += 2; continue;
         }
@@ -1300,38 +1355,19 @@ if is_focus_cmd {
 }
 match cmd {
     "new-window" | "neww" => {
-        let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
-        let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-        let detached = args.iter().any(|a| *a == "-d");
-        let print_info = args.iter().any(|a| *a == "-P");
-        let format_str: Option<String> = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
-        let title: Option<String> = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
-        let empty = args.iter().any(|a| *a == "-E");
-        // -e KEY=VALUE (repeatable, tmux parity, #489): collect environment
-        // for the new pane. The values must also be excluded from the
-        // shell-command extraction below or they get spawned as the command.
-        let env_sets: Vec<(String, String)> = args.windows(2)
-            .filter(|w| w[0] == "-e")
-            .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
-            .collect();
-        // tmux parity (#582): `-- prog args...` is an explicit argv. A
-        // multi-token argv keeps the `--` marker plus token boundaries so
-        // build_command execs it directly (tmux execvp); a single token
-        // keeps string semantics. Without `--`, the historical single-token
-        // extraction applies (the CLI sends the string form as one quoted
-        // arg).
-        let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
-            let tail = &args[pos + 1..];
-            if tail.len() > 1 {
-                Some(format!("-- {}", requote_command_tail(tail)))
-            } else {
-                tail.first().map(|s| s.trim_matches('"').to_string()).filter(|s| !s.is_empty())
-            }
-        } else {
-            args.iter()
-                .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)) && !args.iter().any(|f| f.starts_with("-F") && f.len() > 2 && &f[2..] == **a))
-                .map(|s| s.trim_matches('"').to_string())
-        };
+        let command = ingress
+            .new_window
+            .as_ref()
+            .expect("new-window ingress was parsed");
+        let cmd_str = command.server_command();
+        let name = command.name().map(str::to_string);
+        let start_dir = command.start_dir().map(str::to_string);
+        let detached = command.detached();
+        let print_info = command.print();
+        let format_str = command.print_format().map(str::to_string);
+        let title = command.title().map(str::to_string);
+        let empty = command.empty();
+        let env_sets = command.environment();
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
@@ -1370,7 +1406,8 @@ match cmd {
             .filter(|w| w[0] == "-e")
             .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
-        // tmux parity (#582): same `--` argv handling as new-window above.
+        // tmux parity (#582): same `--` argv handling as
+        // NewWindowCommand::server_command.
         let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
             let tail = &args[pos + 1..];
             if tail.len() > 1 {
@@ -4161,39 +4198,21 @@ fn dispatch_control_command(
             }
         }
         "new-window" | "neww" => {
-            let name = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
-            let start_dir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-            let detached = crate::cli::has_short_flag(&args, 'd');
-            let print_info = crate::cli::has_short_flag(&args, 'P');
-            let format_str = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
-            let title = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
-            let empty = args.iter().any(|a| *a == "-E");
-            // Skip arg if it's a flag, the value of a flag, or a flag-cluster
-            // value (e.g. the format string after `-PF`).
-            let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (i, a) in args.iter().enumerate() {
-                if a.starts_with('-') && !a.starts_with("--") {
-                    skip.insert(i);
-                    // Two-token forms: next arg is the value
-                    if matches!(*a, "-n" | "-c" | "-F" | "-t" | "-x" | "-y" | "-e" | "-T") {
-                        skip.insert(i + 1);
-                    } else if a.len() > 2
-                        && a.chars().skip(1).all(|c| c.is_ascii_alphabetic())
-                        && matches!(a.chars().last(), Some('n') | Some('c') | Some('F') | Some('t') | Some('x') | Some('y') | Some('e') | Some('T'))
-                    {
-                        // Cluster ending in value-taking flag: -PF <value>
-                        skip.insert(i + 1);
-                    }
-                }
-            }
-            let cmd_str: Option<String> = args.iter().enumerate()
-                .find(|(i, _)| !skip.contains(i))
-                .map(|(_, s)| s.trim_matches('"').to_string());
-            // -e KEY=VALUE environment for the new pane (tmux parity, #489).
-            let env_sets: Vec<(String, String)> = args.windows(2)
-                .filter(|w| w[0] == "-e")
-                .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
-                .collect();
+            let command = crate::new_window::NewWindowCommand::parse(
+                cmd,
+                args.iter().copied(),
+            )
+            .expect("new-window command name")
+            .expect("new-window ingress was validated");
+            let cmd_str = command.server_command();
+            let name = command.name().map(str::to_string);
+            let start_dir = command.start_dir().map(str::to_string);
+            let detached = command.detached();
+            let print_info = command.print();
+            let format_str = command.print_format().map(str::to_string);
+            let title = command.title().map(str::to_string);
+            let empty = command.empty();
+            let env_sets = command.environment();
             if print_info {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
@@ -5144,8 +5163,8 @@ mod tests_send_keys_literal_byte;
 mod tests_refresh_client_flags;
 
 #[cfg(test)]
-#[path = "../../tests-rs/test_kill_window_parser_ingress.rs"]
-mod tests_kill_window_parser_ingress;
+#[path = "../../tests-rs/test_window_parser_ingress.rs"]
+mod tests_window_parser_ingress;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_set_option_control.rs"]

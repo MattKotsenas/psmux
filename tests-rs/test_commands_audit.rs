@@ -985,3 +985,23 @@ fn every_command_does_not_panic_embedded_mode() {
         assert!(result.is_ok(), "command '{}' panicked or returned error: {:?}", cmd, result);
     }
 }
+
+#[test]
+fn malformed_new_window_is_rejected_before_local_execution() {
+    for option in ["-c", "-e", "-F", "-n", "-T", "-t"] {
+        let mut app = mock_app_with_windows(&["one", "two"]);
+        let before = app.windows.len();
+
+        let error = execute_command_string(&mut app, &format!("new-window {option}"))
+            .expect_err("missing option value must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{option}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{option} expects an argument")),
+            "{option}: {error}"
+        );
+        assert_eq!(app.windows.len(), before, "{option}");
+    }
+}

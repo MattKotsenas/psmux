@@ -36,6 +36,7 @@ mod debug_log;
 mod control;
 mod resize_window;
 mod kill_window;
+mod new_window;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
@@ -751,11 +752,20 @@ fn run_main() -> io::Result<()> {
         ),
     );
     let command_index = process_command_index(&args);
-    // Reject malformed kill-window arguments before cleanup, probing, or any
-    // server connection.
+    // Reject malformed kill-window and new-window commands before cleanup,
+    // probing, or any server connection.
     let kill_window_command = command_index
         .and_then(|index| {
             crate::kill_window::KillWindowCommand::parse(
+                &args[index],
+                args[index + 1..].iter(),
+            )
+        })
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let new_window_command = command_index
+        .and_then(|index| {
+            crate::new_window::NewWindowCommand::parse(
                 &args[index],
                 args[index + 1..].iter(),
             )
@@ -862,8 +872,13 @@ fn run_main() -> io::Result<()> {
     let kill_window_target = kill_window_command
         .as_ref()
         .and_then(|command| command.effective_target(precommand_target.as_deref()));
+    let new_window_target = new_window_command
+        .as_ref()
+        .and_then(|command| command.effective_target(precommand_target.as_deref()));
     let explicit_target: Option<&str> = if kill_window_command.is_some() {
         kill_window_target.as_deref()
+    } else if new_window_command.is_some() {
+        new_window_target
     } else if is_set_option_command {
         set_option_target.as_deref().or(precommand_target.as_deref())
     } else {
@@ -2068,42 +2083,12 @@ fn run_main() -> io::Result<()> {
                 }
             }
             "new-window" | "neww" => {
-                // Strict getopt-style parsing for new-window flags.
-                // tmux template: "ac:dDe:F:kn:Pt:S:"
-                let mut name_arg: Option<String> = None;
-                let mut detached = false;
-                let mut print_info = false;
-                let mut format_str: Option<String> = None;
-                let mut start_dir: Option<String> = None;
-                let mut title_arg: Option<String> = None;
-                let mut empty_flag = false;
-                let mut env_args: Vec<String> = Vec::new();
-                let mut nw_positional: Vec<String> = Vec::new();
-                let mut nw_saw_ddash = false;
-                {
-                    let mut i = 1;
-                    while i < cmd_args.len() {
-                        let a = cmd_args[i].as_str();
-                        if a == "--" { nw_saw_ddash = true; nw_positional.extend(cmd_args[i+1..].iter().map(|s| s.to_string())); break; }
-                        match a {
-                            "-n" => { i += 1; if i < cmd_args.len() { name_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            s if s.starts_with("-F") && s.len() > 2 => { format_str = Some(s[2..].trim_matches('"').to_string()); }
-                            "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-T" => { i += 1; if i < cmd_args.len() { title_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            // -e KEY=VALUE environment for the new pane (#489)
-                            "-e" => { i += 1; if i < cmd_args.len() { env_args.push(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-t" | "-S" => { i += 1; /* skip value */ }
-                            "-d" => { detached = true; }
-                            "-P" => { print_info = true; }
-                            "-E" => { empty_flag = true; }
-                            "-a" | "-D" | "-k" => { /* ignored for compatibility */ }
-                            _ if a.starts_with('-') => { /* unknown flag, skip */ }
-                            _ => { nw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
-                        }
-                        i += 1;
-                    }
-                }
+                let command = new_window_command.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "new-window command was not parsed",
+                    )
+                })?;
                 // cwd parity: a command-line new-window with no -c must open in
                 // the CALLER's cwd, not the server's (session) cwd. tmux picks a
                 // new window's cwd from three cases — an explicit -c, an attached
@@ -2114,46 +2099,11 @@ fn run_main() -> io::Result<()> {
                 // the warm-pane fast path for command-line new-window (the warm
                 // pane lives in the server's cwd) — interactive prefix-c, which
                 // never routes through here, keeps it.
-                if start_dir.is_none() {
-                    if let Ok(cwd) = std::env::current_dir() {
-                        start_dir = Some(cwd.to_string_lossy().into_owned());
-                    }
-                }
-                let cmd_arg = nw_positional.join(" ");
-                let cmd_arg = cmd_arg.as_str();
-                let mut cmd_line = "new-window".to_string();
-                if detached { cmd_line.push_str(" -d"); }
-                if print_info { cmd_line.push_str(" -P"); }
-                if empty_flag { cmd_line.push_str(" -E"); }
-                if let Some(ref fmt) = format_str {
-                    cmd_line.push_str(&format!(" -F {}", crate::util::quote_arg(&fmt)));
-                }
-                if let Some(name) = &name_arg {
-                    cmd_line.push_str(&format!(" -n {}", crate::util::quote_arg(&name)));
-                }
-                if let Some(t) = &title_arg {
-                    cmd_line.push_str(&format!(" -T {}", crate::util::quote_arg(&t)));
-                }
-                if let Some(dir) = &start_dir {
-                    cmd_line.push_str(&format!(" -c {}", crate::util::quote_arg(&dir)));
-                }
-                for ev in &env_args {
-                    cmd_line.push_str(&format!(" -e {}", crate::util::quote_arg(&ev)));
-                }
-                // tmux parity (#582): a multi-token `-- prog args...` argv is
-                // exec'd directly by the server, so forward the tokens
-                // individually behind the `--` marker instead of collapsing
-                // them into one shell string.
-                if nw_saw_ddash && nw_positional.len() > 1 {
-                    cmd_line.push_str(" --");
-                    for tok in &nw_positional {
-                        cmd_line.push_str(&format!(" {}", crate::util::quote_arg(tok)));
-                    }
-                } else if !cmd_arg.is_empty() {
-                    cmd_line.push_str(&format!(" {}", crate::util::quote_arg(&cmd_arg)));
-                }
-                cmd_line.push('\n');
-                if print_info {
+                let caller_cwd = std::env::current_dir()
+                    .ok()
+                    .map(|cwd| cwd.to_string_lossy().into_owned());
+                let cmd_line = command.to_wire_command(caller_cwd.as_deref());
+                if command.print() {
                     let resp = send_control_with_response(cmd_line)?;
                     print!("{}", resp);
                 } else {

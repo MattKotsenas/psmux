@@ -657,8 +657,9 @@ pub fn requote_command_tail<S: AsRef<str>>(args: &[S]) -> String {
         .join(" ")
 }
 
-/// Validates nested `kill-window` syntax in bindings, hooks, and confirmation
-/// commands, returning `Err` when nesting exceeds `MAX_DEFERRED_COMMAND_DEPTH`.
+/// Validates nested `kill-window` and `new-window` syntax in bindings, hooks,
+/// and confirmation commands, returning `Err` when nesting exceeds
+/// `MAX_DEFERRED_COMMAND_DEPTH`.
 pub fn validate_deferred_command<S: AsRef<str>>(
     command: &str,
     args: &[S],
@@ -692,7 +693,8 @@ fn validate_deferred_command_at_depth<S: AsRef<str>>(
     validate_command_sequence_at_depth(&nested, depth + 1)
 }
 
-/// Validates `kill-window` syntax and nested deferred commands in a chain.
+/// Validates `kill-window`, `new-window`, and nested deferred commands in a
+/// chain.
 pub fn validate_command_sequence(command: &str) -> Result<(), String> {
     validate_command_sequence_at_depth(command, 0)
 }
@@ -705,6 +707,12 @@ fn validate_command_sequence_at_depth(command: &str, depth: usize) -> Result<(),
         };
         let args = &tokens[1..];
         if let Some(parsed) = crate::kill_window::KillWindowCommand::parse(
+            name,
+            args.iter(),
+        ) {
+            parsed.map_err(|error| error.to_string())?;
+        }
+        if let Some(parsed) = crate::new_window::NewWindowCommand::parse(
             name,
             args.iter(),
         ) {
@@ -1012,6 +1020,19 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
         // In server mode the client sends these via TCP directly, so
         // execute_command_prompt() is only reached in embedded mode.
         "new-window" | "neww" => {
+            // Embedded mode creates a bare window; parse only to reject
+            // malformed input.
+            crate::new_window::NewWindowCommand::parse(
+                parts[0],
+                parts.iter().skip(1).copied(),
+            )
+            .expect("new-window command name")
+            .map_err(|error| {
+                let message = error.to_string();
+                app.status_message =
+                    Some((message.clone(), std::time::Instant::now(), None));
+                io::Error::new(io::ErrorKind::InvalidInput, message)
+            })?;
             let pty_system = portable_pty::native_pty_system();
             create_window(&*pty_system, app, None, None, false)?;
         }
@@ -1119,6 +1140,19 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             })?;
             execute_kill_window(app, &command);
             return Ok(());
+        }
+        if let Some(command) = crate::new_window::NewWindowCommand::parse(
+            name,
+            parsed.iter().skip(1),
+        ) {
+            // Parsed only to reject malformed input; the command-string path
+            // below owns execution.
+            command.map_err(|error| {
+                let message = error.to_string();
+                app.status_message =
+                    Some((message.clone(), std::time::Instant::now(), None));
+                io::Error::new(io::ErrorKind::InvalidInput, message)
+            })?;
         }
     }
 

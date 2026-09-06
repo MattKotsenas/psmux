@@ -224,3 +224,28 @@ fn test_command_prompt_unknown_cmd_stays_passthrough() {
     execute_command_prompt(&mut app).unwrap();
     assert!(matches!(app.mode, Mode::Passthrough), "unknown command should leave mode as Passthrough");
 }
+
+#[test]
+fn command_prompt_rejects_missing_new_window_values() {
+    for option in ["-c", "-e", "-F", "-n", "-T", "-t"] {
+        let mut app = mock_app_with_window();
+        let input = format!("neww {option}");
+        app.mode = Mode::CommandPrompt {
+            cursor: input.len(),
+            input,
+        };
+        let before = app.windows.len();
+
+        let error = execute_command_prompt(&mut app)
+            .expect_err("missing option value must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{option}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{option} expects an argument")),
+            "{option}: {error}"
+        );
+        assert_eq!(app.windows.len(), before, "{option}");
+    }
+}

@@ -77,6 +77,54 @@ fn kill_window_missing_target_warns_before_storing_deferred_commands() {
     assert!(!a.hooks.contains_key("pane-died"));
 }
 
+#[test]
+fn new_window_missing_values_warn_before_storing_deferred_commands() {
+    for option in ["-c", "-e", "-F", "-n", "-T", "-t"] {
+        let mut a = app();
+        crate::config::parse_config_content(
+            &mut a,
+            &format!(
+                "new-window {option}\nbind-key x neww {option}\nset-hook pane-died new-window {option}\n"
+            ),
+        );
+
+        assert_eq!(
+            a.config_warnings
+                .iter()
+                .filter(|warning| warning.contains(&format!(
+                    "{option} expects an argument"
+                )))
+                .count(),
+            3,
+            "{option}: {:?}",
+            a.config_warnings
+        );
+        assert!(a.key_tables.get("prefix").is_none_or(|bindings| {
+            bindings
+                .iter()
+                .all(|binding| binding.key.0 != crossterm::event::KeyCode::Char('x'))
+        }));
+        assert!(!a.hooks.contains_key("pane-died"));
+    }
+}
+
+#[test]
+fn new_window_compatibility_flag_is_accepted_in_deferred_commands() {
+    let mut a = app();
+    crate::config::parse_config_content(
+        &mut a,
+        "new-window -S -n mail\nbind-key x neww -S -n mail\nset-hook pane-died new-window -S -n mail\n",
+    );
+
+    assert!(a.config_warnings.is_empty(), "{:?}", a.config_warnings);
+    assert!(a.key_tables.get("prefix").is_some_and(|bindings| {
+        bindings
+            .iter()
+            .any(|binding| binding.key.0 == crossterm::event::KeyCode::Char('x'))
+    }));
+    assert!(a.hooks.contains_key("pane-died"));
+}
+
 // ---- Unknown options ----
 
 #[test]

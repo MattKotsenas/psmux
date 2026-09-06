@@ -969,7 +969,7 @@ fn invalid_set_option_flag(flag_chars: &str) -> Option<char> {
 ///   * Concatenated form: `-Fvalue`
 ///   * Combined short-flag cluster where the value-taking flag is the last
 ///     char in the cluster: `-PF value` (i.e. `-P` boolean + `-F value`).
-///     iTerm2 sends commands like `new-window -PF '#{window_id}'`.
+///     iTerm2 sends commands like `split-window -PF '#{pane_id}'`.
 pub fn extract_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<String> {
     // Two-token form: -F value
     if let Some(w) = args.windows(2).find(|w| w[0] == flag) {
