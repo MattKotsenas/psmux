@@ -1263,8 +1263,11 @@ fn parse_action_split_window_variants() {
     assert!(matches!(parse_command_to_action("splitw"), Some(Action::SplitVertical)));
     assert!(matches!(parse_command_to_action("split-window -h"), Some(Action::SplitHorizontal)));
     assert!(matches!(parse_command_to_action("splitw -h"), Some(Action::SplitHorizontal)));
+    assert!(matches!(parse_command_to_action("splitp -vh"), Some(Action::SplitHorizontal)));
+    assert!(matches!(parse_command_to_action("splitp -hv"), Some(Action::SplitHorizontal)));
     // With extra flags it becomes Command to preserve the full args
     assert!(matches!(parse_command_to_action("split-window -c /tmp"), Some(Action::Command(_))));
+    assert!(matches!(parse_command_to_action("split-window -dZ"), Some(Action::Command(_))));
 }
 
 #[test]

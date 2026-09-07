@@ -52,6 +52,8 @@ fn assert_no_control_command_dispatch(requests: &mpsc::Receiver<CtrlReq>) {
             | CtrlReq::KillWindowTarget { .. }
             | CtrlReq::NewWindow(..)
             | CtrlReq::NewWindowPrint(..)
+            | CtrlReq::SplitWindow(..)
+            | CtrlReq::SplitWindowPrint(..)
             | CtrlReq::BindKey(..)
             | CtrlReq::ConfirmBefore(..)
             | CtrlReq::SetHook(..)
@@ -101,6 +103,26 @@ fn simple_connection_rejects_missing_new_window_values_without_dispatch() {
         authenticate(&mut stream, &mut reader);
 
         writeln!(stream, "new-window {option}").unwrap();
+        stream.flush().unwrap();
+
+        assert_eq!(
+            read_line(&mut reader),
+            format!("psmux: {option} expects an argument")
+        );
+        stream.shutdown(Shutdown::Both).unwrap();
+        handle.join().unwrap();
+        assert_no_requests(&requests);
+    }
+}
+
+#[test]
+fn simple_connection_rejects_missing_split_window_values_without_dispatch() {
+    for option in ["-c", "-e", "-F", "-l", "-p", "-T", "-t"] {
+        let (mut stream, requests, handle) = start_connection(HashMap::new());
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        authenticate(&mut stream, &mut reader);
+
+        writeln!(stream, "split-window {option}").unwrap();
         stream.flush().unwrap();
 
         assert_eq!(
@@ -553,6 +575,33 @@ fn control_connection_rejects_missing_new_window_values_and_stays_usable() {
 }
 
 #[test]
+fn control_connection_rejects_missing_split_window_values_and_stays_usable() {
+    let (mut stream, requests, handle) = start_connection(HashMap::new());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream.write_all(b"CONTROL_NOECHO\n").unwrap();
+    stream.flush().unwrap();
+    assert!(read_line(&mut reader).starts_with("\u{1b}P1000p%begin "));
+    assert!(read_line(&mut reader).starts_with("%end "));
+
+    for option in ["-c", "-e", "-F", "-l", "-p", "-T", "-t"] {
+        writeln!(stream, "splitw {option}").unwrap();
+        stream.flush().unwrap();
+        assert!(read_line(&mut reader).starts_with("%begin "));
+        assert_eq!(
+            read_line(&mut reader),
+            format!("psmux: {option} expects an argument")
+        );
+        assert!(read_line(&mut reader).starts_with("%error "));
+    }
+
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+    assert_no_control_command_dispatch(&requests);
+}
+
+#[test]
 fn control_connection_preserves_new_window_options_and_argv() {
     let (mut stream, requests, handle) = start_connection(HashMap::new());
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -661,6 +710,212 @@ fn control_connection_uses_typed_new_window_targets() {
     assert_eq!(command.as_deref(), Some("tool"));
     assert!(read_line(&mut reader).starts_with("%begin "));
     assert!(read_line(&mut reader).starts_with("%end "));
+
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn simple_connection_preserves_split_window_options_and_argv() {
+    let (mut stream, requests, handle) = start_connection(HashMap::new());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream
+        .write_all(
+            b"split-window -bfdPZh -c one -c two -F firstfmt -F secondfmt -T first-title -T second-title -p 30 -l 10 -e A=1 -e B=two -- tool \"\" \"wide arg\"\n",
+        )
+        .unwrap();
+    stream.flush().unwrap();
+
+    let CtrlReq::SplitWindowPrint(
+        kind,
+        command,
+        detached,
+        start_dir,
+        split_size,
+        format,
+        response,
+        title,
+        environment,
+        zoom_after_split,
+    ) = requests.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected split-window print request");
+    };
+    assert_eq!(kind, LayoutKind::Horizontal);
+    assert_eq!(command.as_deref(), Some("-- tool '' 'wide arg'"));
+    assert!(detached);
+    assert_eq!(start_dir.as_deref(), Some("one"));
+    assert_eq!(split_size, Some((30, true)));
+    assert_eq!(format.as_deref(), Some("firstfmt"));
+    assert_eq!(title.as_deref(), Some("first-title"));
+    assert_eq!(
+        environment,
+        [
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "two".to_string())
+        ]
+    );
+    assert!(zoom_after_split);
+    response.send("created".to_string()).unwrap();
+    assert_eq!(read_line(&mut reader), "created");
+
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn control_connection_preserves_split_window_options_and_argv() {
+    let (mut stream, requests, handle) = start_connection(HashMap::new());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream.write_all(b"CONTROL_NOECHO\n").unwrap();
+    stream.flush().unwrap();
+    assert!(read_line(&mut reader).starts_with("\u{1b}P1000p%begin "));
+    assert!(read_line(&mut reader).starts_with("%end "));
+
+    stream
+        .write_all(
+            b"splitp -bfdPZh -c one -c two -F firstfmt -F secondfmt -T first-title -T second-title -p 30 -l 10 -e A=1 -e B=two -- tool \"\" \"wide arg\"\n",
+        )
+        .unwrap();
+    stream.flush().unwrap();
+
+    let request = loop {
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        if matches!(request, CtrlReq::ControlRegister { .. }) {
+            continue;
+        }
+        break request;
+    };
+    let CtrlReq::SplitWindowPrint(
+        kind,
+        command,
+        detached,
+        start_dir,
+        split_size,
+        format,
+        response,
+        title,
+        environment,
+        zoom_after_split,
+    ) = request
+    else {
+        panic!("expected split-window print request");
+    };
+    assert_eq!(kind, LayoutKind::Horizontal);
+    assert_eq!(command.as_deref(), Some("-- tool '' 'wide arg'"));
+    assert!(detached);
+    assert_eq!(start_dir.as_deref(), Some("one"));
+    assert_eq!(split_size, Some((30, true)));
+    assert_eq!(format.as_deref(), Some("firstfmt"));
+    assert_eq!(title.as_deref(), Some("first-title"));
+    assert_eq!(
+        environment,
+        [
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "two".to_string())
+        ]
+    );
+    assert!(zoom_after_split);
+    response.send("created".to_string()).unwrap();
+
+    assert!(read_line(&mut reader).starts_with("%begin "));
+    assert_eq!(read_line(&mut reader), "created");
+    assert!(read_line(&mut reader).starts_with("%end "));
+
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn attached_split_window_target_overrides_transport_target() {
+    let (mut stream, requests, handle) = start_connection(HashMap::new());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream
+        .write_all(b"TARGET :1\nsplit-window -t:2 -h\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    let CtrlReq::FocusTargetTemp {
+        win,
+        win_is_id,
+        win_name,
+        pane,
+        pane_is_id,
+        resp,
+    } = requests.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected target validation");
+    };
+    assert_eq!(win, Some(2));
+    assert!(!win_is_id);
+    assert_eq!(win_name, None);
+    assert_eq!(pane, None);
+    assert!(!pane_is_id);
+    resp.send(Ok(())).unwrap();
+
+    let CtrlReq::SplitWindow(kind, ..) =
+        requests.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected split-window request");
+    };
+    assert_eq!(kind, LayoutKind::Horizontal);
+
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn command_alias_uses_the_split_window_parser() {
+    let aliases = HashMap::from([(
+        "divide".to_string(),
+        "split-window -h -P".to_string(),
+    )]);
+    let (mut stream, requests, handle) = start_connection(aliases);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream
+        .write_all(b"divide -c\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    assert_eq!(read_line(&mut reader), "psmux: -c expects an argument");
+    stream.shutdown(Shutdown::Both).unwrap();
+    handle.join().unwrap();
+    assert_no_requests(&requests);
+}
+
+#[test]
+fn split_window_target_after_command_operand_remains_command_text() {
+    let (mut stream, requests, handle) = start_connection(HashMap::new());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    authenticate(&mut stream, &mut reader);
+
+    stream
+        .write_all(b"TARGET :1\nsplit-window tool -t child\n")
+        .unwrap();
+    stream.flush().unwrap();
+
+    let CtrlReq::FocusTargetTemp { win, resp, .. } =
+        requests.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected transport target validation");
+    };
+    assert_eq!(win, Some(1));
+    resp.send(Ok(())).unwrap();
+
+    let CtrlReq::SplitWindow(_, command, ..) =
+        requests.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected split-window request");
+    };
+    assert_eq!(command.as_deref(), Some("tool"));
 
     stream.shutdown(Shutdown::Both).unwrap();
     handle.join().unwrap();

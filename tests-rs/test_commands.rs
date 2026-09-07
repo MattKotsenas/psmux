@@ -249,3 +249,32 @@ fn command_prompt_rejects_missing_new_window_values() {
         assert_eq!(app.windows.len(), before, "{option}");
     }
 }
+
+#[test]
+fn command_prompt_rejects_missing_split_window_values() {
+    for option in ["-c", "-e", "-F", "-l", "-p", "-T", "-t"] {
+        let mut app = mock_app_with_window();
+        let input = format!("splitw {option}");
+        app.mode = Mode::CommandPrompt {
+            cursor: input.len(),
+            input,
+        };
+        let before = crate::tree::count_panes(&app.windows[app.active_idx].root);
+
+        let error = execute_command_prompt(&mut app)
+            .expect_err("missing option value must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{option}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{option} expects an argument")),
+            "{option}: {error}"
+        );
+        assert_eq!(
+            crate::tree::count_panes(&app.windows[app.active_idx].root),
+            before,
+            "{option}"
+        );
+    }
+}

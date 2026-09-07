@@ -109,6 +109,37 @@ fn new_window_missing_values_warn_before_storing_deferred_commands() {
 }
 
 #[test]
+fn split_window_missing_values_warn_before_storing_deferred_commands() {
+    for option in ["-c", "-e", "-F", "-l", "-p", "-T", "-t"] {
+        let mut a = app();
+        crate::config::parse_config_content(
+            &mut a,
+            &format!(
+                "split-window {option}\nbind-key x splitw {option}\nset-hook pane-died split-pane {option}\n"
+            ),
+        );
+
+        assert_eq!(
+            a.config_warnings
+                .iter()
+                .filter(|warning| warning.contains(&format!(
+                    "{option} expects an argument"
+                )))
+                .count(),
+            3,
+            "{option}: {:?}",
+            a.config_warnings
+        );
+        assert!(a.key_tables.get("prefix").is_none_or(|bindings| {
+            bindings
+                .iter()
+                .all(|binding| binding.key.0 != crossterm::event::KeyCode::Char('x'))
+        }));
+        assert!(!a.hooks.contains_key("pane-died"));
+    }
+}
+
+#[test]
 fn new_window_compatibility_flag_is_accepted_in_deferred_commands() {
     let mut a = app();
     crate::config::parse_config_content(

@@ -37,6 +37,8 @@ mod control;
 mod resize_window;
 mod kill_window;
 mod new_window;
+mod split_window;
+mod window_command;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
@@ -752,8 +754,8 @@ fn run_main() -> io::Result<()> {
         ),
     );
     let command_index = process_command_index(&args);
-    // Reject malformed kill-window and new-window commands before cleanup,
-    // probing, or any server connection.
+    // Reject malformed typed window commands before cleanup, probing, or any
+    // server connection.
     let kill_window_command = command_index
         .and_then(|index| {
             crate::kill_window::KillWindowCommand::parse(
@@ -766,6 +768,15 @@ fn run_main() -> io::Result<()> {
     let new_window_command = command_index
         .and_then(|index| {
             crate::new_window::NewWindowCommand::parse(
+                &args[index],
+                args[index + 1..].iter(),
+            )
+        })
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let split_window_command = command_index
+        .and_then(|index| {
+            crate::split_window::SplitWindowCommand::parse(
                 &args[index],
                 args[index + 1..].iter(),
             )
@@ -875,10 +886,15 @@ fn run_main() -> io::Result<()> {
     let new_window_target = new_window_command
         .as_ref()
         .and_then(|command| command.effective_target(precommand_target.as_deref()));
+    let split_window_target = split_window_command
+        .as_ref()
+        .and_then(|command| command.effective_target(precommand_target.as_deref()));
     let explicit_target: Option<&str> = if kill_window_command.is_some() {
         kill_window_target.as_deref()
     } else if new_window_command.is_some() {
         new_window_target
+    } else if split_window_command.is_some() {
+        split_window_target
     } else if is_set_option_command {
         set_option_target.as_deref().or(precommand_target.as_deref())
     } else {
@@ -2112,96 +2128,21 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "split-window" | "splitw" | "split-pane" | "splitp" => {
-                // split-pane / splitp are tmux's default command-aliases for
-                // split-window (options-table.c). psmux handles them as arm
-                // synonyms, matching how info/server-info and choose-window/
-                // choose-session are already aliased. See issue #426.
-                // Strict getopt-style parsing for split-window flags.
-                // tmux template: "bc:de:F:fhIl:p:Pt:vZ"
-                let mut flag = "-v";
-                let mut detached = false;
-                let mut print_info = false;
-                let mut format_str: Option<String> = None;
-                let mut start_dir: Option<String> = None;
-                let mut size_pct: Option<String> = None;
-                let mut size_cells: Option<String> = None;
-                let mut title_arg: Option<String> = None;
-                let mut env_args: Vec<String> = Vec::new();
-                let mut zoom_after_split = false;
-                let mut sw_positional: Vec<String> = Vec::new();
-                let mut sw_saw_ddash = false;
-                {
-                    let mut i = 1;
-                    while i < cmd_args.len() {
-                        let a = cmd_args[i].as_str();
-                        if a == "--" { sw_saw_ddash = true; sw_positional.extend(cmd_args[i+1..].iter().map(|s| s.to_string())); break; }
-                        match a {
-                            "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            s if s.starts_with("-F") && s.len() > 2 => { format_str = Some(s[2..].trim_matches('"').to_string()); }
-                            "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-T" => { i += 1; if i < cmd_args.len() { title_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-p" => { i += 1; if i < cmd_args.len() { size_pct = Some(cmd_args[i].to_string()); size_cells = None; } }
-                            "-l" => { i += 1; if i < cmd_args.len() { let v = cmd_args[i].to_string(); if v.ends_with('%') { size_pct = Some(v); size_cells = None; } else { size_cells = Some(v); size_pct = None; } } }
-                            // -e KEY=VALUE environment for the new pane (#489)
-                            "-e" => { i += 1; if i < cmd_args.len() { env_args.push(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-t" => { i += 1; /* skip value */ }
-                            "-h" => { flag = "-h"; }
-                            "-v" => { flag = "-v"; }
-                            "-d" => { detached = true; }
-                            "-P" => { print_info = true; }
-                            "-Z" => { zoom_after_split = true; }
-                            "-b" | "-f" | "-I" => { /* ignored for compatibility */ }
-                            _ if a.starts_with('-') => { /* unknown flag, skip */ }
-                            _ => { sw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
-                        }
-                        i += 1;
-                    }
-                }
+                let command = split_window_command.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "split-window command was not parsed",
+                    )
+                })?;
                 // cwd parity (same as new-window): a command-line split with no
                 // -c must open in the CALLER's cwd, not the server's (session)
                 // cwd. Each psmux CLI call is a one-shot detached client, so
                 // default -c to our current dir when none given.
-                if start_dir.is_none() {
-                    if let Ok(cwd) = std::env::current_dir() {
-                        start_dir = Some(cwd.to_string_lossy().into_owned());
-                    }
-                }
-                let cmd_arg = sw_positional.join(" ");
-                let cmd_arg = cmd_arg.as_str();
-                let mut cmd_line = format!("split-window {}", flag);
-                if detached { cmd_line.push_str(" -d"); }
-                if print_info { cmd_line.push_str(" -P"); }
-                if zoom_after_split { cmd_line.push_str(" -Z"); }
-                if let Some(ref fmt) = format_str {
-                    cmd_line.push_str(&format!(" -F {}", crate::util::quote_arg(&fmt)));
-                }
-                if let Some(dir) = &start_dir {
-                    cmd_line.push_str(&format!(" -c {}", crate::util::quote_arg(&dir)));
-                }
-                if let Some(t) = &title_arg {
-                    cmd_line.push_str(&format!(" -T {}", crate::util::quote_arg(&t)));
-                }
-                if let Some(pct) = &size_pct {
-                    cmd_line.push_str(&format!(" -p {}", pct));
-                } else if let Some(cells) = &size_cells {
-                    cmd_line.push_str(&format!(" -l {}", cells));
-                }
-                for ev in &env_args {
-                    cmd_line.push_str(&format!(" -e {}", crate::util::quote_arg(&ev)));
-                }
-                // tmux parity (#582): a multi-token `-- prog args...` argv is
-                // exec'd directly by the server; forward tokens individually
-                // behind the `--` marker.
-                if sw_saw_ddash && sw_positional.len() > 1 {
-                    cmd_line.push_str(" --");
-                    for tok in &sw_positional {
-                        cmd_line.push_str(&format!(" {}", crate::util::quote_arg(tok)));
-                    }
-                } else if !cmd_arg.is_empty() {
-                    cmd_line.push_str(&format!(" {}", crate::util::quote_arg(&cmd_arg)));
-                }
-                cmd_line.push('\n');
-                if print_info {
+                let caller_cwd = std::env::current_dir()
+                    .ok()
+                    .map(|cwd| cwd.to_string_lossy().into_owned());
+                let cmd_line = command.to_wire_command(caller_cwd.as_deref());
+                if command.print() {
                     let resp = send_control_with_response(cmd_line)?;
                     // #559: an ERROR reply must never masquerade as the new
                     // pane id. `-P -F '#{pane_id}'` is the documented way for

@@ -499,16 +499,18 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
             }
         }
         "split-window" | "splitw" | "split-pane" | "splitp" => {
-            // If extra flags like -c, -d, -p, -F, or a shell command are present,
-            // store as Command to preserve the full argument string.
-            let has_extra = parts.iter().any(|p| matches!(*p, "-c" | "-d" | "-p" | "-l" | "-F" | "-P" | "-b" | "-f" | "-I" | "-Z" | "-e"))
-                || parts.iter().any(|p| !p.starts_with('-') && *p != "split-window" && *p != "splitw" && *p != "split-pane" && *p != "splitp");
-            if has_extra {
-                Some(Action::Command(cmd.to_string()))
-            } else if parts.iter().any(|p| *p == "-h") {
-                Some(Action::SplitHorizontal)
-            } else {
-                Some(Action::SplitVertical)
+            match crate::split_window::SplitWindowCommand::parse(
+                parts[0],
+                parts.iter().skip(1).copied(),
+            ) {
+                Some(Ok(command)) => match command.direct_action_kind() {
+                    Some(LayoutKind::Horizontal) => Some(Action::SplitHorizontal),
+                    Some(LayoutKind::Vertical) => Some(Action::SplitVertical),
+                    None => Some(Action::Command(cmd.to_string())),
+                },
+                // Keep malformed commands intact so typed ingress validation
+                // can report the parse error.
+                Some(Err(_)) | None => Some(Action::Command(cmd.to_string())),
             }
         }
         "kill-pane" | "killp" => Some(Action::KillPane),
@@ -657,8 +659,8 @@ pub fn requote_command_tail<S: AsRef<str>>(args: &[S]) -> String {
         .join(" ")
 }
 
-/// Validates nested `kill-window` and `new-window` syntax in bindings, hooks,
-/// and confirmation commands, returning `Err` when nesting exceeds
+/// Validates nested typed window-command syntax in bindings, hooks, and
+/// confirmation commands, returning `Err` when nesting exceeds
 /// `MAX_DEFERRED_COMMAND_DEPTH`.
 pub fn validate_deferred_command<S: AsRef<str>>(
     command: &str,
@@ -693,8 +695,7 @@ fn validate_deferred_command_at_depth<S: AsRef<str>>(
     validate_command_sequence_at_depth(&nested, depth + 1)
 }
 
-/// Validates `kill-window`, `new-window`, and nested deferred commands in a
-/// chain.
+/// Validates typed window commands and nested deferred commands in a chain.
 pub fn validate_command_sequence(command: &str) -> Result<(), String> {
     validate_command_sequence_at_depth(command, 0)
 }
@@ -706,18 +707,7 @@ fn validate_command_sequence_at_depth(command: &str, depth: usize) -> Result<(),
             continue;
         };
         let args = &tokens[1..];
-        if let Some(parsed) = crate::kill_window::KillWindowCommand::parse(
-            name,
-            args.iter(),
-        ) {
-            parsed.map_err(|error| error.to_string())?;
-        }
-        if let Some(parsed) = crate::new_window::NewWindowCommand::parse(
-            name,
-            args.iter(),
-        ) {
-            parsed.map_err(|error| error.to_string())?;
-        }
+        crate::window_command::validate(name, args)?;
         validate_deferred_command_at_depth(name, args, depth)?;
     }
     Ok(())
@@ -1037,13 +1027,22 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
             create_window(&*pty_system, app, None, None, false)?;
         }
         "split-window" | "splitw" | "split-pane" | "splitp" => {
-            let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-            let zoom_after_split = parts.iter().any(|p| *p == "-Z");
-            if zoom_after_split {
+            let command = crate::split_window::SplitWindowCommand::parse(
+                parts[0],
+                parts.iter().skip(1).copied(),
+            )
+            .expect("split-window command name")
+            .map_err(|error| {
+                let message = error.to_string();
+                app.status_message =
+                    Some((message.clone(), std::time::Instant::now(), None));
+                io::Error::new(io::ErrorKind::InvalidInput, message)
+            })?;
+            if command.zoom_after_split() {
                 unzoom_if_zoomed(app);
             }
-            split_active(app, kind)?;
-            if zoom_after_split {
+            split_active(app, command.kind())?;
+            if command.zoom_after_split() {
                 toggle_zoom(app);
             }
         }
@@ -1123,6 +1122,7 @@ fn execute_kill_window(app: &mut AppState, command: &crate::kill_window::KillWin
 
 fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()> {
     let parsed = parse_command_line(cmd);
+    let mut split_window_command = None;
     if let Some(name) = parsed.first() {
         if let Err(error) = validate_deferred_command(name, &parsed[1..]) {
             app.status_message = Some((error.clone(), std::time::Instant::now(), None));
@@ -1154,6 +1154,17 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 io::Error::new(io::ErrorKind::InvalidInput, message)
             })?;
         }
+        if let Some(command) = crate::split_window::SplitWindowCommand::parse(
+            name,
+            parsed.iter().skip(1),
+        ) {
+            split_window_command = Some(command.map_err(|error| {
+                let message = error.to_string();
+                app.status_message =
+                    Some((message.clone(), std::time::Instant::now(), None));
+                io::Error::new(io::ErrorKind::InvalidInput, message)
+            })?);
+        }
     }
 
     let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -1169,10 +1180,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 // Forward the full command string to preserve -c, -d, -p etc. flags
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
-            } else if parts.iter().any(|p| *p == "-Z") {
-                let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+            } else if let Some(command) = split_window_command
+                .as_ref()
+                .filter(|command| command.zoom_after_split())
+            {
                 unzoom_if_zoomed(app);
-                split_active(app, kind)?;
+                split_active(app, command.kind())?;
                 toggle_zoom(app);
             }
         }

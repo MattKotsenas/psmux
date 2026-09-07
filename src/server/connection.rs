@@ -4,8 +4,10 @@ use std::time::Duration;
 use std::net::TcpStream;
 
 use crate::types::{
-    ControlNotification, CtrlReq, LayoutKind, WaitForOp, WindowDumpFormat,
+    ControlNotification, CtrlReq, WaitForOp, WindowDumpFormat,
 };
+#[cfg(test)]
+use crate::types::LayoutKind;
 
 /// Clear HANDLE_FLAG_INHERIT on a connection socket (see the comment at the
 /// clone sites in `handle_connection`). No-op off Windows.
@@ -268,6 +270,7 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
 struct ParsedIngress {
     kill_window: Option<crate::kill_window::KillWindowCommand>,
     new_window: Option<crate::new_window::NewWindowCommand>,
+    split_window: Option<crate::split_window::SplitWindowCommand>,
 }
 
 fn parse_and_validate_ingress(
@@ -286,12 +289,19 @@ fn parse_and_validate_ingress(
     )
     .transpose()
     .map_err(|error| error.to_string())?;
+    let split_window = crate::split_window::SplitWindowCommand::parse(
+        command,
+        args.iter().copied(),
+    )
+    .transpose()
+    .map_err(|error| error.to_string())?;
 
     crate::commands::validate_deferred_command(command, args)?;
 
     Ok(ParsedIngress {
         kill_window,
         new_window,
+        split_window,
     })
 }
 
@@ -899,6 +909,18 @@ if control_echo || control_noecho {
                     &mut ctrl_pane_is_id,
                 );
             }
+        } else if let Some(command) = ingress.split_window.as_ref() {
+            if let Some(target) = command.target() {
+                apply_target_spec(
+                    target,
+                    &mut ctrl_raw_target,
+                    &mut ctrl_target_win,
+                    &mut ctrl_target_win_is_id,
+                    &mut ctrl_target_win_name,
+                    &mut ctrl_target_pane,
+                    &mut ctrl_pane_is_id,
+                );
+            }
         } else if let Some(parsed_set) = ctrl_set_args.as_ref() {
             if let Some(value) = parsed_set.target {
                 apply_target_spec(
@@ -934,9 +956,12 @@ if control_echo || control_noecho {
             }
         }
 
-        // Control dispatch reparses new-window, so keep the validated argument
-        // sequence intact.
-        let filtered_args = if ctrl_set_option || ingress.new_window.is_some() {
+        // Control dispatch reparses typed window commands, so keep the
+        // validated argument sequence intact.
+        let filtered_args = if ctrl_set_option
+            || ingress.new_window.is_some()
+            || ingress.split_window.is_some()
+        {
             cmd_args.clone()
         } else {
             without_outer_target(cmd_name, &cmd_args)
@@ -1218,6 +1243,18 @@ if let Some(command) = ingress.kill_window.as_ref() {
             &mut pane_is_id,
         );
     }
+} else if let Some(command) = ingress.split_window.as_ref() {
+    if let Some(target) = command.target() {
+        apply_target_spec(
+            target,
+            &mut raw_target,
+            &mut target_win,
+            &mut target_win_is_id,
+            &mut target_win_name,
+            &mut target_pane,
+            &mut pane_is_id,
+        );
+    }
 } else if set_option_command {
     if let Some(value) = parse_set_option_args(&args).target {
         apply_target_spec(
@@ -1381,45 +1418,20 @@ match cmd {
         }
     }
     "split-window" | "splitw" | "split-pane" | "splitp" => {
-        let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-        let detached = args.iter().any(|a| *a == "-d");
-        let zoom_after_split = args.iter().any(|a| *a == "-Z");
-        let print_info = args.iter().any(|a| *a == "-P");
-        let format_str: Option<String> = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
-        let title: Option<String> = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
-        let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-        // -p N = percentage, -l N = cell count, -l N% = percentage (tmux semantics)
-        let split_size: Option<(u16, bool)> = args.windows(2).find(|w| w[0] == "-p")
-            .and_then(|w| w[1].trim_matches('%').parse::<u16>().ok())
-            .map(|v| (v, true))
-            .or_else(|| args.windows(2).find(|w| w[0] == "-l")
-                .and_then(|w| {
-                    let raw = &w[1];
-                    let is_pct = raw.ends_with('%');
-                    raw.trim_end_matches('%').parse::<u16>().ok().map(|v| (v, is_pct))
-                }));
-        // -e KEY=VALUE (repeatable, tmux parity, #489): environment for the
-        // new pane. Excluded from shell-command extraction below — before
-        // this fix the -e value itself was spawned as the pane command,
-        // which flashed a red error and closed the pane instantly.
-        let env_sets: Vec<(String, String)> = args.windows(2)
-            .filter(|w| w[0] == "-e")
-            .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
-            .collect();
-        // tmux parity (#582): same `--` argv handling as
-        // NewWindowCommand::server_command.
-        let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
-            let tail = &args[pos + 1..];
-            if tail.len() > 1 {
-                Some(format!("-- {}", requote_command_tail(tail)))
-            } else {
-                tail.first().map(|s| s.trim_matches('"').to_string()).filter(|s| !s.is_empty())
-            }
-        } else {
-            args.iter()
-                .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)))
-                .map(|s| s.trim_matches('"').to_string())
-        };
+        let command = ingress
+            .split_window
+            .as_ref()
+            .expect("split-window ingress was parsed");
+        let kind = command.kind();
+        let cmd_str = command.server_command();
+        let detached = command.detached();
+        let zoom_after_split = command.zoom_after_split();
+        let print_info = command.print();
+        let format_str = command.print_format().map(str::to_string);
+        let title = command.title().map(str::to_string);
+        let start_dir = command.start_dir().map(str::to_string);
+        let split_size = command.split_size();
+        let env_sets = command.environment();
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets, zoom_after_split));
@@ -4227,33 +4239,22 @@ fn dispatch_control_command(
             }
         }
         "split-window" | "splitw" | "split-pane" | "splitp" => {
-            let kind = if crate::cli::has_short_flag(&args, 'h') {
-                LayoutKind::Horizontal
-            } else {
-                LayoutKind::Vertical
-            };
-            let cmd_str = args.windows(2).find(|w| w[0] == "-c").map(|_| ()).and(None);
-            let start_dir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-            let detached = crate::cli::has_short_flag(&args, 'd');
-            let zoom_after_split = crate::cli::has_short_flag(&args, 'Z');
-            let print_info = crate::cli::has_short_flag(&args, 'P');
-            let format_str = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
-            let title = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
-            // -p N = percentage, -l N = cell count, -l N% = percentage (tmux semantics)
-            let split_size: Option<(u16, bool)> = args.windows(2).find(|w| w[0] == "-p")
-                .and_then(|w| w[1].trim_end_matches('%').parse::<u16>().ok())
-                .map(|v| (v, true))
-                .or_else(|| args.windows(2).find(|w| w[0] == "-l")
-                    .and_then(|w| {
-                        let raw = &w[1];
-                        let is_pct = raw.ends_with('%');
-                        raw.trim_end_matches('%').parse::<u16>().ok().map(|v| (v, is_pct))
-                    }));
-            // -e KEY=VALUE environment for the new pane (tmux parity, #489).
-            let env_sets: Vec<(String, String)> = args.windows(2)
-                .filter(|w| w[0] == "-e")
-                .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
-                .collect();
+            let command = crate::split_window::SplitWindowCommand::parse(
+                cmd,
+                args.iter().copied(),
+            )
+            .expect("split-window command name")
+            .expect("split-window ingress was validated");
+            let kind = command.kind();
+            let cmd_str = command.server_command();
+            let start_dir = command.start_dir().map(str::to_string);
+            let detached = command.detached();
+            let zoom_after_split = command.zoom_after_split();
+            let print_info = command.print();
+            let format_str = command.print_format().map(str::to_string);
+            let title = command.title().map(str::to_string);
+            let split_size = command.split_size();
+            let env_sets = command.environment();
             let (rtx, rrx) = mpsc::channel::<String>();
             if print_info {
                 let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets, zoom_after_split));

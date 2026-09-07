@@ -75,6 +75,10 @@ name = "test_new_window_cli_error"
 path = "tests-rs/test_new_window_cli_error.rs"
 
 [[test]]
+name = "test_split_window_cli_error"
+path = "tests-rs/test_split_window_cli_error.rs"
+
+[[test]]
 name = "test_issue494_copymode_freeze"
 path = "tests-rs/test_issue494_copymode_freeze.rs"
 
