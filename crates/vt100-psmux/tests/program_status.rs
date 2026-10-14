@@ -40,7 +40,7 @@ fn replacement_inheritance_and_hierarchical_clear() {
     let statuses = parser.screen().program_status();
     assert_eq!(statuses.inherited_app("build/unit"), Some("test"));
     assert_eq!(statuses.inherited_app("builder"), Some("cargo"));
-    assert_eq!(statuses.attention().unwrap().id, "build/unit");
+    assert_eq!(statuses.summary().unwrap().status.id, "build/unit");
     report(&mut parser, "state=done");
     assert_eq!(parser.screen().program_status().get("").unwrap().app, None);
     assert_eq!(parser.screen().program_status().get("").unwrap().msg, None);
@@ -97,18 +97,20 @@ fn malformed_unknown_duplicate_and_state_specific_fields() {
 fn acknowledgements_preserve_retransmissions_but_not_a_new_run_in_one_batch() {
     let mut parser = enabled();
     report(&mut parser, "state=done");
-    assert!(parser.screen().program_status().attention().is_some());
+    assert!(!parser.screen().program_status().summary().unwrap().seen);
     parser.screen_mut().program_status_mut().acknowledge();
-    assert!(parser.screen().program_status().attention().is_none());
+    assert!(parser.screen().program_status().summary().unwrap().seen);
     report(&mut parser, "state=done");
-    assert!(parser.screen().program_status().attention().is_none());
+    assert!(parser.screen().program_status().summary().unwrap().seen);
     parser.process(b"\x1b]7501;state=working\x07\x1b]7501;state=done\x07");
-    assert_eq!(parser.screen().program_status().attention().unwrap().state, ProgramState::Done);
+    let summary = parser.screen().program_status().summary().unwrap();
+    assert_eq!(summary.status.state, ProgramState::Done);
+    assert!(!summary.seen);
     report(&mut parser, "state=error:id=failed");
-    assert_eq!(parser.screen().program_status().attention().unwrap().state, ProgramState::Error);
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.state, ProgramState::Error);
     report(&mut parser, "state=blocked:id=question");
     parser.screen_mut().program_status_mut().acknowledge();
-    assert_eq!(parser.screen().program_status().attention().unwrap().state, ProgramState::Blocked);
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.state, ProgramState::Blocked);
 }
 
 #[test]
@@ -209,7 +211,7 @@ fn reinitialization_cannot_reuse_a_previous_semantic_generation() {
     parser.screen_mut().reinit_keep_history();
     report(&mut parser, "state=blocked");
     assert_ne!(parser.screen().program_status().generation(), cached_generation);
-    assert_eq!(parser.screen().program_status().attention().unwrap().state, ProgramState::Blocked);
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.state, ProgramState::Blocked);
 }
 
 #[test]
@@ -250,4 +252,38 @@ fn snapshots_neither_replay_nor_capture_queries_and_ris_preserves_order() {
     assert!(snapshot.screen_mut().take_queries().is_empty());
     parser.process(b"\x1bc\x1b[c");
     assert_eq!(parser.screen_mut().take_queries(), vec![TerminalQuery::ProgramStatus, TerminalQuery::Da1]);
+}
+
+#[test]
+fn summary_includes_every_state_and_keeps_seen_results_reported() {
+    let mut parser = enabled();
+    assert!(parser.screen().program_status().summary().is_none());
+    report(&mut parser, "state=working:id=work");
+    report(&mut parser, "state=idle:id=rest");
+    let summary = parser.screen().program_status().summary().unwrap();
+    assert_eq!(summary.status.id, "work");
+    assert!(!summary.seen);
+    report(&mut parser, "state=done:id=result");
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.id, "result");
+    parser.screen_mut().program_status_mut().acknowledge();
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.id, "work");
+    report(&mut parser, "state=clear:id=work");
+    let summary = parser.screen().program_status().summary().unwrap();
+    assert_eq!(summary.status.state, ProgramState::Done);
+    assert!(summary.seen);
+    report(&mut parser, "state=idle:id=rest:app=new");
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.state, ProgramState::Idle);
+    assert_eq!(parser.screen().program_status().records().count(), 2);
+}
+
+#[test]
+fn identical_working_retransmission_does_not_steal_selection() {
+    let mut parser = enabled();
+    report(&mut parser, "state=working:id=first");
+    report(&mut parser, "state=working:id=second");
+    let generation = parser.screen().program_status().generation();
+    let selected = parser.screen().program_status().summary().unwrap().status.id.clone();
+    report(&mut parser, "state=working:id=first");
+    assert_eq!(parser.screen().program_status().summary().unwrap().status.id, selected);
+    assert_eq!(parser.screen().program_status().generation(), generation);
 }

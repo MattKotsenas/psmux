@@ -19,7 +19,7 @@ function Default-Sessions {
     (& $Binary list-sessions 2>&1 | Out-String).Trim()
 }
 function P { & $Binary -L $namespace @args }
-# Frames carry tabs and attention; full records come from `list-windows -J`.
+# Frames carry tabs and the selected status; full records come from `list-windows -J`.
 function State {
     # Listing first: the frame is then at least as new as the records it is
     # checked against, so a tab is never judged on an older frame.
@@ -146,7 +146,7 @@ while ($sw.ElapsedMilliseconds -lt 2000) {
     }
     $windowsFormat = '#I:#W#{?window_flags,#{window_flags}, }'
     # The documented opt-in recipe (docs/program-status.md).
-    $recipe = '#I:#W#{?window_flags,#{window_flags},#{?window_ps_attention,, }}#{window_ps_attention}'
+    $recipe = '#I:#W#{?window_flags,#{window_flags},#{?window_ps_state,, }}#{?window_ps_state, [#{window_ps_state}],}'
     Assert ((P show-options -g -v window-status-format).Trim() -eq $windowsFormat) 'off leaves the tmux tab default alone'
 
     # ── program-status on: everything the protocol does ──
@@ -163,14 +163,14 @@ while ($sw.ElapsedMilliseconds -lt 2000) {
     Start-Sleep -Milliseconds 200
     'state=working:app=test' | Set-Content -LiteralPath $control -NoNewline
     $state = Wait-State { param($s) $s.windows[0].ps_panes.Count -gt 0 } 'application reports reach the server'
-    Assert (-not $state.windows[0].ps_attention) 'working has no attention indicator'
+    Assert ($state.windows[0].ps_status.state -eq 'working' -and -not $state.windows[0].activity) 'working is summarized without output activity'
     $pane = $state.windows[0].ps_panes[0].pane
     'state=blocked:app=test' | Set-Content -LiteralPath $control -NoNewline
-    $state = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'blocked' } 'stock tabs retain inspectable attention'
+    $state = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'blocked' } 'stock tabs leave blocked status inspectable'
     $stockFormat = '#I:#W#{?window_flags,#{window_flags}, }'
     Assert ((P show-options -g -v window-status-format).Trim() -eq $stockFormat) 'inactive default matches tmux'
     Assert ((P show-options -g -v window-status-current-format).Trim() -eq $stockFormat) 'active default matches tmux'
-    Assert ($state.windows[0].tab_text -notmatch '\[[?!+]%\d+\]') 'stock tabs omit attention even when blocked'
+    Assert ($state.windows[0].tab_text -notmatch '\[(idle|working|blocked|done|error)\]') 'stock tabs omit status even when blocked'
     $firstWindow = (P display-message -p '#{window_index}').Trim()
     P set-window-option -t "${session}:$firstWindow" window-status-current-format 'LOCAL'
     Assert ((State).windows[0].tab_text -eq 'LOCAL') 'window-local format is installed'
@@ -178,25 +178,25 @@ while ($sw.ElapsedMilliseconds -lt 2000) {
     P set-option -g window-status-current-format $recipe
     $state = State
     Assert ($state.windows[0].tab_text -eq 'LOCAL') 'global opt-in preserves a window-local format'
-    P set-window-option -t "${session}:$firstWindow" window-status-current-format 'LOCAL#{window_ps_attention}'
+    P set-window-option -t "${session}:$firstWindow" window-status-current-format 'LOCAL [#{window_ps_state}]'
     $state = State
-    Assert ($state.windows[0].tab_text -match '\[\?%\d+\]') 'local format can opt in to existing attention'
+    Assert ($state.windows[0].tab_text -match '\[blocked\]') 'local format can opt in to existing status'
     P set-window-option -u -t "${session}:$firstWindow" window-status-current-format
     P set-option -g -u window-status-format
     P set-option -g -u window-status-current-format
     $state = State
     Assert ((P show-options -g -v window-status-format).Trim() -eq $stockFormat) 'inactive reset matches tmux'
     Assert ((P show-options -g -v window-status-current-format).Trim() -eq $stockFormat) 'active reset matches tmux'
-    Assert ($state.windows[0].tab_text -notmatch '\[[?!+]%\d+\]') 'reset withdraws indicators without clearing reports'
-    Assert ($state.windows[0].ps_attention.state -eq 'blocked') 'reset preserves inspection'
+    Assert ($state.windows[0].tab_text -notmatch '\[(idle|working|blocked|done|error)\]') 'reset withdraws indicators without clearing reports'
+    Assert ($state.windows[0].ps_status.state -eq 'blocked') 'reset preserves inspection'
     P set-option -g window-status-format $recipe
     P set-option -g window-status-current-format $recipe
     $state = State
-    Assert ($state.windows[0].tab_text -match '\[\?%\d+\]') 'global format can opt in to existing attention'
+    Assert ($state.windows[0].tab_text -match '\[blocked\]') 'global format can opt in to existing status'
     Assert ($state.windows[0].tab_text -notmatch '  ') "the documented recipe never doubles a space: '$($state.windows[0].tab_text)'"
     'state=working:app=test' | Set-Content -LiteralPath $control -NoNewline
     $state = Wait-State { param($s) $s.windows[0].ps_panes[0].records[0].state -eq 'working' } 'working report after opt-in'
-    Assert ($state.windows[0].tab_text -notmatch '\[[?!+]%\d+\]') 'working remains quiet after opt-in'
+    Assert ($state.windows[0].tab_text -match '\[working\]' -and -not $state.windows[0].activity) 'working is displayed without output activity'
     P new-window -t "${session}:" 'pwsh -NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 600"'
     $foreground = (P display-message -p '#{window_index}').Trim()
     Assert ($foreground -ne $firstWindow) 'foreground is a separate window'
@@ -205,40 +205,62 @@ while ($sw.ElapsedMilliseconds -lt 2000) {
         Wait-Frame $client { param($s) $s.windows.Count -gt 0 -and -not $s.windows[0].ps_panes } 'client receives initial state without record text'
     }
     'state=done:app=test:msg=UmVhZHk=' | Set-Content -LiteralPath $control -NoNewline
-    $state = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'done' } 'background completion appears with a silent foreground'
-    Assert ($state.windows[0].tab_text -match '\[\+%\d+\]') 'completion is a visible text indicator'
+    $state = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'done' } 'background completion appears with a silent foreground'
+    Assert ($state.windows[0].tab_text -match '\[done\]') 'completion is a visible text indicator'
     Assert (-not $state.windows[0].activity) 'completion does not set output activity'
     foreach ($client in $clients) {
-        Wait-Frame $client { param($s) $s.windows[0].ps_attention.state -eq 'done' } 'background completion is pushed to both clients without polling'
+        Wait-Frame $client { param($s) $s.windows[0].ps_status.state -eq 'done' } 'background completion is pushed to both clients without polling'
     }
     P copy-mode
     'state=blocked:kind=permission:app=test' | Set-Content -LiteralPath $control -NoNewline
-    $state = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'blocked' } 'blocked status updates while foreground is in copy mode'
-    Assert ($state.windows[0].tab_text -match '\[\?%\d+\]') 'needs-input indicator is visible'
+    $state = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'blocked' } 'blocked status updates while foreground is in copy mode'
+    Assert ($state.windows[0].tab_text -match '\[blocked\]') 'needs-input indicator is visible'
     P select-window -t "${session}:$firstWindow"
     $state = State
-    Assert ($state.windows[0].ps_attention.state -eq 'blocked') 'return does not acknowledge blocked'
+    Assert ($state.windows[0].ps_status.state -eq 'blocked' -and -not $state.windows[0].ps_status.seen) 'return does not acknowledge blocked'
     'state=error:app=test' | Set-Content -LiteralPath $control -NoNewline
-    $null = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'error' } 'error arriving in the focused pane remains unseen'
+    $null = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'error' -and -not $s.windows[0].ps_status.seen } 'error arriving in the focused pane remains unseen'
     P select-window -t "${session}:$foreground"
     P select-window -t "${session}:$firstWindow"
     $state = State
-    Assert (-not $state.windows[0].ps_attention) 'return acknowledges current error'
+    Assert ($state.windows[0].ps_status.state -eq 'error' -and $state.windows[0].ps_status.seen) 'return acknowledges current error'
     Assert ($state.windows[0].ps_panes[0].records[0].state -eq 'error') 'acknowledgement preserves reported state'
     Assert ($state.windows[0].ps_panes[0].records[0].seen) 'acknowledgement is record-local and shared'
     foreach ($client in $clients) {
-        Wait-Frame $client { param($s) -not $s.windows[0].ps_attention } 'shared acknowledgement is pushed to both clients'
+        Wait-Frame $client { param($s) $s.windows[0].ps_status.state -eq 'error' -and $s.windows[0].ps_status.seen } 'shared acknowledgement is pushed to both clients'
     }
+    # The selected pane has a seen error; work in an unselected sibling must
+    # represent this window and push progress/state changes to both clients.
+    $control2 = Join-Path $work 'background.txt'
+    'state=working:progress=0:app=build' | Set-Content -LiteralPath $control2 -NoNewline
+    $command2 = 'pwsh -NoLogo -NoProfile -NonInteractive -File "' + $worker + '" -Control "' + $control2 + '"'
+    $background = (P split-window -d -t "%$pane" -P -F '#{pane_id}' $command2).Trim()
+    $state = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'working' -and $s.windows[0].ps_status.app -eq 'build' } 'unselected pane working replaces a seen result'
+    Assert ($state.windows[0].ps_status.pane -eq [int]$background.TrimStart('%')) 'summary identifies the background pane'
+    Assert (-not $state.windows[0].activity) 'background work does not set output activity'
+    Assert ($null -eq $state.windows[0].ps_status.PSObject.Properties['attention']) 'summary has no separate attention category'
+    Assert ((P display-message -p '#{pane_id}').Trim() -eq "%$pane") 'split preserved the selected pane'
+    'state=working:progress=75:app=build' | Set-Content -LiteralPath $control2 -NoNewline
+    foreach ($client in $clients) {
+        Wait-Frame $client { param($s) $s.windows[0].ps_status.state -eq 'working' -and $s.windows[0].ps_status.progress -eq 75 } 'background progress is pushed to both clients'
+    }
+    'state=idle:app=build' | Set-Content -LiteralPath $control2 -NoNewline
+    foreach ($client in $clients) {
+        Wait-Frame $client { param($s) $s.windows[0].ps_status.state -eq 'idle' } 'background idle is pushed to both clients'
+    }
+    P kill-pane -t $background
+    $state = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'error' -and $s.windows[0].ps_status.seen } 'removing the background pane reveals the preserved seen result'
+
     'state=working' | Set-Content -LiteralPath $control -NoNewline
     $null = Wait-State { param($s) $s.windows[0].ps_panes[0].records[0].state -eq 'working' } 'next run begins'
     'state=error:app=test' | Set-Content -LiteralPath $control -NoNewline
-    $null = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'error' } 'same result after a new run produces fresh attention'
+    $null = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'error' -and -not $s.windows[0].ps_status.seen } 'same result after a new run is unseen'
     'state=clear' | Set-Content -LiteralPath $control -NoNewline
-    $state = Wait-State { param($s) -not $s.windows[0].ps_attention -and -not $s.windows[0].ps_panes } 'clear withdraws attention and records'
+    $state = Wait-State { param($s) -not $s.windows[0].ps_status -and -not $s.windows[0].ps_panes } 'clear withdraws status and records'
     'state=done' | Set-Content -LiteralPath $control -NoNewline
-    $null = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'done' } 'completion before attached process exit'
+    $null = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'done' } 'completion before attached process exit'
     'exit' | Set-Content -LiteralPath $control -NoNewline
-    $null = Wait-State { param($s) $s.windows[0].ps_attention.state -eq 'done' -and ((P display-message -p -t "%$pane" '#{pane_dead}').Trim() -eq '1') } 'completion survives attached process exit'
+    $null = Wait-State { param($s) $s.windows[0].ps_status.state -eq 'done' -and ((P display-message -p -t "%$pane" '#{pane_dead}').Trim() -eq '1') } 'completion survives attached process exit'
     P respawn-pane -E -t "%$pane"
     $null = Wait-State { param($s) -not $s.windows[0].ps_panes } 'respawn withdraws old records and seen state'
 
@@ -247,17 +269,17 @@ while ($sw.ElapsedMilliseconds -lt 2000) {
     "[Console]::Write([char]27 + ']7501;state=blocked:app=late' + [char]7 + 'EMITTED')`nStart-Sleep -Seconds 600" | Set-Content -LiteralPath $emitterScript -Encoding utf8
     $emitter = 'pwsh -NoLogo -NoProfile -NonInteractive -File "' + $emitterScript + '"'
     P new-window -d -n late_on -t "${session}:" $emitter
-    $null = Wait-State { param($s) @($s.windows | Where-Object { $_.ps_attention.state -eq 'blocked' }).Count -gt 0 } 'on: a new pane reports'
+    $null = Wait-State { param($s) @($s.windows | Where-Object { $_.ps_status.state -eq 'blocked' }).Count -gt 0 } 'on: a new pane reports'
     P set-option -gu program-status
     Assert ((P show-options -g -v program-status).Trim() -eq 'off') 'set -u restores off'
-    $state = Wait-State { param($s) -not @($s.windows | Where-Object { $_.ps_panes -or $_.ps_attention }) } 'turning it off withdraws every record'
+    $state = Wait-State { param($s) -not @($s.windows | Where-Object { $_.ps_panes -or $_.ps_status }) } 'turning it off withdraws every record'
     Assert ((P show-options -g -v window-status-format).Trim() -eq $recipe) 'indicator formats are still in place'
     P new-window -d -n late_off -t "${session}:" $emitter
     $null = Wait-State { param($s) (P capture-pane -p -t "${session}:late_off") -join '' -match 'EMITTED' } 'off: the report was written to the pane'
     Start-Sleep -Milliseconds 500
     $state = State
-    Assert (-not @($state.windows | Where-Object { $_.ps_panes -or $_.ps_attention })) 'off with indicator formats: a report is not stored'
-    Assert (-not @($state.windows | Where-Object { $_.tab_text -match '\[[?!+]%\d+\]' })) 'off with indicator formats: no indicator'
+    Assert (-not @($state.windows | Where-Object { $_.ps_panes -or $_.ps_status })) 'off with indicator formats: a report is not stored'
+    Assert (-not @($state.windows | Where-Object { $_.tab_text -match '\[(idle|working|blocked|done|error)\]' })) 'off with indicator formats: no indicator'
 } finally {
     foreach ($client in $clients) { $client.tcp.Dispose() }
     if ($created) { P kill-server }

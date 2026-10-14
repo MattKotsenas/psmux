@@ -7,11 +7,40 @@ use serde::{Deserialize, Serialize};
 use crate::types::{AppState, Node, Pane, Window};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct Attention {
+pub(crate) struct Status {
     pub pane: usize,
     pub id: String,
     pub state: String,
     pub kind: Option<String>,
+    pub progress: Option<u8>,
+    pub app: Option<String>,
+    pub seen: bool,
+}
+
+impl Status {
+    fn from_summary(pane: usize, summary: &vt100::ProgramRecord, statuses: &vt100::ProgramStatuses) -> Self {
+        let status = &summary.status;
+        Self {
+            pane, id: status.id.clone(), state: status.state.as_str().to_owned(),
+            kind: status.kind.map(|kind| kind.as_str().to_owned()),
+            progress: status.progress,
+            app: statuses.inherited_app(&status.id).map(str::to_owned),
+            seen: summary.seen,
+        }
+    }
+
+    fn field(&self, field: &str) -> String {
+        match field {
+            "pane" => format!("%{}", self.pane),
+            "id" => self.id.clone(),
+            "state" => self.state.clone(),
+            "kind" => self.kind.clone().unwrap_or_default(),
+            "progress" => self.progress.map_or(String::new(), |p| p.to_string()),
+            "app" => self.app.clone().unwrap_or_default(),
+            "seen" => u8::from(self.seen).to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,27 +90,17 @@ pub(crate) fn set_enabled(app: &mut AppState, enabled: bool) {
     }
 }
 
-pub(crate) fn window_attention(window: &Window) -> Option<Attention> {
+pub(crate) fn window_status(window: &Window) -> Option<Status> {
     let mut selected = None;
     let mut best = None;
     window_panes(window, |pane| {
         if let Ok(parser) = pane.live_parser().lock() {
             let statuses = parser.screen().program_status();
-            if let Some(status) = statuses.attention() {
-                let priority = match status.state {
-                    vt100::ProgramState::Blocked => 3,
-                    vt100::ProgramState::Error => 2,
-                    _ => 1,
-                };
-                let key = (priority, statuses.attention_changed(), pane.id);
+            if let Some(summary) = statuses.summary() {
+                let key = (summary.rank(), pane.id);
                 if best.is_none_or(|previous| key > previous) {
                     best = Some(key);
-                    selected = Some(Attention {
-                        pane: pane.id,
-                        id: status.id.clone(),
-                        state: status.state.as_str().to_owned(),
-                        kind: status.kind.map(|kind| kind.as_str().to_owned()),
-                    });
+                    selected = Some(Status::from_summary(pane.id, summary, statuses));
                 }
             }
         }
@@ -148,21 +167,14 @@ pub(crate) fn acknowledge_focused(app: &AppState) {
     }
 }
 
+pub(crate) fn window_format(window: &Window, var: &str) -> String {
+    window_status(window).map_or(String::new(), |status| status.field(var.strip_prefix("window_ps_").unwrap_or("")))
+}
+
 pub(crate) fn pane_format(pane: &Pane, var: &str) -> String {
     let Ok(parser) = pane.live_parser().lock() else { return String::new(); };
     let statuses = parser.screen().program_status();
-    if var == "pane_ps_attention_state" {
-        return statuses.attention().map_or(String::new(), |s| s.state.as_str().to_owned());
-    }
-    if var == "pane_ps_attention_id" {
-        return statuses.attention().map_or(String::new(), |s| s.id.clone());
-    }
-    let Some(root) = statuses.get("") else { return String::new(); };
-    match var {
-        "pane_ps_state" => root.state.as_str().to_owned(),
-        "pane_ps_kind" => root.kind.map_or(String::new(), |k| k.as_str().to_owned()),
-        "pane_ps_progress" => root.progress.map_or(String::new(), |p| p.to_string()),
-        "pane_ps_app" => root.app.clone().unwrap_or_default(),
-        _ => String::new(),
-    }
+    statuses.summary().map_or(String::new(), |summary| {
+        Status::from_summary(pane.id, summary, statuses).field(var.strip_prefix("pane_ps_").unwrap_or(""))
+    })
 }
