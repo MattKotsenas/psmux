@@ -65,22 +65,22 @@ fn listing(app: &AppState) -> serde_json::Value {
 }
 
 /// The documented opt-in tab format (docs/program-status.md).
-const RECIPE: &str = "#I:#W#{?window_flags,#{window_flags},#{?window_ps_attention,, }}#{window_ps_attention}";
+const RECIPE: &str = "#I:#W#{?window_flags,#{window_flags},#{?window_ps_state,, }}#{?window_ps_state, [#{window_ps_state}],}";
 
-fn enable_attention(app: &mut AppState) {
+fn enable_status(app: &mut AppState) {
     crate::config::parse_config_content(app, &format!(
         "set -g window-status-format '{RECIPE}'\nset -g window-status-current-format '{RECIPE}'\n",
     ));
 }
 
 #[test]
-fn documented_recipe_matches_stock_tabs_until_attention_and_never_doubles_a_space() {
+fn documented_recipe_matches_stock_tabs_without_reports_and_never_doubles_a_space() {
     let mut app = app();
     let stock: serde_json::Value = serde_json::from_str(&crate::server::helpers::list_windows_json_with_tabs(&app).unwrap()).unwrap();
-    enable_attention(&mut app);
+    enable_status(&mut app);
     let quiet: serde_json::Value = serde_json::from_str(&crate::server::helpers::list_windows_json_with_tabs(&app).unwrap()).unwrap();
     for window in 0..2 {
-        assert_eq!(quiet[window]["tab_text"], stock[window]["tab_text"], "no attention: identical to stock");
+        assert_eq!(quiet[window]["tab_text"], stock[window]["tab_text"], "no reports: identical to stock");
     }
     report(get_pane(&app, 0, 0), "state=blocked");
     report(get_pane(&app, 1, 0), "state=error");
@@ -89,29 +89,27 @@ fn documented_recipe_matches_stock_tabs_until_attention_and_never_doubles_a_spac
         let tab = json[window]["tab_text"].as_str().unwrap();
         assert!(!tab.contains("  "), "double space in {tab:?}");
     }
-    assert_eq!(json[0]["tab_text"], "0:test* [?%10]");
+    assert_eq!(json[0]["tab_text"], "0:test* [blocked]");
     let second = json[1]["tab_text"].as_str().unwrap();
-    assert!(matches!(second, "1:test [!%20]" | "1:test- [!%20]"), "{second:?}");
+    assert!(matches!(second, "1:test [error]" | "1:test- [error]"), "{second:?}");
 }
 
 #[test]
-fn custom_tabs_show_attention_only_after_explicit_opt_in() {
+fn custom_tabs_show_all_states_only_after_explicit_opt_in() {
     let mut app = app();
     crate::config::parse_config_content(&mut app, "set -g window-status-format INACTIVE:#W\nset -g window-status-current-format ACTIVE:#W\n");
     for window in 0..2 { report(get_pane(&app, window, 0), "state=blocked"); }
     let before: serde_json::Value = serde_json::from_str(&crate::server::helpers::list_windows_json_with_tabs(&app).unwrap()).unwrap();
     assert_eq!(before[0]["tab_text"], "ACTIVE:test");
     assert_eq!(before[1]["tab_text"], "INACTIVE:test");
-    let config = "set -g window-status-format 'INACTIVE:#W#{window_ps_attention}'\nset -g window-status-current-format 'ACTIVE:#W#{window_ps_attention}'\n";
+    let config = "set -g window-status-format 'INACTIVE:#W:#{window_ps_state}'\nset -g window-status-current-format 'ACTIVE:#W:#{window_ps_state}'\n";
     crate::config::parse_config_content(&mut app, config);
     crate::config::parse_config_content(&mut app, config);
     for state in ["idle", "working", "done", "error", "blocked"] {
         for window in 0..2 { report(get_pane(&app, window, 0), &format!("state={state}")); }
         let json: serde_json::Value = serde_json::from_str(&crate::server::helpers::list_windows_json_with_tabs(&app).unwrap()).unwrap();
-        let symbol = match state { "done" => "+", "error" => "!", "blocked" => "?", _ => "" };
-        for (window, prefix, pane) in [(0, "ACTIVE:test", 10), (1, "INACTIVE:test", 20)] {
-            let suffix = if symbol.is_empty() { String::new() } else { format!(" [{symbol}%{pane}]") };
-            assert_eq!(json[window]["tab_text"], format!("{prefix}{suffix}"), "{state}");
+        for (window, prefix) in [(0, "ACTIVE:test"), (1, "INACTIVE:test")] {
+            assert_eq!(json[window]["tab_text"], format!("{prefix}:{state}"), "{state}");
             assert!(json[window].get("ps_panes").is_none(), "frames never carry records");
             assert_eq!(listing(&app)[window]["ps_panes"][0]["records"][0]["state"], state);
         }
@@ -150,29 +148,29 @@ fn stock_tabs_preserve_tmux_defaults_even_with_program_reports() {
 #[test]
 fn background_status_changes_invalidate_frames_without_output_alerts() {
     let mut app = app();
-    enable_attention(&mut app);
+    enable_status(&mut app);
     let before = crate::server::helpers::combined_data_version(&app);
     let mut cached_version = 0;
     let mut cached_windows = String::new();
     assert!(crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached_windows).unwrap());
     let initial_json: serde_json::Value = serde_json::from_str(&cached_windows).unwrap();
-    assert!(initial_json[1].get("ps_attention").is_none());
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(initial_json[1].get("ps_status").is_none());
+    assert!(window_status(&app.windows[1]).is_none());
     report(get_pane(&app, 1, 1), "state=done");
     assert_ne!(crate::server::helpers::combined_data_version(&app), before);
-    assert_eq!(window_attention(&app.windows[1]).unwrap().pane, 21);
+    assert_eq!(window_status(&app.windows[1]).unwrap().pane, 21);
     assert!(!app.windows[1].activity_flag);
     assert!(crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached_windows).unwrap());
     let updated_json: serde_json::Value = serde_json::from_str(&cached_windows).unwrap();
-    assert_eq!(updated_json[1]["ps_attention"]["state"], "done");
-    assert!(updated_json[1]["tab_text"].as_str().unwrap().contains("[+%21]"));
+    assert_eq!(updated_json[1]["ps_status"]["state"], "done");
+    assert!(updated_json[1]["tab_text"].as_str().unwrap().contains("[done]"));
     let version = crate::server::helpers::combined_data_version(&app);
     get_pane(&app, 1, 1).live_parser().lock().unwrap().process(b"ordinary output");
     assert_eq!(crate::server::helpers::combined_data_version(&app), version);
     assert!(!crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached_windows).unwrap());
     report(get_pane(&app, 1, 1), "state=clear");
     assert_ne!(crate::server::helpers::combined_data_version(&app), version);
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(window_status(&app.windows[1]).is_none());
 }
 
 #[test]
@@ -181,12 +179,12 @@ fn return_acknowledges_only_current_target_results_shared_by_all_readers() {
     report(get_pane(&app, 0, 0), "state=done");
     report(get_pane(&app, 1, 0), "state=error");
     report(get_pane(&app, 1, 1), "state=blocked");
-    assert!(window_attention(&app.windows[0]).is_some());
-    assert_eq!(window_attention(&app.windows[1]).unwrap().state, "blocked");
+    assert!(window_status(&app.windows[0]).is_some());
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "blocked");
     crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
     assert!(get_pane(&app, 1, 0).live_parser().lock().unwrap().screen().program_status().seen(""));
-    assert!(window_attention(&app.windows[0]).is_some());
-    assert_eq!(window_attention(&app.windows[1]).unwrap().state, "blocked");
+    assert!(window_status(&app.windows[0]).is_some());
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "blocked");
     let seen = window_records(&app.windows[1]);
     let another_client = window_records(&app.windows[1]);
     assert_eq!(serde_json::to_value(seen).unwrap(), serde_json::to_value(another_client).unwrap());
@@ -195,7 +193,7 @@ fn return_acknowledges_only_current_target_results_shared_by_all_readers() {
     crate::copy_mode::switch_with_copy_save(&mut app, |_| {});
     assert!(!get_pane(&app, 1, 0).live_parser().lock().unwrap().screen().program_status().seen(""));
     crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 0);
-    assert!(window_attention(&app.windows[0]).is_none());
+    assert!(window_status(&app.windows[0]).unwrap().seen);
     crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
     assert!(get_pane(&app, 1, 0).live_parser().lock().unwrap().screen().program_status().seen(""));
 }
@@ -236,7 +234,7 @@ fn return_acknowledgement_linearizes_under_parser_contention() {
 #[test]
 fn respawn_then_immediate_report_refreshes_cached_tabs_and_records() {
     let mut app = app();
-    enable_attention(&mut app);
+    enable_status(&mut app);
     report(get_pane(&app, 1, 0), "state=done");
     let mut cached_version = 0;
     let mut cached_windows = String::new();
@@ -247,11 +245,11 @@ fn respawn_then_immediate_report_refreshes_cached_tabs_and_records() {
     assert_ne!(crate::server::helpers::combined_data_version(&app), before);
     assert!(crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached_windows).unwrap());
     let json: serde_json::Value = serde_json::from_str(&cached_windows).unwrap();
-    assert_eq!(json[1]["ps_attention"]["state"], "blocked");
+    assert_eq!(json[1]["ps_status"]["state"], "blocked");
     assert!(json[1].get("ps_panes").is_none());
     assert_eq!(listing(&app)[1]["ps_panes"][0]["records"][0]["state"], "blocked");
-    assert!(json[1]["tab_text"].as_str().unwrap().contains("[?%20]"));
-    assert!(!json[1]["tab_text"].as_str().unwrap().contains("[+%20]"));
+    assert!(json[1]["tab_text"].as_str().unwrap().contains("[blocked]"));
+    assert!(!json[1]["tab_text"].as_str().unwrap().contains("[done]"));
 }
 
 #[test]
@@ -259,30 +257,30 @@ fn aggregation_prioritizes_blocked_error_done_and_recent_changes_across_panes() 
     let app = app();
     report(get_pane(&app, 1, 0), "state=error");
     report(get_pane(&app, 1, 1), "state=done");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().pane, 20);
+    assert_eq!(window_status(&app.windows[1]).unwrap().pane, 20);
     report(get_pane(&app, 1, 1), "state=blocked:kind=question:id=child");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().id, "child");
+    assert_eq!(window_status(&app.windows[1]).unwrap().id, "child");
     report(get_pane(&app, 1, 0), "state=blocked:kind=auth");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().pane, 20);
+    assert_eq!(window_status(&app.windows[1]).unwrap().pane, 20);
     report(get_pane(&app, 1, 1), "state=blocked:kind=question:id=child");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().pane, 20);
+    assert_eq!(window_status(&app.windows[1]).unwrap().pane, 20);
 }
 
 #[test]
 fn formats_and_structured_records_keep_literal_text_out_of_style_execution() {
     let mut app = app();
-    enable_attention(&mut app);
+    enable_status(&mut app);
     report(get_pane(&app, 0, 0), "state=blocked:kind=auth:progress=0:app=pi:msg=I1tmZz1yZWRd");
     assert_eq!(crate::format::expand_format("#{pane_ps_state}|#{pane_ps_kind}|#{pane_ps_progress}|#{pane_ps_app}", &app), "blocked|auth|0|pi");
-    assert_eq!(crate::format::expand_format("#{window_ps_attention}", &app), " [?%10]");
+    assert_eq!(crate::format::expand_format("#{window_ps_state}|#{window_ps_seen}", &app), "blocked|0");
     let frame = crate::server::helpers::list_windows_json_with_tabs(&app).unwrap();
     let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
     assert!(json[0].get("ps_panes").is_none());
     assert_eq!(listing(&app)[0]["ps_panes"][0]["records"][0]["msg"], "#[fg=red]");
     assert!(!json[0]["tab_text"].as_str().unwrap().contains("#[fg=red]"));
-    assert!(json[0]["tab_text"].as_str().unwrap().contains("[?%10]"));
+    assert!(json[0]["tab_text"].as_str().unwrap().contains("[blocked]"));
     let old: crate::util::WinInfo = serde_json::from_str(r#"{"id":1,"name":"old","active":true}"#).unwrap();
-    assert!(old.ps_attention.is_none());
+    assert!(old.ps_status.is_none());
     assert!(old.ps_panes.is_empty());
 }
 
@@ -297,19 +295,19 @@ fn copy_mode_inspects_and_acknowledges_live_records_and_respawn_withdraws_them()
     pane.term = Arc::new(Mutex::new(snapshot));
     report(pane, "state=error");
     assert_eq!(pane.term.lock().unwrap().screen().program_status().get("").unwrap().state, vt100::ProgramState::Working);
-    assert_eq!(window_attention(&app.windows[1]).unwrap().state, "error");
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "error");
     crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(window_status(&app.windows[1]).unwrap().seen);
     let before = version(&app);
     let pane = crate::tree::active_pane_mut(&mut app.windows[1].root, &path).unwrap();
     pane.live_parser().lock().unwrap().screen_mut().reinit_keep_history();
     assert_ne!(version(&app), before);
     report(get_pane(&app, 1, 0), "state=error");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().state, "error");
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "error");
 }
 
 #[test]
-fn floating_and_dead_retained_panes_participate_in_attention() {
+fn floating_and_dead_retained_panes_participate_in_status_selection() {
     let mut app = app();
     let mut floating = pane(99);
     floating.dead = true;
@@ -318,10 +316,10 @@ fn floating_and_dead_retained_panes_participate_in_attention() {
         pane: floating, id: 99, x: 1, y: 1, w: 20, h: 10,
         border: String::new(), title: String::new(), position: None, styles: Default::default(),
     });
-    assert_eq!(window_attention(&app.windows[1]).unwrap().pane, 99);
+    assert_eq!(window_status(&app.windows[1]).unwrap().pane, 99);
     app.windows[1].floating_focus = Some(0);
     crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(window_status(&app.windows[1]).unwrap().seen);
 }
 
 #[test]
@@ -345,9 +343,9 @@ fn program_status_option_is_off_by_default_and_the_single_switch() {
     for pane in [get_pane(&app, 1, 0), get_pane(&app, 1, 1)] {
         pane.live_parser().lock().unwrap().screen_mut().set_program_status_enabled(false);
     }
-    enable_attention(&mut app);
+    enable_status(&mut app);
     report(get_pane(&app, 1, 0), "state=blocked");
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(window_status(&app.windows[1]).is_none());
     assert!(window_records(&app.windows[1]).is_empty());
 
     // The option is the switch, and set -u restores off and withdraws records.
@@ -355,11 +353,123 @@ fn program_status_option_is_off_by_default_and_the_single_switch() {
     assert!(app.program_status);
     assert_eq!(crate::server::options::get_option_value(&app, "program-status"), "on");
     report(get_pane(&app, 1, 0), "state=blocked");
-    assert_eq!(window_attention(&app.windows[1]).unwrap().state, "blocked");
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "blocked");
     crate::server::options::reset_option_to_default(&mut app, "program-status");
     assert!(!app.program_status);
     assert_eq!(crate::server::options::get_option_value(&app, "program-status"), "off");
-    assert!(window_attention(&app.windows[1]).is_none());
+    assert!(window_status(&app.windows[1]).is_none());
     assert!(window_records(&app.windows[1]).is_empty());
     assert!(!crate::types::PROGRAM_STATUS_ENABLED.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn working_in_a_background_child_drives_the_window_summary_and_formats() {
+    let mut app = app();
+    enable_status(&mut app);
+    report(get_pane(&app, 1, 0), "state=idle:app=shell");
+    report(get_pane(&app, 1, 1), "state=idle:app=build");
+    report(get_pane(&app, 1, 1), "state=working:id=compile:progress=0:title=SGk=:msg=I1tmZz1yZWRd");
+    // A newer idle report in the selected pane must not hide background work.
+    report(get_pane(&app, 1, 0), "state=idle:app=newshell");
+    let summary = window_status(&app.windows[1]).unwrap();
+    assert_eq!((summary.pane, summary.id.as_str(), summary.state.as_str()), (21, "compile", "working"));
+    assert_eq!(summary.app.as_deref(), Some("build"));
+    assert_eq!(summary.progress, Some(0));
+    assert!(!summary.seen);
+    assert_eq!(crate::format::expand_format_for_window(
+        "#{window_ps_state}|#{window_ps_id}|#{window_ps_pane}|#{window_ps_progress}|#{window_ps_app}|#{window_ps_seen}", &app, 1),
+        "working|compile|%21|0|build|0");
+    assert_eq!(pane_format(get_pane(&app, 1, 1), "pane_ps_state"), "working");
+    assert_eq!(pane_format(get_pane(&app, 1, 1), "pane_ps_id"), "compile");
+    assert_eq!(pane_format(get_pane(&app, 1, 1), "pane_ps_app"), "build");
+    let frame: serde_json::Value = serde_json::from_str(&crate::server::helpers::list_windows_json_with_tabs(&app).unwrap()).unwrap();
+    assert_eq!(frame[1]["ps_status"]["state"], "working");
+    assert!(frame[1]["tab_text"].as_str().unwrap().contains("[working]"));
+    assert!(frame[1].get("ps_panes").is_none());
+    assert!(frame[1]["ps_status"].get("title").is_none());
+    assert!(frame[1]["ps_status"].get("msg").is_none());
+    let raw = listing(&app);
+    assert_eq!(raw[1]["ps_panes"][1]["records"].as_array().unwrap().len(), 2);
+    assert_eq!(raw[1]["ps_panes"][1]["records"][1]["msg"], "#[fg=red]");
+}
+
+#[test]
+fn window_and_pane_use_one_ordering_for_all_state_and_seen_combinations() {
+    // Low-priority idle/seen results share a bucket; newest semantic change wins.
+    let cases = [("idle", false, 0), ("done", true, 0), ("error", true, 0),
+        ("working", false, 1), ("done", false, 2), ("error", false, 3), ("blocked", false, 4)];
+    for (left_state, left_seen, left_rank) in cases {
+        for (right_state, right_seen, right_rank) in cases {
+            let app = app();
+            for (index, state, seen) in [(0, left_state, left_seen), (1, right_state, right_seen)] {
+                let pane = get_pane(&app, 1, index);
+                report(pane, &format!("state={state}"));
+                if seen { pane.live_parser().lock().unwrap().screen_mut().program_status_mut().acknowledge(); }
+            }
+            let expected = if left_rank > right_rank { 0 } else { 1 };
+            let summary = window_status(&app.windows[1]).unwrap();
+            assert_eq!(summary.pane, 20 + expected, "{left_state}/{left_seen} vs {right_state}/{right_seen}");
+            let pane = get_pane(&app, 1, expected);
+            assert_eq!(summary.state, pane_format(pane, "pane_ps_state"));
+            assert_eq!(u8::from(summary.seen).to_string(), pane_format(pane, "pane_ps_seen"));
+        }
+    }
+}
+
+#[test]
+fn acknowledgement_reveals_background_work_without_erasing_a_result() {
+    let mut app = app();
+    report(get_pane(&app, 1, 0), "state=done");
+    report(get_pane(&app, 1, 1), "state=working");
+    assert_eq!(window_status(&app.windows[1]).unwrap().state, "done");
+    let before = version(&app);
+    crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
+    assert_ne!(version(&app), before);
+    let summary = window_status(&app.windows[1]).unwrap();
+    assert_eq!(summary.state, "working");
+    assert_eq!(summary.pane, 21);
+    assert!(!summary.seen);
+    assert_eq!(pane_format(get_pane(&app, 1, 0), "pane_ps_state"), "done");
+    assert_eq!(pane_format(get_pane(&app, 1, 0), "pane_ps_seen"), "1");
+    report(get_pane(&app, 1, 1), "state=clear");
+    let summary = window_status(&app.windows[1]).unwrap();
+    assert_eq!(summary.state, "done");
+    assert!(summary.seen);
+}
+
+#[test]
+fn all_summary_changes_refresh_silent_frames_including_progress_and_seen() {
+    let mut app = app();
+    let mut cached_version = 0;
+    let mut cached = String::new();
+    crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached).unwrap();
+    for body in ["state=working:progress=0", "state=working:progress=75", "state=idle", "state=done"] {
+        report(get_pane(&app, 1, 0), body);
+        assert!(crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached).unwrap(), "{body}");
+        let frame: serde_json::Value = serde_json::from_str(&cached).unwrap();
+        assert!(frame[1].get("ps_status").is_some());
+        assert!(!frame[1]["activity"].as_bool().unwrap());
+    }
+    crate::copy_mode::switch_with_copy_save(&mut app, |app| app.active_idx = 1);
+    assert!(crate::server::helpers::refresh_program_status_tabs(&app, &mut cached_version, &mut cached).unwrap());
+    let frame: serde_json::Value = serde_json::from_str(&cached).unwrap();
+    assert_eq!(frame[1]["ps_status"]["seen"], true);
+    assert_eq!(frame[1]["ps_status"]["state"], "done");
+}
+
+#[test]
+fn summaries_expose_reported_state_and_seen_without_a_separate_category() {
+    let app = app();
+    report(get_pane(&app, 0, 0), "state=idle:app=pi");
+    report(get_pane(&app, 0, 0), "state=blocked:kind=permission:id=child");
+    assert_eq!(crate::format::expand_format(
+        "#{pane_ps_state}|#{pane_ps_id}|#{pane_ps_kind}|#{pane_ps_seen}|#{window_ps_state}|#{window_ps_id}|#{window_ps_kind}|#{window_ps_pane}|#{window_ps_seen}", &app),
+        "blocked|child|permission|0|blocked|child|permission|%10|0");
+    let json = listing(&app);
+    let summary = json[0]["ps_status"].as_object().unwrap();
+    let mut fields: Vec<_> = summary.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["app", "id", "kind", "pane", "progress", "seen", "state"]);
+    assert_eq!(summary["app"], "pi");
+    assert_eq!(json[0]["ps_panes"][0]["records"].as_array().unwrap().len(), 2);
 }

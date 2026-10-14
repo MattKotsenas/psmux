@@ -1763,17 +1763,9 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 "0".into()
             }
         }
-        "window_ps_attention_state" | "window_ps_attention_pane" | "window_ps_attention" => {
-            crate::program_status::window_attention(win).map_or(String::new(), |attention| {
-                match var {
-                    "window_ps_attention_state" => attention.state,
-                    "window_ps_attention_pane" => format!("%{}", attention.pane),
-                    _ => {
-                        let symbol = match attention.state.as_str() { "blocked" => "?", "error" => "!", _ => "+" };
-                        format!(" [{symbol}%{}]", attention.pane)
-                    }
-                }
-            })
+        "window_ps_state" | "window_ps_id" | "window_ps_pane" | "window_ps_kind" |
+        "window_ps_progress" | "window_ps_app" | "window_ps_seen" => {
+            crate::program_status::window_format(win, var)
         }
         "window_cell_width" => "8".into(),
         "window_cell_height" => "16".into(),
@@ -1786,8 +1778,8 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_id" => {
             if let Some(p) = target_pane() { format!("%{}", p.id) } else { "%0".into() }
         }
-        "pane_ps_state" | "pane_ps_kind" | "pane_ps_progress" | "pane_ps_app" |
-        "pane_ps_attention_state" | "pane_ps_attention_id" => {
+        "pane_ps_state" | "pane_ps_id" | "pane_ps_kind" | "pane_ps_progress" |
+        "pane_ps_app" | "pane_ps_seen" => {
             target_pane().map_or(String::new(), |p| crate::program_status::pane_format(p, var))
         }
         "pane_title" => {

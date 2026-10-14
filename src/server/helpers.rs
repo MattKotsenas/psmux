@@ -459,7 +459,7 @@ pub(crate) fn list_windows_json_with_tabs(app: &AppState) -> io::Result<String> 
             bell: w.bell_flag,
             last: i == app.last_window_idx,
             tab_text: tab,
-            ps_attention: crate::program_status::window_attention(w),
+            ps_status: crate::program_status::window_status(w),
             // Records stay out of the frame JSON: no client reads them, and
             // 64 records with full titles and messages made every pushed frame
             // about 150 KB. `list-windows -J` carries them for inspection.

@@ -1,6 +1,6 @@
 //! OSC 7501 records. Updates are validated before the store is touched.
 
-/// A state reported by a program, independent of attention presentation.
+/// A state reported by a program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgramState {
     /// At rest.
@@ -69,17 +69,35 @@ pub struct ProgramStatus {
     pub msg: Option<String>,
 }
 
+/// A stored report with psmux's acknowledgement and selection metadata.
 #[derive(Clone, Debug)]
-struct Record {
-    status: ProgramStatus,
-    seen: bool,
+pub struct ProgramRecord {
+    /// The application report; acknowledgement never rewrites its state.
+    pub status: ProgramStatus,
+    /// Whether this result has been acknowledged.
+    pub seen: bool,
     changed: std::time::Instant,
+}
+
+impl ProgramRecord {
+    /// Shared ordering for record, pane and window selection.
+    /// Idle and acknowledged results share the lowest priority.
+    pub fn rank(&self) -> (u8, std::time::Instant) {
+        let priority = match self.status.state {
+            ProgramState::Blocked => 4,
+            ProgramState::Error if !self.seen => 3,
+            ProgramState::Done if !self.seen => 2,
+            ProgramState::Working => 1,
+            _ => 0,
+        };
+        (priority, self.changed)
+    }
 }
 
 /// The live terminal's records, including shared acknowledgement state.
 #[derive(Clone, Debug, Default)]
 pub struct ProgramStatuses {
-    records: Vec<Record>,
+    records: Vec<ProgramRecord>,
     generation: u64,
 }
 
@@ -119,23 +137,11 @@ impl ProgramStatuses {
         }
     }
 
-    /// Blocked, unseen error, then unseen done; newest changed record breaks ties.
-    pub fn attention(&self) -> Option<&ProgramStatus> {
-        self.records.iter().filter_map(|r| {
-            let priority = match r.status.state {
-                ProgramState::Blocked => 3,
-                ProgramState::Error if !r.seen => 2,
-                ProgramState::Done if !r.seen => 1,
-                _ => return None,
-            };
-            Some(((priority, r.changed), &r.status))
-        }).max_by_key(|(key, _)| *key).map(|(_, status)| status)
-    }
-
-    /// Time the selected attention record last changed, for cross-pane ordering.
-    pub fn attention_changed(&self) -> Option<std::time::Instant> {
-        let id = &self.attention()?.id;
-        self.records.iter().find(|r| &r.status.id == id).map(|r| r.changed)
+    /// Select across all records, including working, idle and seen results.
+    /// Rank is shared with window selection; id makes equal-time ties stable
+    /// even when an identical retransmission changes eviction order.
+    pub fn summary(&self) -> Option<&ProgramRecord> {
+        self.records.iter().max_by(|a, b| (a.rank(), &a.status.id).cmp(&(b.rank(), &b.status.id)))
     }
 
     /// Mark every current completion/error seen without changing reported state.
@@ -181,7 +187,7 @@ impl ProgramStatuses {
             (false, std::time::Instant::now())
         };
         if self.records.len() == Self::CAPACITY { self.records.remove(0); }
-        self.records.push(Record { status, seen, changed });
+        self.records.push(ProgramRecord { status, seen, changed });
     }
 }
 
