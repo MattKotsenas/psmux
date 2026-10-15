@@ -91,7 +91,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "mouse" -Exp
 }
 
 Write-Test "set -g mouse off"
-& $PSMUX set-option -t $SESSION_NAME mouse off 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME mouse off 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "mouse" -Expected "off") {
     Write-Pass "mouse set to off"
 } else {
@@ -107,7 +107,7 @@ if (Wait-ForOption -Session $SESSION_NAME -Binary $PSMUX -Pattern "mouse off") {
 }
 
 Write-Test "set -g mouse on (restore)"
-& $PSMUX set-option -t $SESSION_NAME mouse on 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME mouse on 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "mouse" -Expected "on") {
     Write-Pass "mouse restored to on"
 } else {
@@ -127,7 +127,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index"
 }
 
 Write-Test "set -g base-index 0"
-& $PSMUX set-option -t $SESSION_NAME base-index 0 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME base-index 0 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index" -Expected "0") {
     Write-Pass "base-index set to 0"
 } else {
@@ -135,7 +135,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index"
 }
 
 Write-Test "set -g base-index 1 (restore)"
-& $PSMUX set-option -t $SESSION_NAME base-index 1 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME base-index 1 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index" -Expected "1") {
     Write-Pass "base-index restored to 1"
 } else {
@@ -147,7 +147,7 @@ Write-Host ""
 Write-Host "--- status-left option ---"
 
 Write-Test "set -g status-left '[#S] '"
-& $PSMUX set-option -t $SESSION_NAME status-left "[#S] " 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME status-left "[#S] " 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status-left" -Expected "[#S] ") {
     Write-Pass "status-left set to '[#S] '"
 } else {
@@ -168,7 +168,7 @@ Write-Host ""
 Write-Host "--- status-right option ---"
 
 Write-Test "set -g status-right '%H:%M %d-%b-%y'"
-& $PSMUX set-option -t $SESSION_NAME status-right "%H:%M %d-%b-%y" 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME status-right "%H:%M %d-%b-%y" 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status-right" -Expected "%H:%M %d-%b-%y") {
     Write-Pass "status-right set to '%H:%M %d-%b-%y'"
 } else {
@@ -181,7 +181,7 @@ Write-Host ""
 Write-Host "--- status-style option ---"
 
 Write-Test "set -g status-style 'bg=green,fg=black'"
-& $PSMUX set-option -t $SESSION_NAME status-style "bg=green,fg=black" 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME status-style "bg=green,fg=black" 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status-style" -Expected "bg=green,fg=black") {
     Write-Pass "status-style set correctly"
 } else {
@@ -190,7 +190,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status-styl
 }
 
 Write-Test "set -g status-style with different colors"
-& $PSMUX set-option -t $SESSION_NAME status-style "bg=blue,fg=white" 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME status-style "bg=blue,fg=white" 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status-style" -Expected "bg=blue,fg=white") {
     Write-Pass "status-style changed to bg=blue,fg=white"
 } else {
@@ -203,7 +203,7 @@ Write-Host ""
 Write-Host "--- cursor-style option ---"
 
 Write-Test "set -g cursor-style bar"
-& $PSMUX set-option -t $SESSION_NAME cursor-style bar 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME cursor-style bar 2>&1
 Start-Sleep -Milliseconds 500
 $v = (& $PSMUX show-options -v cursor-style -t $SESSION_NAME 2>&1) | Out-String
 $v = $v.Trim()
@@ -214,7 +214,7 @@ if ($v -eq "bar") {
 }
 
 Write-Test "set -g cursor-style block"
-& $PSMUX set-option -t $SESSION_NAME cursor-style block 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME cursor-style block 2>&1
 Start-Sleep -Milliseconds 500
 $v = (& $PSMUX show-options -v cursor-style -t $SESSION_NAME 2>&1) | Out-String
 $v = $v.Trim()
@@ -225,7 +225,7 @@ if ($v -eq "block") {
 }
 
 Write-Test "set -g cursor-style underline"
-& $PSMUX set-option -t $SESSION_NAME cursor-style underline 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME cursor-style underline 2>&1
 Start-Sleep -Milliseconds 500
 $v = (& $PSMUX show-options -v cursor-style -t $SESSION_NAME 2>&1) | Out-String
 $v = $v.Trim()
@@ -248,7 +248,7 @@ Write-Host ""
 Write-Host "--- cursor-blink option ---"
 
 Write-Test "set -g cursor-blink on"
-& $PSMUX set-option -t $SESSION_NAME cursor-blink on 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME cursor-blink on 2>&1
 Start-Sleep -Milliseconds 500
 $v = (& $PSMUX show-options -v cursor-blink -t $SESSION_NAME 2>&1) | Out-String
 $v = $v.Trim()
@@ -259,7 +259,7 @@ if ($v -eq "on") {
 }
 
 Write-Test "set -g cursor-blink off"
-& $PSMUX set-option -t $SESSION_NAME cursor-blink off 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME cursor-blink off 2>&1
 Start-Sleep -Milliseconds 500
 $v = (& $PSMUX show-options -v cursor-blink -t $SESSION_NAME 2>&1) | Out-String
 $v = $v.Trim()
@@ -290,7 +290,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "history-lim
 }
 
 Write-Test "set -g history-limit 9999"
-& $PSMUX set-option -t $SESSION_NAME history-limit 9999 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME history-limit 9999 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "history-limit" -Expected "9999") {
     Write-Pass "history-limit set to 9999"
 } else {
@@ -299,7 +299,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "history-lim
 }
 
 Write-Test "set -g history-limit 2000 (restore)"
-& $PSMUX set-option -t $SESSION_NAME history-limit 2000 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME history-limit 2000 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "history-limit" -Expected "2000") {
     Write-Pass "history-limit restored to 2000"
 } else {
@@ -311,7 +311,7 @@ Write-Host ""
 Write-Host "--- prediction-dimming option ---"
 
 Write-Test "set -g prediction-dimming off"
-& $PSMUX set-option -t $SESSION_NAME prediction-dimming off 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME prediction-dimming off 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "prediction-dimming" -Expected "off") {
     Write-Pass "prediction-dimming set to off"
 } else {
@@ -320,7 +320,7 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "prediction-
 }
 
 Write-Test "set -g prediction-dimming on"
-& $PSMUX set-option -t $SESSION_NAME prediction-dimming on 2>&1
+& $PSMUX set-option -g -t $SESSION_NAME prediction-dimming on 2>&1
 if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "prediction-dimming" -Expected "on") {
     Write-Pass "prediction-dimming restored to on"
 } else {

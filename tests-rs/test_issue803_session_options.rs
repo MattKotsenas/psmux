@@ -310,3 +310,19 @@ fn nested_toggle_round_trip_restores_the_users_values() {
         assert!(app.session_option_globals.is_empty());
     }
 }
+
+#[test]
+fn shadowed_global_flag_is_stored_as_on_or_off() {
+    // A -g write to a flag the session overrides went into the shadow as typed,
+    // so `show -g mouse` printed `true` instead of `on` (options.c prints flags
+    // as on/off whatever spelling set them).
+    let mut app = session();
+    set_s(&mut app, "mouse", "on");
+    for (typed, shown) in [("true", "on"), ("false", "off"), ("1", "on"), ("0", "off"), ("YES", "on"), ("no", "off")] {
+        set_g(&mut app, "mouse", typed);
+        assert_eq!(global(&app, "mouse"), shown, "set -g mouse {}", typed);
+        assert_eq!(session_value(&app, "mouse"), "on");
+    }
+    unset_s(&mut app, "mouse");
+    assert!(!app.mouse_enabled);
+}

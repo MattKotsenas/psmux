@@ -214,7 +214,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style block (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style block 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style = $style.Trim()
     if ($style -match "block") {
         Add-Result "TUI: cursor-style = block" $true "($style)"
@@ -226,7 +226,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style underline (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style underline 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style2 = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style2 = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style2 = $style2.Trim()
     if ($style2 -match "underline") {
         Add-Result "TUI: cursor-style = underline" $true "($style2)"
@@ -238,7 +238,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style bar (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style bar 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style3 = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style3 = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style3 = $style3.Trim()
     if ($style3 -match "bar") {
         Add-Result "TUI: cursor-style = bar" $true "($style3)"

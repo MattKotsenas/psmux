@@ -194,14 +194,15 @@ Test-Result "flag-g" ($show -match '\b42\b') "show='$show'"
 # -a (append) using SEPARATE -a flag
 Send-Tcp $sess "set-option -g status-right AAA" | Out-Null
 Send-Tcp $sess "set-option -a status-right BBB" | Out-Null
-$show = Send-Tcp $sess "show-options -g status-right"
+# -a without -g appends to the session's own value; the global stays AAA (tmux, #803)
+$show = Send-Tcp $sess "show-options status-right"
 Test-Result "flag-a-append" ($show -match 'AAABBB') "show='$show'"
 
 # Triple append using separate flags
 Send-Tcp $sess "set-option -g status-left X" | Out-Null
 Send-Tcp $sess "set-option -a status-left Y" | Out-Null
 Send-Tcp $sess "set-option -a status-left Z" | Out-Null
-$show = Send-Tcp $sess "show-options -g status-left"
+$show = Send-Tcp $sess "show-options status-left"
 Test-Result "flag-a-triple" ($show -match 'XYZ') "show='$show'"
 
 # -u (unset) on @user option using separate -u flag
@@ -218,7 +219,8 @@ Test-Result "flag-q-silent" ($resp -notmatch 'unknown option') "resp='$resp'"
 
 # -w (window scope) + verify accepted
 Send-Tcp $sess "set-option -w mouse on" | Out-Null
-$show = Send-Tcp $sess "show-options -g mouse"
+# mouse is a session option, so -w sets the session's value (tmux options_scope_from_name)
+$show = Send-Tcp $sess "show-options mouse"
 Test-Result "flag-w-accepted" ($show -match '\bon\b') "show='$show'"
 
 # -t target + verify applied

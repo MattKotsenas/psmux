@@ -349,7 +349,8 @@ if ($okOn -and $okOff) { Write-Pass "destroy-unattached set/show works" } else {
 
 Write-Test "13.3 unset destroy-unattached defaults to off"
 Psmux set -g destroy-unattached on | Out-Null
-Psmux set -u destroy-unattached | Out-Null
+# -gu unsets the GLOBAL; plain -u only drops a session value (tmux, #803)
+Psmux set -gu destroy-unattached | Out-Null
 $val = (& $PSMUX show-options -t $SESSION -g -v destroy-unattached 2>&1 | Out-String).Trim()
 if ($val -match "off") { Write-Pass "destroy-unattached unset -> off" } else { Write-Fail "destroy-unattached unset default wrong: $val" }
 

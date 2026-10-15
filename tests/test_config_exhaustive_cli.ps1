@@ -61,6 +61,11 @@ function CLI-Show($sess, $opt) {
     return $out.Trim()
 }
 
+function CLI-ShowSession($sess, $opt) {
+    $out = & $psmux show-options -t $sess $opt 2>&1 | Out-String
+    return $out.Trim()
+}
+
 function CLI-Set($sess, [string[]]$args_) {
     & $psmux set-option -t $sess @args_ 2>&1 | Out-Null
 }
@@ -197,14 +202,15 @@ Test-Result "cli-flag-g" ($show -match '\b42\b') "show='$show'"
 # -a (append) using separate flag
 CLI-Set $sess @('-g', 'status-right', 'AAA')
 & $psmux set-option -t $sess -a status-right BBB 2>&1 | Out-Null
-$show = CLI-Show $sess 'status-right'
+# -a without -g appends to the session's own value; the global stays AAA (tmux, #803)
+$show = CLI-ShowSession $sess 'status-right'
 Test-Result "cli-flag-a-append" ($show -match 'AAABBB') "show='$show'"
 
 # Triple append
 CLI-Set $sess @('-g', 'status-left', 'X')
 & $psmux set-option -t $sess -a status-left Y 2>&1 | Out-Null
 & $psmux set-option -t $sess -a status-left Z 2>&1 | Out-Null
-$show = CLI-Show $sess 'status-left'
+$show = CLI-ShowSession $sess 'status-left'
 Test-Result "cli-flag-a-triple" ($show -match 'XYZ') "show='$show'"
 
 # -u (unset) on @user option using separate flag
@@ -222,7 +228,8 @@ Test-Result "cli-flag-q-silent" ($show -match 'mouse') "Server still alive: show
 
 # -w (window scope)
 & $psmux set-option -t $sess -w mouse on 2>&1 | Out-Null
-$show = CLI-Show $sess 'mouse'
+# mouse is a session option, so -w sets the session's value (tmux options_scope_from_name)
+$show = CLI-ShowSession $sess 'mouse'
 Test-Result "cli-flag-w" ($show -match '\bon\b') "show='$show'"
 
 # -t target

@@ -108,7 +108,8 @@ Test-Result "tcp-combined-au-unset" ($r.ok -and $r.resp -ne 'au_val') "resp='$($
 Write-Test "TCP -qa set-option quiet+append"
 Send-Tcp "set-option -g status-left QA1" | Out-Null
 Send-Tcp "set-option -qa status-left QA2" | Out-Null
-$r = Send-Tcp "show-options -gqv status-left"
+# -a without -g appends to the session's own value, the global keeps QA1 (tmux, #803)
+$r = Send-Tcp "show-options -qv status-left"
 Test-Result "tcp-combined-qa-append" ($r.ok -and $r.resp -eq 'QA1QA2') "resp='$($r.resp)'"
 
 # -go (combined only-if-unset: existing value preserved)
@@ -135,7 +136,7 @@ Write-Host "`n=== 2. TCP SEPARATED FLAGS ===" -ForegroundColor Cyan
 Write-Test "TCP separated -a append"
 Send-Tcp "set-option -g status-right SEP_A" | Out-Null
 Send-Tcp "set-option -a status-right SEP_B" | Out-Null
-$r = Send-Tcp "show-options -gqv status-right"
+$r = Send-Tcp "show-options -qv status-right"
 Test-Result "tcp-separated-a-append" ($r.ok -and $r.resp -eq 'SEP_ASEP_B') "resp='$($r.resp)'"
 
 # -u (separated unset)
@@ -189,7 +190,7 @@ Write-Host "`n=== 4. CLI SEPARATED FLAGS ===" -ForegroundColor Cyan
 Write-Test "CLI separated -a append"
 CLI-Set @('-g', 'status-right', 'CS_A')
 & $psmux set-option -a status-right CS_B -t $SESSION 2>&1 | Out-Null
-$r = CLI-Show 'status-right'
+$r = (& $psmux show-options -qv -t $SESSION status-right 2>&1 | Out-String).Trim()
 Test-Result "cli-separated-a-append" ($r -eq 'CS_ACS_B') "resp='$r'"
 
 # -u via CLI

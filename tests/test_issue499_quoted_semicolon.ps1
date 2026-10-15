@@ -196,7 +196,7 @@ else { Write-Fail "expected 'a ; b ; c ; d', got '$e3'" }
 # A realistic user value: status-left with a semicolon.
 & $PSMUX set-option -t $SESSION 'status-left' "[#S] ; ready" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 600
-$sl = (& $PSMUX show-options -g -v status-left -t $SESSION 2>&1 | Out-String).TrimEnd("`r", "`n")
+$sl = (& $PSMUX show-options -v status-left -t $SESSION 2>&1 | Out-String).TrimEnd("`r", "`n")
 if ($sl -match "ready") { Write-Pass "status-left with ';' round-trips: '$sl'" }
 else { Write-Fail "status-left lost its tail: '$sl'" }
 

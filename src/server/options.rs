@@ -473,12 +473,18 @@ pub(crate) fn global_session_option_value(app: &AppState, name: &str) -> String 
     }
 }
 
-/// A shadowed global is stored as text, so spell a key the way `show` would.
+/// A shadowed global is stored as text, so spell a key or a flag the way
+/// `show` would (a flag is `on` or `off`, options_to_string in options.c).
 fn canonical_global_value(name: &str, value: &str) -> String {
     match name {
         "prefix" | "prefix2" if !value.is_empty() => crate::config::parse_option_key(value, false)
             .map(|key| crate::config::format_option_key(&key))
             .unwrap_or_else(|_| value.to_string()),
+        _ if is_boolean_option(name) => match value.to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" | "yes" => "on".to_string(),
+            "off" | "false" | "0" | "no" => "off".to_string(),
+            _ => value.to_string(),
+        },
         _ => value.to_string(),
     }
 }

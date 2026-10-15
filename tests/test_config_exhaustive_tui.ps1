@@ -250,7 +250,10 @@ function Test-TuiOption {
     Focus-PsmuxWindow | Out-Null
     Send-PsmuxCommand $SetCmd
     Start-Sleep -Milliseconds 300
-    $r = Send-TcpCommand $SESSION "show-options -g $ShowOpt"
+    # Read the table the set wrote: a set without -g gives the session its own
+    # value and leaves the global alone (tmux, #803), so `show -g` would not see it.
+    $showScope = if ($SetCmd -match '\s-[a-zA-Z]*g') { '-g ' } else { '' }
+    $r = Send-TcpCommand $SESSION "show-options $showScope$ShowOpt"
     if ($r.ok -and $r.resp -match $ExpectedPattern) {
         Write-Pass "$Label"
     } else {
