@@ -2412,7 +2412,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 return app.named_buffers.get(name).map(|b| b.len().to_string()).unwrap_or("0".into());
             }
             let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
-            app.paste_buffers.get(idx).map(|b| b.len().to_string()).unwrap_or("0".into())
+            app.paste_buffers.get(idx).map(|b| b.data.len().to_string()).unwrap_or("0".into())
         }
         "buffer_sample" => {
             let named = NAMED_BUFFER_OVERRIDE.with(|c| c.borrow().clone());
@@ -2420,7 +2420,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 return app.named_buffers.get(name).map(|b| b.chars().take(50).collect::<String>()).unwrap_or_default();
             }
             let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
-            app.paste_buffers.get(idx).map(|b| b.chars().take(50).collect::<String>()).unwrap_or_default()
+            app.paste_buffers.get(idx).map(|b| b.data.chars().take(50).collect::<String>()).unwrap_or_default()
         }
         "buffer_name" => {
             let named = NAMED_BUFFER_OVERRIDE.with(|c| c.borrow().clone());
@@ -2428,7 +2428,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                 return name;
             }
             let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
-            if idx < app.paste_buffers.len() { format!("buffer{:04}", idx) } else { String::new() }
+            app.paste_buffers.get(idx).map(|b| b.name.clone()).unwrap_or_default()
         }
         "buffer_created" => app.created_at.timestamp().to_string(),
 
