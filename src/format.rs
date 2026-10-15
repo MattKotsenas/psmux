@@ -10,8 +10,8 @@
 use std::env;
 use std::cell::{Cell, RefCell};
 
-use crate::types::{AppState, Node, LayoutKind, Pane, Mode, VERSION};
-use crate::tree::{split_with_gaps, get_active_pane_id, active_pane, count_panes};
+use crate::types::{AppState, Node, Pane, Mode, VERSION};
+use crate::tree::{get_active_pane_id, active_pane, count_panes};
 
 // Thread-local override for per-pane format expansion in list-panes.
 // When set to Some(pos), pane_* variables resolve for the Nth pane (0-based)
@@ -178,60 +178,6 @@ pub fn set_named_buffer_override(name: Option<String>) {
     NAMED_BUFFER_OVERRIDE.with(|c| *c.borrow_mut() = name);
 }
 
-// ─────────────────── tmux window_layout generation ────────────────────
-
-/// Generate a tmux-compatible window_layout string from the pane tree.
-/// Format: `<checksum>,<layout_body>`
-/// Body examples:
-///   Single pane:  `80x24,0,0,0`
-///   Horiz split:  `80x24,0,0{40x24,0,0,0,39x24,41,0,1}`
-///   Vert split:   `80x24,0,0[80x12,0,0,0,80x11,0,13,1]`
-pub fn generate_window_layout(node: &Node, area: ratatui::prelude::Rect) -> String {
-    let body = layout_node(node, area);
-    let checksum = tmux_layout_checksum(&body);
-    format!("{:04x},{}", checksum, body)
-}
-
-fn layout_node(node: &Node, area: ratatui::prelude::Rect) -> String {
-    match node {
-        Node::Leaf(pane) => {
-            // WxH,X,Y,pane_id
-            format!("{}x{},{},{},{}", area.width, area.height, area.x, area.y, pane.id)
-        }
-        Node::Split { kind, sizes, children } => {
-            let is_horizontal = matches!(*kind, LayoutKind::Horizontal);
-            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-                sizes.clone()
-            } else {
-                vec![(100 / children.len().max(1)) as u16; children.len()]
-            };
-            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-            
-            let (open, close) = if is_horizontal { ('{', '}') } else { ('[', ']') };
-            
-            let mut inner = String::new();
-            for (i, child) in children.iter().enumerate() {
-                if i > 0 { inner.push(','); }
-                if i < rects.len() {
-                    inner.push_str(&layout_node(child, rects[i]));
-                }
-            }
-            
-            format!("{}x{},{},{}{}{}{}", area.width, area.height, area.x, area.y, open, inner, close)
-        }
-    }
-}
-
-/// Compute tmux layout checksum (16-bit CSUM as used by tmux src/layout-custom.c).
-fn tmux_layout_checksum(layout: &str) -> u16 {
-    let mut csum: u16 = 0;
-    for &b in layout.as_bytes() {
-        csum = (csum >> 1) | ((csum & 1) << 15); // rotate right 1 bit
-        csum = csum.wrapping_add(b as u16);
-    }
-    csum
-}
-
 // ─────────────────────────── public API ───────────────────────────
 
 /// Expand tmux format strings for the active window.
@@ -262,6 +208,25 @@ pub fn expand_format_untimed(fmt: &str, app: &AppState) -> String {
 /// every targeted window as active).
 fn real_active_idx(app: &AppState) -> usize {
     app.temp_focus_saved_active.unwrap_or(app.active_idx)
+}
+
+/// #{pane_tabs} for a pane `cols` wide: the default tab stops, one every 8
+/// columns from column 8 (tmux screen_reset_tabs), comma separated.
+pub fn pane_tab_stops(cols: u16) -> String {
+    (8..cols).step_by(8).map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// #{window_raw_flags} of window `win_idx` (tmux window_printable_flags).
+pub fn window_raw_flags(app: &AppState, win_idx: usize) -> String {
+    let mut f = String::new();
+    let Some(win) = app.windows.get(win_idx) else { return f };
+    if win_idx == real_active_idx(app) { f.push('*'); }
+    else if win_idx == app.last_window_idx { f.push('-'); }
+    if win.zoom_saved.is_some() { f.push('Z'); }
+    if win.activity_flag { f.push('#'); }
+    if win.bell_flag { f.push('!'); }
+    if win.silence_flag { f.push('~'); }
+    f
 }
 
 /// Expand tmux format strings for a specific window index.
@@ -1742,20 +1707,15 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         // tmux counts floating panes too: format_cb_window_panes is
         // window_count_panes(w, 1), with_floating set (#767).
         "window_panes" => (tiled_count + win.floating.len()).to_string(),
-        "window_flags" | "window_raw_flags" => {
-            let mut f = String::new();
-            if win_idx == real_active_idx(app) { f.push('*'); }
-            else if win_idx == app.last_window_idx { f.push('-'); }
-            if win.zoom_saved.is_some() { f.push('Z'); }
-            if win.activity_flag { f.push('#'); }
-            if win.bell_flag { f.push('!'); }
-            if win.silence_flag { f.push('~'); }
-            f
-        }
+        "window_flags" | "window_raw_flags" => window_raw_flags(app, win_idx),
         "window_id" => format!("@{}", win.id),
         "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
         "window_zoomed_flag" => if win.zoom_saved.is_some() { "1".into() } else { "0".into() },
-        "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, win.area),
+        // tmux format_cb_window_layout / format_cb_window_visible_layout:
+        // while zoomed the first is the real split, the second the zoomed
+        // pane alone (#824).
+        "window_layout" => crate::control::window_layout_string(win, win.area),
+        "window_visible_layout" => crate::control::window_visible_layout_string(win, win.area),
         "window_width" => win.area.width.to_string(),
         "window_height" => win.area.height.to_string(),
         "window_format" => "1".into(),
@@ -2204,7 +2164,14 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_start_command" => target_pane()
             .map(|p| crate::pane::start_command_display(&p.start_command))
             .unwrap_or_default(),
-        "pane_start_path" | "pane_tabs" => String::new(),
+        "pane_start_path" => String::new(),
+        // tmux format_cb_pane_tabs lists the set tab stops of the pane's
+        // screen.  The pane emulator keeps the default stops only (every 8
+        // columns from column 8, as tmux screen_reset_tabs sets them), so
+        // they follow from the pane width (#827).
+        "pane_tabs" => target_pane()
+            .map(|p| pane_tab_stops(p.last_cols))
+            .unwrap_or_default(),
         "pane_fg" => {
             if let Some(p) = target_pane() {
                 if let Ok(parser) = p.term.lock() {

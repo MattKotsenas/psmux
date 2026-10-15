@@ -8165,10 +8165,12 @@ fn dispatch_control_command(
             let _ = resp_tx.send(String::new());
             true
         }
-        // Copy mode in tmux control sessions is a no-op for iTerm2 — iTerm
-        // implements its own copy mode locally on captured pane content.
-        // Returning success keeps iTerm's command pipeline alive.
+        // tmux cmd-copy-mode.c puts the target pane in copy mode whichever
+        // client asks, a control client included (#827); the control client
+        // hears it as %pane-mode-changed (control::sync_window_changes).
+        // Same request, flags and -t routing as the one-shot route.
         "copy-mode" => {
+            let _ = tx.send(CtrlReq::CopyModeCmd(crate::copy_mode::CopyModeFlags::parse(args)));
             let _ = resp_tx.send(String::new());
             true
         }

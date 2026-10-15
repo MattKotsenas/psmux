@@ -6,7 +6,7 @@
 use super::*;
 
 fn snap(ids: &[usize], current: usize) -> WindowSnapshot {
-    WindowSnapshot { ids: ids.to_vec(), current: Some(current) }
+    WindowSnapshot { ids: ids.to_vec(), current: Some(current), pane_modes: Vec::new() }
 }
 
 fn lines(before: &WindowSnapshot, after: &WindowSnapshot) -> Vec<String> {
@@ -50,7 +50,7 @@ fn select_window_and_no_op() {
 
 #[test]
 fn last_window_gone_announces_only_the_close() {
-    let after = WindowSnapshot { ids: vec![], current: None };
+    let after = WindowSnapshot { ids: vec![], current: None, pane_modes: Vec::new() };
     assert_eq!(lines(&snap(&[7], 7), &after), vec!["%window-close @7"]);
 }
 

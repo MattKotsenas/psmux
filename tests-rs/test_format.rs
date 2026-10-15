@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::LayoutKind;
 
 fn mock_app() -> AppState {
     let mut app = AppState::new("test_session".to_string());

@@ -4264,7 +4264,26 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(reply);
                     echo_pending_until = Some(Instant::now());
                 }
-                CtrlReq::ZoomPane => { toggle_zoom(&mut app); state_dirty = true; meta_dirty = true; hook_event = Some("after-resize-pane"); }
+                CtrlReq::ZoomPane => {
+                    toggle_zoom(&mut app);
+                    // tmux window_zoom makes the zoomed pane its window's
+                    // active pane (window_set_active_pane), so a `-t` zoom of
+                    // another pane keeps that pane active once the request's
+                    // temporary focus is put back; otherwise the window showed
+                    // the zoomed pane while another one was active (#824).
+                    let win = &mut app.windows[app.active_idx];
+                    if win.zoom_saved.is_some() {
+                        if let Some(pid) = get_active_pane_id(&win.root, &win.active_path) {
+                            crate::tree::touch_mru(&mut win.pane_mru, pid);
+                            if let Some(saved) = temp_focus_restore.as_mut() {
+                                if saved.active_idx == app.active_idx {
+                                    saved.pane_id = pid;
+                                }
+                            }
+                        }
+                    }
+                    state_dirty = true; meta_dirty = true; hook_event = Some("after-resize-pane");
+                }
                 // tmux: the prefix forces a switch to the prefix table, which
                 // drops any `switch-client -T` latch (issue #640).
                 CtrlReq::PrefixBegin => { app.client_prefix_active = true; app.current_key_table = None; state_dirty = true; }
@@ -8026,12 +8045,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         Ok(resized) => {
                             state_dirty = true;
                             meta_dirty = true;
-                            if let Some(window) = app.windows.get(resized.window_index) {
-                                let layout = control::window_layout_string(window, resized.area);
-                                control::emit_notification(&app, crate::types::ControlNotification::LayoutChange {
-                                    window_id: resized.window_id,
-                                    layout,
-                                });
+                            if let Some(n) = control::layout_change(&app, resized.window_index, resized.area) {
+                                control::emit_notification(&app, n);
                             }
                             let _ = resp.send(Ok(()));
                         }
@@ -8070,14 +8085,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         state_dirty = true;
                         meta_dirty = true;
-                        for window in app.windows.iter().filter(|window| {
+                        for (idx, window) in app.windows.iter().enumerate().filter(|(_, window)| {
                             old_areas.get(&window.id).copied() != Some(window.area)
                         }) {
-                            let layout = control::window_layout_string(window, window.area);
-                            control::emit_notification(&app, crate::types::ControlNotification::LayoutChange {
-                                window_id: window.id,
-                                layout,
-                            });
+                            if let Some(n) = control::layout_change(&app, idx, window.area) {
+                                control::emit_notification(&app, n);
+                            }
                         }
                     }
                 }
@@ -8534,16 +8547,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         "after-split-window" | "after-resize-pane" | "after-break-pane"
                         | "after-join-pane" | "after-rotate-window" | "after-swap-pane" => {
-                            let layout = if let Some(w) = app.windows.iter().find(|w| w.id == win_id) {
-                                control::window_layout_string(w, w.area)
-                            } else {
-                                let area = app.last_window_area;
-                                format!("0000,{}x{},0,0", area.width, area.height)
-                            };
-                            control::emit_notification(&app, crate::types::ControlNotification::LayoutChange {
-                                window_id: win_id,
-                                layout,
-                            });
+                            let n = app.windows.iter().position(|w| w.id == win_id)
+                                .and_then(|idx| control::layout_change(&app, idx, app.windows[idx].area))
+                                .unwrap_or_else(|| {
+                                    let area = app.last_window_area;
+                                    let layout = format!("0000,{}x{},0,0", area.width, area.height);
+                                    crate::types::ControlNotification::LayoutChange {
+                                        window_id: win_id,
+                                        visible_layout: layout.clone(),
+                                        layout,
+                                        flags: String::new(),
+                                    }
+                                });
+                            control::emit_notification(&app, n);
                         }
                         _ => {}
                     }
@@ -9036,15 +9052,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // Notify any attached control-mode clients about the diff.
                 if !app.control_clients.is_empty() {
                     for (win_id, prev_active, prev_leaves) in &pre_reap {
-                        if let Some(w) = app.windows.iter().find(|w| w.id == *win_id) {
+                        if let Some((w_idx, w)) = app.windows.iter().enumerate().find(|(_, w)| w.id == *win_id) {
                             let new_leaves = tree::count_panes(&w.root);
                             let new_active = tree::get_active_pane_id(&w.root, &w.active_path);
                             if new_leaves != *prev_leaves {
-                                let layout = control::window_layout_string(w, w.area);
-                                control::emit_notification(&app, crate::types::ControlNotification::LayoutChange {
-                                    window_id: *win_id,
-                                    layout,
-                                });
+                                if let Some(n) = control::layout_change(&app, w_idx, w.area) {
+                                    control::emit_notification(&app, n);
+                                }
                             }
                             if new_active != *prev_active {
                                 if let Some(pid) = new_active {

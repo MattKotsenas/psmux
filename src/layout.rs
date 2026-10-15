@@ -1513,6 +1513,24 @@ pub fn parse_tmux_layout_string(layout_str: &str, panes: &mut Vec<Node>) -> Opti
     layout_node_to_node(&layout, panes)
 }
 
+/// The split weights for a parsed split's children: each child's cell size
+/// along the split axis.  `split_with_gaps` hands out the parent's cells less
+/// the borders in proportion to the weights, and the children of a tmux
+/// layout cell add up to exactly that, so the cells come back as written
+/// (tmux layout_parse applies them as is).  Rounding them to percentages
+/// moved the split by a cell (#827).
+pub fn layout_split_weights(kind: LayoutKind, children: &[LayoutNode]) -> Vec<u16> {
+    let dims: Vec<u16> = children.iter().map(|c| match kind {
+        LayoutKind::Horizontal => c.width(),
+        LayoutKind::Vertical => c.height(),
+    }).collect();
+    if dims.iter().all(|&d| d == 0) {
+        let n = children.len().max(1) as u16;
+        return vec![100 / n; children.len()];
+    }
+    dims
+}
+
 /// Convert a LayoutNode descriptor tree into a Node tree,
 /// consuming panes from the vec in left-to-right leaf order.
 fn layout_node_to_node(layout: &LayoutNode, panes: &mut Vec<Node>) -> Option<Node> {
@@ -1522,25 +1540,7 @@ fn layout_node_to_node(layout: &LayoutNode, panes: &mut Vec<Node>) -> Option<Nod
             Some(panes.remove(0))
         }
         LayoutNode::Split { kind, children, .. } => {
-            let total_size: u32 = match kind {
-                LayoutKind::Horizontal => children.iter().map(|c| c.width() as u32).sum(),
-                LayoutKind::Vertical => children.iter().map(|c| c.height() as u32).sum(),
-            };
-            let sizes: Vec<u16> = if total_size == 0 {
-                let n = children.len().max(1) as u16;
-                vec![100 / n; children.len()]
-            } else {
-                let mut szs: Vec<u16> = children.iter().map(|c| {
-                    let dim = match kind {
-                        LayoutKind::Horizontal => c.width() as u32,
-                        LayoutKind::Vertical => c.height() as u32,
-                    };
-                    (dim * 100 / total_size) as u16
-                }).collect();
-                let sum: u16 = szs.iter().sum();
-                if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
-                szs
-            };
+            let sizes = layout_split_weights(*kind, children);
             let mut nodes = Vec::with_capacity(children.len());
             for child in children {
                 nodes.push(layout_node_to_node(child, panes)?);

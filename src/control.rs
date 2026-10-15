@@ -17,7 +17,11 @@ fn layout_checksum(s: &str) -> u16 {
 ///   Leaf:           WxH,X,Y,paneid
 ///   Side-by-side:   WxH,X,Y{child1,child2,...}     (LayoutKind::Horizontal)
 ///   Stacked:        WxH,X,Y[child1,child2,...]     (LayoutKind::Vertical)
-fn append_layout_body(node: &Node, area: Rect, out: &mut String) {
+///
+/// `saved` is a zoomed window's `zoom_saved`: the real split sizes along the
+/// zoomed pane's path, which the live tree has replaced with 100/0 while the
+/// window is zoomed.  `path` is the child index path of `node`.
+fn append_layout_body(node: &Node, area: Rect, saved: &[(Vec<usize>, Vec<u16>)], path: &mut Vec<usize>, out: &mut String) {
     match node {
         Node::Leaf(pane) => {
             out.push_str(&format!("{}x{},{},{},{}", area.width, area.height, area.x, area.y, pane.id));
@@ -27,6 +31,10 @@ fn append_layout_body(node: &Node, area: Rect, out: &mut String) {
                 out.push_str(&format!("{}x{},{},{}", area.width, area.height, area.x, area.y));
                 return;
             }
+            let sizes = saved.iter()
+                .find(|(p, sz)| p == path && sz.len() == children.len())
+                .map(|(_, sz)| sz)
+                .unwrap_or(sizes);
             let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
                 sizes.clone()
             } else {
@@ -40,20 +48,55 @@ fn append_layout_body(node: &Node, area: Rect, out: &mut String) {
             for (i, child) in children.iter().enumerate() {
                 if i > 0 { out.push(','); }
                 let r = rects.get(i).copied().unwrap_or(area);
-                append_layout_body(child, r, out);
+                path.push(i);
+                append_layout_body(child, r, saved, path, out);
+                path.pop();
             }
             out.push(close);
         }
     }
 }
 
-/// Build a complete tmux layout string for a window: `<csum>,<body>`.
-/// `area` is the target window's stored geometry.
+fn checksummed(body: String) -> String {
+    format!("{:04x},{}", layout_checksum(&body), body)
+}
+
+/// A window's #{window_layout} (`<csum>,<body>`): the real split, also while
+/// the window is zoomed (tmux format_cb_window_layout dumps saved_layout_root
+/// when it is set).  `area` is the target window's stored geometry.
 pub fn window_layout_string(window: &Window, area: Rect) -> String {
     let mut body = String::new();
-    append_layout_body(&window.root, area, &mut body);
-    let csum = layout_checksum(&body);
-    format!("{:04x},{}", csum, body)
+    let saved: &[(Vec<usize>, Vec<u16>)] = window.zoom_saved.as_deref().unwrap_or(&[]);
+    append_layout_body(&window.root, area, saved, &mut Vec::new(), &mut body);
+    checksummed(body)
+}
+
+/// A window's #{window_visible_layout}: what is on screen.  While zoomed that
+/// is the zoomed pane alone at the window size (tmux window_zoom makes
+/// layout_root layout_init(w, wp), and format_cb_window_visible_layout dumps
+/// layout_root); otherwise it is the same as #{window_layout}.
+pub fn window_visible_layout_string(window: &Window, area: Rect) -> String {
+    if window.zoom_saved.is_some() {
+        if let Some(id) = crate::tree::get_active_pane_id(&window.root, &window.active_path) {
+            return checksummed(format!("{}x{},{},{},{}", area.width, area.height, area.x, area.y, id));
+        }
+    }
+    let mut body = String::new();
+    append_layout_body(&window.root, area, &[], &mut Vec::new(), &mut body);
+    checksummed(body)
+}
+
+/// The `%layout-change` for window `win_idx`, as tmux
+/// control_window_layout_changed_cb sends it: "#{window_id} #{window_layout}
+/// #{window_visible_layout} #{window_raw_flags}".
+pub fn layout_change(app: &AppState, win_idx: usize, area: Rect) -> Option<ControlNotification> {
+    let window = app.windows.get(win_idx)?;
+    Some(ControlNotification::LayoutChange {
+        window_id: window.id,
+        layout: window_layout_string(window, area),
+        visible_layout: window_visible_layout_string(window, area),
+        flags: crate::format::window_raw_flags(app, win_idx),
+    })
 }
 
 /// Format a control mode notification as a tmux wire-compatible line.
@@ -74,10 +117,9 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::WindowPaneChanged { window_id, pane_id } => {
             format!("%window-pane-changed @{} %{}", window_id, pane_id)
         }
-        ControlNotification::LayoutChange { window_id, layout } => {
+        ControlNotification::LayoutChange { window_id, layout, visible_layout, flags } => {
             // tmux sends: %layout-change @WID layout visible_layout flags
-            // visible_layout and flags mirror layout and empty flags for now
-            format!("%layout-change @{} {} {} *", window_id, layout, layout)
+            format!("%layout-change @{} {} {} {}", window_id, layout, visible_layout, flags)
         }
         ControlNotification::SessionChanged { session_id, name } => {
             format!("%session-changed ${} {}", session_id, name)
@@ -269,13 +311,61 @@ pub fn has_control_clients(app: &AppState) -> bool {
 pub struct WindowSnapshot {
     pub ids: Vec<usize>,
     pub current: Option<usize>,
+    /// Every pane in a mode, with the mode's name (`pane_modes`).
+    pub pane_modes: Vec<(usize, &'static str)>,
 }
 
 pub fn window_snapshot(app: &AppState) -> WindowSnapshot {
     WindowSnapshot {
         ids: app.windows.iter().map(|w| w.id).collect(),
         current: app.windows.get(app.active_idx).map(|w| w.id),
+        pane_modes: pane_modes(app),
     }
+}
+
+/// The panes that are in a mode and which mode, by the same rule as
+/// #{pane_mode}: the focused pane's mode is `app.mode`, every other pane's is
+/// the copy mode parked in its `copy_state`.
+pub fn pane_modes(app: &AppState) -> Vec<(usize, &'static str)> {
+    let focused = crate::copy_mode::active_pane_id(app);
+    let focused_mode = if app.mode.in_copy() {
+        Some("copy-mode")
+    } else if matches!(app.mode, crate::types::Mode::ClockMode) {
+        Some("clock-mode")
+    } else {
+        None
+    };
+    let mut out = Vec::new();
+    for win in &app.windows {
+        crate::tree::for_each_pane(&win.root, &mut |p| {
+            let mode = if Some(p.id) == focused {
+                focused_mode
+            } else if p.copy_state.is_some() {
+                Some("copy-mode")
+            } else {
+                None
+            };
+            if let Some(m) = mode { out.push((p.id, m)); }
+        });
+    }
+    out.sort_unstable();
+    out
+}
+
+/// `%pane-mode-changed %N` for every pane whose mode changed between two
+/// snapshots: entered, left, or swapped for another (tmux fires
+/// pane-mode-changed from window_pane_set_mode and window_pane_reset_mode,
+/// control-notify.c control_pane_mode_changed_cb).
+pub fn pane_mode_notifications(
+    before: &[(usize, &'static str)],
+    after: &[(usize, &'static str)],
+) -> Vec<ControlNotification> {
+    let mut ids: Vec<usize> = before.iter().filter(|e| !after.contains(e)).map(|e| e.0)
+        .chain(after.iter().filter(|e| !before.contains(e)).map(|e| e.0))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter().map(|pane_id| ControlNotification::PaneModeChanged { pane_id }).collect()
 }
 
 /// The window notifications between two snapshots, in tmux's order: a window
@@ -314,6 +404,9 @@ pub fn sync_window_changes(app: &mut AppState) {
     if let Some(before) = app.control_windows_seen.take() {
         if !app.control_clients.is_empty() {
             for notif in window_change_notifications(&before, &now, app.session_id) {
+                emit_notification(app, notif);
+            }
+            for notif in pane_mode_notifications(&before.pane_modes, &now.pane_modes) {
                 emit_notification(app, notif);
             }
         }
@@ -684,6 +777,8 @@ mod tests {
         let line = format_notification(&ControlNotification::LayoutChange {
             window_id: 2,
             layout: "5e08,120x30,0,0,1".to_string(),
+            visible_layout: "5e08,120x30,0,0,1".to_string(),
+            flags: "*".to_string(),
         });
         // tmux format: %layout-change @WID layout visible_layout flags
         assert_eq!(line, "%layout-change @2 5e08,120x30,0,0,1 5e08,120x30,0,0,1 *");
@@ -929,3 +1024,7 @@ mod tests_issue811_window_notifications;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue825_control_detach.rs"]
 mod tests_issue825_control_detach;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue824_827_cc.rs"]
+mod tests_issue824_827_cc;
