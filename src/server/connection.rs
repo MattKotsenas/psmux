@@ -882,10 +882,13 @@ fn capture_pane_special(
         styled: has('e'),
         preserve_trailing: has('N'),
     });
-    Some(match rrx.recv_timeout(Duration::from_secs(5)).ok().flatten() {
-        Some(text) => Ok(text),
-        None if has('q') => Ok(String::new()),
-        None => Err("no alternate screen".to_string()),
+    // A wait that runs out is the timeout error, not "no alternate screen"
+    // (the same rule as the user option read, issue #832).
+    Some(match rrx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Some(text)) => Ok(text),
+        Err(_) => Err("no response from server (timed out)".to_string()),
+        Ok(None) if has('q') => Ok(String::new()),
+        Ok(None) => Err("no alternate screen".to_string()),
     })
 }
 
@@ -5160,13 +5163,17 @@ match cmd {
             };
             let (rtx, rrx) = mpsc::channel::<Option<(String, bool)>>();
             let _ = tx.send(CtrlReq::UserOptionLookup(rtx, name.to_string(), target_window.clone(), table));
-            let found = rrx.recv_timeout(Duration::from_millis(2000)).ok().flatten();
-            let output = match found {
-                Some((value, inherited)) => {
+            // A wait that runs out is not "not set": answering empty (or
+            // "invalid option") for a key that is set left a script no way to
+            // tell a busy server from an unset option (issue #832). It is the
+            // client's own timeout error, and -q does not hide it.
+            let output = match rrx.recv_timeout(Duration::from_millis(2000)) {
+                Ok(Some((value, inherited))) => {
                     crate::server::options::render_user_option_line(name, &value, inherited, has_v)
                 }
-                None if has_q => String::new(),
-                None => format!("ERROR: invalid option: {}\n", name),
+                Err(_) => "ERROR: no response from server (timed out)\n".to_string(),
+                Ok(None) if has_q => String::new(),
+                Ok(None) => format!("ERROR: invalid option: {}\n", name),
             };
             if !output.is_empty() {
                 if persistent {
@@ -7283,14 +7290,16 @@ fn dispatch_control_command(
                 };
                 let (urtx, urrx) = mpsc::channel::<Option<(String, bool)>>();
                 let _ = tx.send(CtrlReq::UserOptionLookup(urtx, name.to_string(), target_window2.clone(), table));
-                let reply = match urrx.recv_timeout(Duration::from_millis(2000)).ok().flatten() {
-                    Some((value, inherited)) => crate::server::options::render_user_option_line(
+                let reply = match urrx.recv_timeout(Duration::from_millis(2000)) {
+                    Ok(Some((value, inherited))) => crate::server::options::render_user_option_line(
                         name, &value, inherited, value_only,
                     ).trim_end_matches('\n').to_string(),
-                    None if combined_has2('q') => String::new(),
+                    // A wait that ran out is an error, never "not set" (#832).
+                    Err(_) => "\u{0001}ERR\u{0001}no response from server (timed out)".to_string(),
+                    Ok(None) if combined_has2('q') => String::new(),
                     // tmux answers %error here (cmd-show-options.c), not a
                     // body under %end (issue #813).
-                    None => format!("\u{0001}ERR\u{0001}invalid option: {}", name),
+                    Ok(None) => format!("\u{0001}ERR\u{0001}invalid option: {}", name),
                 };
                 let _ = resp_tx.send(reply);
                 return true;
