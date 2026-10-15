@@ -394,6 +394,14 @@ set -g @kill-descendants off
 
 Explicit `kill-pane`, `kill-window`, and `kill-session` always terminate the pane's full process tree regardless of this option. See the Dead Panes section in [configuration.md](configuration.md) for details.
 
+### `default-terminal`: keep `xterm-256color` on Windows
+
+On Unix the program in a tmux pane talks to tmux's own terminal emulator, so `tmux-256color` describes it accurately. On Windows every pane program talks to the Windows console (conhost, or OpenConsole with `PSMUX_CONPTY_DIR`), and psmux sees what the console renders. The terminal the program really writes to is therefore the console, which behaves like an xterm.
+
+`tmux-256color` and `screen-256color` also cause a real problem with Neovim on Windows (#806). Their terminfo moves the cursor down one row with a bare line feed (`cud1=^J`). On its way to the Windows console that line feed becomes CR LF (Neovim's source blames libuv's implicit conversion), so the cursor lands in column 0 and the next write goes to the wrong place: in a vertical split the top row shows the right window's text at the left edge. Neovim already replaces `cud1` with `CSI B` on Windows, but only for xterm type terminals (`patch_terminfo_bugs` in `src/nvim/tui/tui.c`, neovim #10558). It reproduces the same way in a bare ConPTY with no psmux at all.
+
+Keep the default `set -g default-terminal "xterm-256color"`. On Windows it loses nothing, and truecolor still works through `terminal-overrides`.
+
 ## Format Variables
 
 psmux supports 140+ format variables with full modifier support, including:
