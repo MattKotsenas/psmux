@@ -1357,7 +1357,19 @@ fn run_main() -> io::Result<()> {
                 || (command_index.is_some_and(|i| args[i] == "command-prompt")
                     && (target.starts_with('/')
                         || target.strip_prefix('%').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))));
-            if has_explicit_session && !is_switch_client && !is_detach_client {
+            // A bare `-t` of a window or pane command (`rename-window -t w2`,
+            // `kill-pane -t 1`) is a window or pane of the current session
+            // before it is a session name (cmd-find.c:1093 to :1110). Unless
+            // a session of that name exists, it routes like no `-t` at all
+            // and the server resolves it; it used to die here with "no server
+            // running on session '<ns>__w2'".
+            let bare_window_or_pane = command_index
+                .is_some_and(|i| crate::commands::in_server_target_kind(&args[i]).is_some()
+                    || crate::cli::window_target_command(&args[i])
+                    || matches!(args[i].as_str(), "unlink-window" | "unlinkw" | "link-window" | "linkw"))
+                && crate::cli::bare_target_token(&target)
+                && !std::path::Path::new(&crate::paths::port_file(&port_file_base)).exists();
+            if has_explicit_session && !is_switch_client && !is_detach_client && !bare_window_or_pane {
                 // tmux matches a session name exactly and case-sensitively
                 // (`session_find` is a strcmp, and the prefix and fnmatch
                 // fallbacks of `cmd_find_get_session` are case-sensitive too).
@@ -2878,7 +2890,16 @@ fn run_main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            "kill-pane" | "killp" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
+            "kill-pane" | "killp" => {
+                // A -t naming nothing is the server's "can't find pane" (exit 1
+                // in tmux); the fire-and-forget send dropped it and exited 0.
+                let resp = send_control_with_response("kill-pane\n".to_string())?;
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             "capture-pane" | "capturep" => {
                 // Parse optional flags - cmd_args[0] is command, start from 1
                 let mut cmd = "capture-pane".to_string();
@@ -4481,7 +4502,13 @@ fn run_main() -> io::Result<()> {
                 // the wire keeps the server from reading it as a flag.
                 let operand_args: Vec<&str> = cmd_args[1..].iter().map(|s| s.as_str()).collect();
                 if let Some(name) = crate::cli::first_operand("rename-window", &operand_args) {
-                    send_control(format!("rename-window -- {}\n", crate::util::quote_arg(name)))?;
+                    // Read the reply: a -t naming no window is the server's
+                    // "can't find window" (exit 1 in tmux), not a silent 0.
+                    let resp = send_control_with_response(format!("rename-window -- {}\n", crate::util::quote_arg(name)))?;
+                    if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                        eprintln!("psmux: {}", msg.trim_end());
+                        std::process::exit(1);
+                    }
                 }
                 return Ok(());
             }

@@ -35,6 +35,7 @@ fn app() -> AppState {
     let mut app = AppState::new("demo".to_string());
     app.windows = vec![make_window("main", 1), make_window("keywin", 2), make_window("other", 3)];
     app.active_idx = 0;
+    app.window_base_index = 0;
     app
 }
 
@@ -79,18 +80,21 @@ fn in_server_resolution_rewrites_bare_names_only() {
 }
 
 #[test]
-fn bare_target_name_shape() {
-    assert!(crate::cli::bare_target_name("keywin"));
-    assert!(crate::cli::bare_target_name("=keywin"));
-    assert!(!crate::cli::bare_target_name("0"));
-    assert!(!crate::cli::bare_target_name("+1"));
-    assert!(!crate::cli::bare_target_name("!"));
-    assert!(!crate::cli::bare_target_name("s:w"));
-    assert!(!crate::cli::bare_target_name("w.1"));
-    assert!(!crate::cli::bare_target_name("%3"));
-    assert!(!crate::cli::bare_target_name("@3"));
-    assert!(!crate::cli::bare_target_name("{mouse}"));
-    assert!(!crate::cli::bare_target_name(""));
+fn bare_target_token_shape() {
+    for t in ["keywin", "=keywin", "0", "+1", "!", "{end}"] {
+        assert!(crate::cli::bare_target_token(t), "{} is bare", t);
+    }
+    for t in ["s:w", "w.1", "%3", "@3", "$1", "~", ""] {
+        assert!(!crate::cli::bare_target_token(t), "{} is not bare", t);
+    }
+}
+
+#[test]
+fn a_bare_index_is_a_window_or_a_pane_of_the_current_window() {
+    let app = app();
+    // Window commands: the window index (base 0 here).
+    assert_eq!(resolve_in_server_target(&app, InServerTarget::Window, "2"), Ok(Some("@3".to_string())));
+    assert!(resolve_in_server_target(&app, InServerTarget::Window, "9").is_err());
 }
 
 #[test]

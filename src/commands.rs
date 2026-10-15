@@ -1438,6 +1438,17 @@ pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: 
             if plain.starts_with('{') {
                 return Ok(None);
             }
+            // A bare index is a pane of the current window before it is a
+            // window (cmd_find_get_pane, cmd-find.c:575 to :600).
+            if !app.windows.is_empty() && plain.chars().all(|c| c.is_ascii_digit()) {
+                let win = &app.windows[app.active_idx.min(app.windows.len() - 1)];
+                if let Some(path) = plain.parse::<usize>().ok()
+                    .and_then(|i| i.checked_sub(app.pane_base_index))
+                    .and_then(|i| crate::tree::path_by_position(&win.root, i))
+                {
+                    return Ok(crate::tree::get_active_pane_id_at_path(&win.root, &path).map(|id| format!("%{}", id)));
+                }
+            }
             let (wp, path) = crate::window_ops::resolve_pane_spec(app, t)?;
             Ok(crate::tree::get_active_pane_id_at_path(&app.windows[wp].root, &path)
                 .map(|id| format!("%{}", id)))
@@ -1796,7 +1807,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
             if let Some(t) = parts.get(t_pos + 1) {
                 has_target = true;
-                let resolved = if crate::cli::bare_target_name(t) {
+                let resolved = if crate::cli::bare_target_token(t) {
                     resolve_in_server_target(app, kind, t)
                 } else {
                     Ok(None)

@@ -434,7 +434,7 @@ fn bare_target_rewrite(
     let end = crate::cli::outer_target_scan_end(cmd, args).min(args.len());
     let Some(i) = args[..end].iter().position(|a| *a == "-t") else { return Ok(None) };
     let Some(t) = args.get(i + 1) else { return Ok(None) };
-    if !crate::cli::bare_target_name(t) {
+    if !crate::cli::bare_target_token(t) {
         return Ok(None);
     }
     let (s, r) = mpsc::channel();
@@ -2883,8 +2883,21 @@ if persistent && client_readonly && !readonly_client_may_run(cmd) {
 // before it is a session name, as in tmux; parse_target alone filed it as a
 // session and the command acted on the CURRENT window. Resolved on live
 // state and rewritten to its id; naming nothing, the command does not run.
+// The CLI sends a command's `-t` as the TARGET line; a bare one gets the
+// same treatment, as the command's own `-t`.
+let target_line_args: Vec<&str>;
+let probe_args: &[&str] = match global_raw_target.as_deref() {
+    Some(g) if crate::cli::bare_target_token(g)
+        && crate::commands::in_server_target_kind(cmd).is_some()
+        && !args[..crate::cli::outer_target_scan_end(cmd, &args).min(args.len())].contains(&"-t") =>
+    {
+        target_line_args = ["-t", g].into_iter().chain(args.iter().copied()).collect();
+        &target_line_args
+    }
+    _ => &args,
+};
 let resolved_target_args: Vec<String>;
-let args: Vec<&str> = match bare_target_rewrite(cmd, &args, &tx) {
+let args: Vec<&str> = match bare_target_rewrite(cmd, probe_args, &tx) {
     Ok(Some(new)) => {
         resolved_target_args = new;
         resolved_target_args.iter().map(String::as_str).collect()
