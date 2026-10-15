@@ -122,6 +122,29 @@ try {
     if ($after -eq $before) { Write-Pass "hook kill-window -t nosuchwin killed nothing" } else { Write-Fail "hook kill-window -t nosuchwin: '$before' -> '$after'" }
     P set-hook -gu after-split-window | Out-Null
 
+    Write-Host "`n[3c] bindings made with the CLI's bind-key keep their arguments" -ForegroundColor Yellow
+    foreach ($n in 'cliwin', 'cliwin2', 'pxwin') { P new-window -d -t $S -n $n | Out-Null }
+    Start-Sleep -Milliseconds 800
+    $pxpane = ((P display-message -t "${S}:pxwin" -p '#{pane_id}') -join '').Trim()
+    P bind -n F2 rename-window -t cliwin clirenamed | Out-Null
+    P bind -n F11 kill-window -t :cliwin2 | Out-Null
+    P bind x kill-pane -t $pxpane | Out-Null
+    $keys = (P list-keys) -join "`n"
+    foreach ($want in @('F2 rename-window -t cliwin clirenamed', 'F11 kill-window -t :cliwin2', "x kill-pane -t $pxpane")) {
+        if ($keys.Contains($want)) { Write-Pass "list-keys shows '$want'" } else { Write-Fail "list-keys lacks '$want'" }
+    }
+    $cur = Current
+    Key '{F2}'
+    $n = Names
+    if (($n -contains 'clirenamed') -and ($n -notcontains 'cliwin') -and ($n -contains $cur)) { Write-Pass "F2 renamed cliwin" } else { Write-Fail "F2 -> $($n -join ',') (current $cur)" }
+    Key '{F11}'
+    $n = Names
+    if (($n -notcontains 'cliwin2') -and ($n -contains $cur)) { Write-Pass "F11 killed cliwin2 only" } else { Write-Fail "F11 -> $($n -join ',')" }
+    Key '^b'; Key 'x'
+    Start-Sleep -Milliseconds 800
+    $n = Names
+    if (($n -notcontains 'pxwin') -and ($n -contains $cur)) { Write-Pass "prefix x killed pane $pxpane (pxwin) only" } else { Write-Fail "prefix x -> $($n -join ',')" }
+
     Write-Host "`n[4] a session name is that session's current window" -ForegroundColor Yellow
     P select-window -t "${S}:spare" | Out-Null
     Start-Sleep -Milliseconds 500
