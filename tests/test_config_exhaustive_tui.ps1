@@ -502,6 +502,9 @@ if ($r.ok -and $r.resp -match 'mouse') {
 }
 
 # Combined -a via TUI
+# Drop the session value the earlier -a test left, so the append starts from the global
+Send-PsmuxCommand "set-option -u status-right"
+Start-Sleep -Milliseconds 200
 Send-PsmuxCommand "set-option -g status-right P1"
 Start-Sleep -Milliseconds 200
 Test-TuiOption "set-option -a status-right P2" "status-right" 'P1P2' "TUI combined -a"

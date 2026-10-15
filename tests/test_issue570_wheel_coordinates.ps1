@@ -96,7 +96,9 @@ function Get-ForwardedCol([int]$ScreenX, [switch]$UseVT, [int]$ScreenY = 8) {
     Start-Sleep -Milliseconds 900
     $all = if (Test-Path $childLog) { Get-Content $childLog } else { @() }
     if ($all.Count -le $before) { return $null }
-    $new = $all[$before..($all.Count-1)] | Where-Object { $_ -like 'RECV*' } | Select-Object -Last 1
+    # Only wheel reports (SGR 64/65): a pointer moving over the visible window
+    # also produces motion reports (35) the child logs, which are not the probe.
+    $new = $all[$before..($all.Count-1)] | Where-Object { $_ -like 'RECV*' -and $_ -match '<ESC>\[<6[45];' } | Select-Object -Last 1
     if ($new -match '<ESC>\[<(\d+);(\d+);(\d+)M') {
         return [pscustomobject]@{ Btn=[int]$Matches[1]; Col=[int]$Matches[2]; Row=[int]$Matches[3] }
     }
@@ -142,7 +144,7 @@ $before = if (Test-Path $childLog) { (Get-Content $childLog).Count } else { 0 }
 & $inj $proc.Id "down" 1 $x 6 | Out-Null
 Start-Sleep -Milliseconds 900
 $all = Get-Content $childLog
-$line = if ($all.Count -gt $before) { $all[$before..($all.Count-1)] | Where-Object { $_ -like 'RECV*' } | Select-Object -Last 1 } else { "" }
+$line = if ($all.Count -gt $before) { $all[$before..($all.Count-1)] | Where-Object { $_ -like 'RECV*' -and $_ -match '<ESC>\[<6[45];' } | Select-Object -Last 1 } else { "" }
 if ($line -match '<ESC>\[<65;(\d+);(\d+)M') {
     $col = [int]$Matches[1]
     if ($col -eq ([int]($g.W / 3) + 1)) { Write-Pass "wheel-down reported col $col" }

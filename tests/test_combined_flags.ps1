@@ -188,6 +188,8 @@ Write-Host "`n=== 4. CLI SEPARATED FLAGS ===" -ForegroundColor Cyan
 
 # -a via CLI
 Write-Test "CLI separated -a append"
+# Drop the session value the TCP -a test above left, so the session reads the global again
+& $psmux set-option -u status-right -t $SESSION 2>&1 | Out-Null
 CLI-Set @('-g', 'status-right', 'CS_A')
 & $psmux set-option -a status-right CS_B -t $SESSION 2>&1 | Out-Null
 $r = (& $psmux show-options -qv -t $SESSION status-right 2>&1 | Out-String).Trim()
