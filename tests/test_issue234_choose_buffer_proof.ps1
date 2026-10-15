@@ -100,7 +100,7 @@ if ($bufCount -eq 3) {
 # === Test 2: Verify choose-buffer returns structured data ===
 Write-Host "`n[Test 2] choose-buffer returns structured data" -ForegroundColor Yellow
 $resp = & $PSMUX choose-buffer -t $SESSION 2>&1 | Out-String
-if ($resp -match "buffer0:.*bytes:.*Buffer Gamma" -and $resp -match "buffer2:.*bytes:.*Buffer Alpha") {
+if ($resp -match "buffer2:.*bytes:.*Buffer Gamma" -and $resp -match "buffer0:.*bytes:.*Buffer Alpha" -and $resp.IndexOf("Buffer Gamma") -lt $resp.IndexOf("Buffer Alpha")) {
     Write-Pass "choose-buffer returns ordered buffer list (newest first)"
 } else {
     Write-Fail "Unexpected choose-buffer output: $resp"

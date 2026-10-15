@@ -407,14 +407,14 @@ if ($lines.Count -ge 2) {
     Write-Fail "Expected 2+ buffer entries, got $($lines.Count): '$vStr'"
 }
 
-Write-Test "list-buffers -F #{buffer_name} shows buffer0000, buffer0001..."
+Write-Test "list-buffers -F #{buffer_name} shows buffer0, buffer1 (tmux paste.c names buffer%u)"
 $v3 = & $PSMUX list-buffers -t $SESSION -F '#{buffer_name}' 2>&1
 $v3Str = ($v3 | Out-String).Trim()
 Write-Info "buffer_name raw: '$v3Str'"
-if ($v3Str -match "buffer0000" -and $v3Str -match "buffer0001") {
+if ($v3Str -match "(?m)^buffer0\r?$" -and $v3Str -match "(?m)^buffer1\r?$") {
     Write-Pass "Buffer names are indexed correctly"
 } else {
-    Write-Fail "Expected buffer0000 and buffer0001, got '$v3Str'"
+    Write-Fail "Expected buffer0 and buffer1, got '$v3Str'"
 }
 
 Write-Test "list-buffers -F #{buffer_sample} shows buffer content"

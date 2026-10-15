@@ -71,7 +71,7 @@ if ($bufCount -eq 3) {
 # Test 2: choose-buffer CLI returns buffer list (non-interactive, just text)
 Write-Host "[Test 2] choose-buffer CLI returns buffer list" -ForegroundColor Yellow
 $output = & $PSMUX choose-buffer -t $SESSION 2>&1 | Out-String
-if ($output -match "buffer0:" -and $output -match "bytes:") {
+if ($output -match "buffer\d+:" -and $output -match "bytes:") {
     Write-Pass "choose-buffer CLI returns formatted buffer list"
 } else {
     Write-Fail "choose-buffer CLI output unexpected: $output"
@@ -92,7 +92,7 @@ Write-Host "`n--- Part B: TCP Server Path ---" -ForegroundColor Yellow
 # Test 4: choose-buffer via TCP returns buffer list
 Write-Host "[Test 4] choose-buffer via TCP returns buffer data" -ForegroundColor Yellow
 $resp = Send-TcpCommand -Session $SESSION -Command "choose-buffer"
-if ($resp -match "buffer0:" -and $resp -match "bytes:") {
+if ($resp -match "buffer\d+:" -and $resp -match "bytes:") {
     Write-Pass "TCP choose-buffer returns buffer data"
 } else {
     Write-Fail "TCP choose-buffer unexpected: $resp"

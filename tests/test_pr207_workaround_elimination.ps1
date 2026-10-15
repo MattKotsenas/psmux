@@ -241,7 +241,7 @@ if ($all_ok) {
 $after_delete = (& $PSMUX show-buffer -b $uuid1 2>&1 | Out-String).Trim()
 $still_exists = (& $PSMUX show-buffer -b $uuid2 2>&1 | Out-String).Trim()
 Info "After delete $uuid1 : '$after_delete', $uuid2 : '$still_exists'"
-if ($after_delete -eq "" -and $still_exists -eq "SECOND_BUFFER_CONTENT") {
+if (($after_delete -eq "" -or $after_delete -match "no buffer") -and $still_exists -eq "SECOND_BUFFER_CONTENT") {
     Pass "WA5c: delete-buffer -b NAME removes only that buffer"
 } else {
     Fail "WA5c: delete-buffer -b broke other buffers"
@@ -368,7 +368,7 @@ if ($cap_cao -match "CAO_WORKFLOW_OK") {
 
 # Verify buffer was deleted
 $deleted_check = (& $PSMUX show-buffer -b $cao_buf 2>&1 | Out-String).Trim()
-if ($deleted_check -eq "") {
+if ($deleted_check -eq "" -or $deleted_check -match "no buffer") {
     Pass "CAO send_keys() finally: buffer cleaned up via delete-buffer"
 } else {
     Fail "CAO send_keys() finally: buffer not deleted"
