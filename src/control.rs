@@ -106,6 +106,11 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::ExtendedOutput { pane_id, age_ms, data } => {
             format!("%extended-output %{} {} : {}", pane_id, age_ms, escape_output(data))
         }
+        // The writer thread normally turns this into %output or
+        // %extended-output through ControlOutputGate::dequeue.
+        ControlNotification::PaneOutput { pane_id, data, .. } => {
+            format!("%output %{} {}", pane_id, escape_output(data))
+        }
         ControlNotification::SubscriptionChanged { name, session_id, window_id, window_index, pane_id, value } => {
             format!("%subscription-changed {} ${} @{} {} %{} : {}", name, session_id, window_id, window_index, pane_id, value)
         }
@@ -316,6 +321,291 @@ pub fn sync_window_changes(app: &mut AppState) {
     app.control_windows_seen = Some(now);
 }
 
+/// One item of `refresh-client -f`: `Some(Some(secs))` sets pause-after,
+/// `Some(None)` clears it, `None` is not a pause-after flag. Follows
+/// server-client.c server_client_control_flags: bare `pause-after` is an age
+/// of 0, `pause-after=N` reads N like `%u`, and a leading `!` clears the flag.
+pub fn parse_pause_after_flag(flag: &str) -> Option<Option<u64>> {
+    let flag = flag.trim();
+    if flag == "no-pause" {
+        return Some(None); // psmux's older spelling of !pause-after
+    }
+    let (not, name) = match flag.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, flag),
+    };
+    let secs = if name == "pause-after" {
+        0
+    } else {
+        let digits: String = name
+            .strip_prefix("pause-after=")?
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u64>().ok()?
+    };
+    Some(if not { None } else { Some(secs) })
+}
+
+/// tmux's limit for a control client that does not use pause-after: once its
+/// oldest unwritten pane output is this old the client is dropped with
+/// `%exit too far behind` (control.c CONTROL_MAXIMUM_AGE, in milliseconds).
+pub const CONTROL_MAXIMUM_AGE_MS: u64 = 300_000;
+
+#[derive(Default)]
+struct GatePane {
+    /// Output handed to the writer and not written yet: (sequence, queued at).
+    pending: std::collections::VecDeque<(u64, std::time::Instant)>,
+    /// Paused for this client (tmux CONTROL_PANE_PAUSED).
+    paused: bool,
+    /// Queued output with a sequence at or below this was discarded by a
+    /// pause and is dropped when the writer reaches it.
+    discard_upto: u64,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// `refresh-client -f pause-after=N` age in milliseconds (None = unset).
+    pause_after_ms: Option<u64>,
+    panes: std::collections::HashMap<usize, GatePane>,
+    next_seq: u64,
+    /// Panes paused by the server thread whose `%pause` line the writer
+    /// still has to print.
+    pending_pauses: Vec<usize>,
+    /// The client fell more than CONTROL_MAXIMUM_AGE behind.
+    too_far_behind: bool,
+}
+
+/// What the server loop does with a new chunk of pane output for one client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GateEnqueue {
+    /// Queue it as `ControlNotification::PaneOutput` with this sequence.
+    Send(u64),
+    /// The pane is paused (or the client is going away): drop it.
+    Skip,
+    /// This chunk paused the pane: drop it and wake the writer.
+    Paused,
+    /// The client is too far behind: drop it; the client is disconnected.
+    TooFarBehind,
+}
+
+/// What the writer thread does with a queued chunk when it reaches it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GateWrite {
+    /// `%output` (pause-after unset) or `%extended-output` with this age.
+    Write { age_ms: u64, extended: bool },
+    /// Discarded by a pause, or the pane is paused: write nothing.
+    Drop,
+    /// This chunk is older than pause-after: write `%pause %N` instead.
+    Pause,
+    /// Older than CONTROL_MAXIMUM_AGE without pause-after: disconnect.
+    TooFarBehind,
+}
+
+/// Per control client output bookkeeping shared by the server loop (which
+/// queues pane output) and the connection's writer thread (which writes it).
+///
+/// Mirrors tmux control.c: the age that matters is the age of the OLDEST
+/// output for a pane that the client has not been sent yet
+/// (control_check_age). With pause-after set, a pane whose backlog is older
+/// than the pause age is paused for that client, its backlog is discarded and
+/// nothing more is queued for it until `refresh-client -A '%N:continue'`.
+/// Without pause-after a client more than CONTROL_MAXIMUM_AGE behind is
+/// disconnected with "too far behind". Either way the backlog for a stalled
+/// client stops growing (#826).
+#[derive(Default)]
+pub struct ControlOutputGate {
+    state: std::sync::Mutex<GateState>,
+    /// The client's socket, shut down when it falls too far behind so a
+    /// writer blocked on a client that stopped reading is released.
+    stream: std::sync::Mutex<Option<std::net::TcpStream>>,
+}
+
+fn gate_age_ms(then: std::time::Instant, now: std::time::Instant) -> u64 {
+    now.checked_duration_since(then).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+impl ControlOutputGate {
+    pub fn new(stream: Option<std::net::TcpStream>) -> Self {
+        ControlOutputGate { state: Default::default(), stream: std::sync::Mutex::new(stream) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// tmux control_check_age for an age already measured: true when the
+    /// client is behind by more than it may be.
+    fn too_old(st: &GateState, age: u64) -> bool {
+        // control.c: `if (cb->t >= t) return (0);` (no age, not behind).
+        if age == 0 {
+            return false;
+        }
+        match st.pause_after_ms {
+            Some(limit) => age >= limit,
+            None => age >= CONTROL_MAXIMUM_AGE_MS,
+        }
+    }
+
+    fn pause_locked(st: &mut GateState, pane_id: usize) {
+        let last = st.next_seq;
+        let p = st.panes.entry(pane_id).or_default();
+        p.paused = true;
+        p.pending.clear();
+        p.discard_upto = last;
+    }
+
+    fn mark_too_far_behind(st: &mut GateState) {
+        st.too_far_behind = true;
+        st.panes.clear();
+    }
+
+    /// Close the client's connection: its writer (possibly blocked on a
+    /// client that stopped reading) and its command loop both end, and the
+    /// connection deregisters the client.
+    pub fn shutdown_stream(&self) {
+        if let Some(s) = self.stream.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// The server loop has new output for `pane_id` (control_write_output).
+    pub fn enqueue(&self, pane_id: usize, now: std::time::Instant) -> GateEnqueue {
+        let mut st = self.lock();
+        if st.too_far_behind {
+            return GateEnqueue::Skip;
+        }
+        if st.panes.get(&pane_id).map_or(false, |p| p.paused) {
+            return GateEnqueue::Skip;
+        }
+        let oldest = st.panes.get(&pane_id).and_then(|p| p.pending.front().map(|e| e.1));
+        if let Some(t) = oldest {
+            if Self::too_old(&st, gate_age_ms(t, now)) {
+                if st.pause_after_ms.is_some() {
+                    Self::pause_locked(&mut st, pane_id);
+                    st.pending_pauses.push(pane_id);
+                    return GateEnqueue::Paused;
+                }
+                // The writer is most likely blocked on this client, so
+                // the %exit line cannot reach it; just drop the connection.
+                Self::mark_too_far_behind(&mut st);
+                drop(st);
+                self.shutdown_stream();
+                return GateEnqueue::TooFarBehind;
+            }
+        }
+        st.next_seq += 1;
+        let seq = st.next_seq;
+        st.panes.entry(pane_id).or_default().pending.push_back((seq, now));
+        GateEnqueue::Send(seq)
+    }
+
+    /// The chunk `seq` could not be queued after all (channel full or gone).
+    pub fn unqueue(&self, pane_id: usize, seq: u64) {
+        let mut st = self.lock();
+        if let Some(p) = st.panes.get_mut(&pane_id) {
+            if p.pending.back().map(|e| e.0) == Some(seq) {
+                p.pending.pop_back();
+            }
+        }
+    }
+
+    /// The writer reached chunk `seq` (control_write_pending).
+    pub fn dequeue(
+        &self,
+        pane_id: usize,
+        seq: u64,
+        queued_at: std::time::Instant,
+        now: std::time::Instant,
+    ) -> GateWrite {
+        let mut st = self.lock();
+        if st.too_far_behind {
+            return GateWrite::Drop;
+        }
+        let pause_set = st.pause_after_ms.is_some();
+        let paused = match st.panes.get_mut(&pane_id) {
+            None => return GateWrite::Drop,
+            Some(p) => {
+                if seq <= p.discard_upto {
+                    return GateWrite::Drop;
+                }
+                if p.pending.front().map(|e| e.0) == Some(seq) {
+                    p.pending.pop_front();
+                }
+                p.paused
+            }
+        };
+        if paused {
+            return GateWrite::Drop;
+        }
+        let age = gate_age_ms(queued_at, now);
+        if Self::too_old(&st, age) {
+            if pause_set {
+                Self::pause_locked(&mut st, pane_id);
+                return GateWrite::Pause;
+            }
+            // The writer prints `%exit too far behind`, then closes.
+            Self::mark_too_far_behind(&mut st);
+            return GateWrite::TooFarBehind;
+        }
+        GateWrite::Write { age_ms: age, extended: pause_set }
+    }
+
+    /// `%pause` lines the server thread decided on, for the writer to print.
+    pub fn take_pending_pauses(&self) -> Vec<usize> {
+        std::mem::take(&mut self.lock().pending_pauses)
+    }
+
+    pub fn is_too_far_behind(&self) -> bool {
+        self.lock().too_far_behind
+    }
+
+    /// `refresh-client -f pause-after[=N]` (Some) / `!pause-after` (None).
+    pub fn set_pause_after(&self, ms: Option<u64>) {
+        self.lock().pause_after_ms = ms;
+    }
+
+    pub fn pause_after_ms(&self) -> Option<u64> {
+        self.lock().pause_after_ms
+    }
+
+    pub fn is_paused(&self, pane_id: usize) -> bool {
+        self.lock().panes.get(&pane_id).map_or(false, |p| p.paused)
+    }
+
+    /// `refresh-client -A '%N:pause'` (control_pause_pane). True when the
+    /// pane was not paused, so a `%pause` line is due.
+    pub fn pause_pane(&self, pane_id: usize) -> bool {
+        let mut st = self.lock();
+        if st.panes.get(&pane_id).map_or(false, |p| p.paused) {
+            return false;
+        }
+        Self::pause_locked(&mut st, pane_id);
+        st.pending_pauses.push(pane_id);
+        true
+    }
+
+    /// `refresh-client -A '%N:continue'` (control_continue_pane). True when
+    /// the pane was paused, so a `%continue` line is due.
+    pub fn continue_pane(&self, pane_id: usize) -> bool {
+        let mut st = self.lock();
+        let last = st.next_seq;
+        match st.panes.get_mut(&pane_id) {
+            Some(p) if p.paused => {
+                p.paused = false;
+                p.pending.clear();
+                p.discard_upto = last;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue826_cc_pause_after.rs"]
+mod tests_issue826_cc_pause_after;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,9 +762,7 @@ mod tests {
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
             subscription_last_check: std::collections::HashMap::new(),
-            pause_after_secs: None,
-            output_paused_panes: std::collections::HashSet::new(),
-            pane_last_output: std::collections::HashMap::new(),
+            output_gate: Default::default(),
             size: None,
             window_sizes: std::collections::HashMap::new(),
         });
@@ -494,9 +782,7 @@ mod tests {
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
             subscription_last_check: std::collections::HashMap::new(),
-            pause_after_secs: None,
-            output_paused_panes: std::collections::HashSet::new(),
-            pane_last_output: std::collections::HashMap::new(),
+            output_gate: Default::default(),
             size: None,
             window_sizes: std::collections::HashMap::new(),
         });
@@ -520,9 +806,7 @@ mod tests {
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
             subscription_last_check: std::collections::HashMap::new(),
-            pause_after_secs: None,
-            output_paused_panes: std::collections::HashSet::new(),
-            pane_last_output: std::collections::HashMap::new(),
+            output_gate: Default::default(),
             size: None,
             window_sizes: std::collections::HashMap::new(),
         });

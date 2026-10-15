@@ -2112,10 +2112,14 @@ if control_echo || control_noecho {
     // as in tmux (server_client_check_exit runs after the command).
     let cmd_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cmd_busy_notif = cmd_busy.clone();
+    // Shared with the server loop: pause-after, paused panes, backlog age (#826).
+    let output_gate = std::sync::Arc::new(control::ControlOutputGate::new(
+        r.get_ref().try_clone().ok(),
+    ));
+    let gate_notif = output_gate.clone();
     let notif_thread = std::thread::spawn(move || {
         while let Ok(notif) = notif_rx.recv() {
             let is_detach = matches!(notif, ControlNotification::Detached);
-            let is_exit = is_detach || matches!(notif, ControlNotification::Exit { .. });
             if is_detach {
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
                 while cmd_busy_notif.load(std::sync::atomic::Ordering::Acquire)
@@ -2124,13 +2128,62 @@ if control_echo || control_noecho {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             }
-            let formatted = control::format_notification(&notif);
+            // %pause lines the server loop decided on while this thread was
+            // busy (or blocked on a client that stopped reading).
+            let mut lines: Vec<String> = gate_notif
+                .take_pending_pauses()
+                .into_iter()
+                .map(|p| format!("%pause %{}", p))
+                .collect();
+            let mut is_exit = is_detach || matches!(notif, ControlNotification::Exit { .. });
+            match notif {
+                ControlNotification::PaneOutput { pane_id, data, seq, queued_at } => {
+                    match gate_notif.dequeue(pane_id, seq, queued_at, std::time::Instant::now()) {
+                        control::GateWrite::Write { age_ms, extended: true } => {
+                            lines.push(control::format_notification(
+                                &ControlNotification::ExtendedOutput { pane_id, age_ms, data },
+                            ));
+                        }
+                        control::GateWrite::Write { extended: false, .. } => {
+                            lines.push(control::format_notification(
+                                &ControlNotification::Output { pane_id, data },
+                            ));
+                        }
+                        control::GateWrite::Pause => lines.push(format!("%pause %{}", pane_id)),
+                        control::GateWrite::Drop => {}
+                        control::GateWrite::TooFarBehind => {
+                            lines.push("%exit too far behind".to_string());
+                            is_exit = true;
+                        }
+                    }
+                }
+                // Only a wake-up: the line itself came from the gate above.
+                ControlNotification::Pause { .. } => {}
+                other => lines.push(control::format_notification(&other)),
+            }
+            let too_far = gate_notif.is_too_far_behind();
+            if too_far && !is_exit {
+                // Dropped by the server loop (control.c "too far behind").
+                gate_notif.shutdown_stream();
+                break;
+            }
+            if lines.is_empty() {
+                continue;
+            }
             let mut ws = match ws_notif.lock() {
                 Ok(ws) => ws,
                 Err(_) => break,
             };
-            if writeln!(ws, "{}", formatted).is_err() { break; }
-            if ws.flush().is_err() { break; }
+            let mut failed = false;
+            for formatted in &lines {
+                if writeln!(ws, "{}", formatted).is_err() { failed = true; break; }
+            }
+            if failed || ws.flush().is_err() { break; }
+            if too_far {
+                drop(ws);
+                gate_notif.shutdown_stream();
+                break;
+            }
             // Exit notification written — now signal the client to exit.
             // Writing %exit through the DCS stream (before TCP close) lets
             // iTerm2 receive it as a DCS message and close native windows
@@ -2190,6 +2243,7 @@ if control_echo || control_noecho {
         notif_tx: notif_tx,
         // `#{client_pid}` of a -CC client is the process at the other end (#724).
         pid: connection_peer_pid(r.get_ref()),
+        output_gate: output_gate.clone(),
     });
 
     // Control mode command loop: read lines, dispatch, wrap in %begin/%end/%error
@@ -7837,25 +7891,21 @@ fn dispatch_control_command(
                 // Parse -f flags (e.g. pause-after=N)
                 if args[i] == "-f" {
                     if let Some(flag_val) = args.get(i + 1) {
-                        // A comma list, each flag turned off by a leading `!`
-                        // (server-client.c server_client_set_flags).
-                        for flag_val in flag_val.trim_matches('"').split(',') {
-                            if let Some(stripped) = flag_val.strip_prefix("pause-after=") {
-                                let secs = stripped.parse::<u64>().ok();
+                        let flag_val = flag_val.trim_matches('"').trim_matches('\'');
+                        // A comma separated list; `!flag` clears a flag
+                        // (server-client.c server_client_set_flags and
+                        // server_client_control_flags).
+                        for flag in flag_val.split(',') {
+                            if let Some(change) = crate::control::parse_pause_after_flag(flag) {
                                 let _ = tx.send(CtrlReq::ControlSetPauseAfter {
                                     client_id,
-                                    pause_after_secs: secs,
+                                    pause_after_secs: change,
                                 });
-                            } else if flag_val == "no-pause" {
-                                let _ = tx.send(CtrlReq::ControlSetPauseAfter {
-                                    client_id,
-                                    pause_after_secs: None,
-                                });
-                            } else if flag_val == "ignore-size" || flag_val == "!ignore-size" {
+                            } else if flag == "ignore-size" || flag == "!ignore-size" {
                                 // #825: the flag was accepted and dropped.
                                 let _ = tx.send(CtrlReq::SetClientIgnoreSize(
                                     client_id,
-                                    !flag_val.starts_with('!'),
+                                    !flag.starts_with('!'),
                                 ));
                             }
                         }
@@ -7871,14 +7921,20 @@ fn dispatch_control_command(
                         if let Some(colon) = spec.find(':') {
                             let pane_spec = &spec[..colon];
                             let action = &spec[colon + 1..];
-                            if action == "continue" {
-                                if let Some(pid_str) = pane_spec.strip_prefix('%') {
-                                    if let Ok(pid) = pid_str.parse::<usize>() {
-                                        let _ = tx.send(CtrlReq::ControlContinuePane {
-                                            client_id,
-                                            pane_id: pid,
-                                        });
-                                    }
+                            let pane = pane_spec
+                                .strip_prefix('%')
+                                .and_then(|p| p.parse::<usize>().ok());
+                            if let Some(pid) = pane {
+                                if action == "continue" {
+                                    let _ = tx.send(CtrlReq::ControlContinuePane {
+                                        client_id,
+                                        pane_id: pid,
+                                    });
+                                } else if action == "pause" {
+                                    let _ = tx.send(CtrlReq::ControlPausePane {
+                                        client_id,
+                                        pane_id: pid,
+                                    });
                                 }
                             }
                         }

@@ -125,9 +125,7 @@ fn paste_api_announces_buffer_changes() {
         subscriptions: Default::default(),
         subscription_values: Default::default(),
         subscription_last_check: Default::default(),
-        pause_after_secs: None,
-        output_paused_panes: Default::default(),
-        pane_last_output: Default::default(),
+        output_gate: Default::default(),
         size: None,
         window_sizes: Default::default(),
     });

@@ -19,9 +19,7 @@ fn add_control(app: &mut AppState, id: u64, size: Option<(u16, u16)>) -> Receive
         subscriptions: std::collections::HashMap::new(),
         subscription_values: std::collections::HashMap::new(),
         subscription_last_check: std::collections::HashMap::new(),
-        pause_after_secs: None,
-        output_paused_panes: std::collections::HashSet::new(),
-        pane_last_output: std::collections::HashMap::new(),
+        output_gate: Default::default(),
         size,
         window_sizes: std::collections::HashMap::new(),
     });

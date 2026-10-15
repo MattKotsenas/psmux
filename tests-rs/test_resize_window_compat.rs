@@ -62,9 +62,7 @@ fn control_client(
         subscriptions: std::collections::HashMap::new(),
         subscription_values: std::collections::HashMap::new(),
         subscription_last_check: std::collections::HashMap::new(),
-        pause_after_secs: None,
-        output_paused_panes: std::collections::HashSet::new(),
-        pane_last_output: std::collections::HashMap::new(),
+        output_gate: Default::default(),
         size,
         window_sizes: window_sizes.iter().copied().collect(),
     }

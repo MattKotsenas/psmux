@@ -54,6 +54,10 @@ pub enum ControlNotification {
     Pause { pane_id: usize },
     /// Extended output with age information (when pause-after is active).
     ExtendedOutput { pane_id: usize, age_ms: u64, data: String },
+    /// Pane output queued by the server loop through the client's
+    /// `ControlOutputGate`; the writer decides when it reaches it whether it
+    /// goes out as %output, %extended-output, a %pause, or not at all (#826).
+    PaneOutput { pane_id: usize, data: String, seq: u64, queued_at: Instant },
     /// Subscription value changed notification.
     SubscriptionChanged {
         name: String,
@@ -89,12 +93,9 @@ pub struct ControlClient {
     pub subscription_values: HashMap<String, String>,
     /// Last time each subscription was checked (rate limit: 1/s per sub).
     pub subscription_last_check: HashMap<String, Instant>,
-    /// `refresh-client -f pause-after=N`: pause output if client falls behind by N seconds.
-    pub pause_after_secs: Option<u64>,
-    /// Panes whose output is currently paused due to pause-after threshold.
-    pub output_paused_panes: HashSet<usize>,
-    /// Timestamp of last output sent per pane (for pause-after age tracking).
-    pub pane_last_output: HashMap<usize, Instant>,
+    /// pause-after age, paused panes and the per pane backlog age, shared
+    /// with the connection's writer thread (#826).
+    pub output_gate: Arc<crate::control::ControlOutputGate>,
     /// Default viewport reported by `refresh-client -C`.
     pub size: Option<(u16, u16)>,
     /// Per-window viewport overrides reported as `refresh-client -C @id:WxH`.
@@ -4159,10 +4160,16 @@ pub enum CtrlReq {
         client_id: u64,
         name: String,
     },
-    /// `refresh-client -f pause-after=N` set pause-after flag.
+    /// `refresh-client -f pause-after[=N]` (Some(seconds); bare pause-after
+    /// is Some(0) like tmux) or `!pause-after` / `no-pause` (None).
     ControlSetPauseAfter {
         client_id: u64,
         pause_after_secs: Option<u64>,
+    },
+    /// `refresh-client -A '%N:pause'` pause a pane's output for this client.
+    ControlPausePane {
+        client_id: u64,
+        pane_id: usize,
     },
     /// `refresh-client -A '%N:continue'` resume paused pane output.
     ControlContinuePane {
@@ -4296,6 +4303,8 @@ pub enum CtrlReq {
         notif_tx: mpsc::SyncSender<ControlNotification>,
         /// The control client's process id, read from the connection (#724).
         pid: Option<u32>,
+        /// Output gate shared with the connection's writer thread (#826).
+        output_gate: Arc<crate::control::ControlOutputGate>,
     },
     /// Deregister a control mode client.
     ControlDeregister {

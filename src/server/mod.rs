@@ -2909,47 +2909,41 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     });
                 }
-                // Dispatch to each control client with pause-after logic
+                // Dispatch to each control client. The client's output gate
+                // tracks how old the oldest unwritten output of each pane is
+                // (tmux control_check_age): past pause-after the pane is
+                // paused for that client and its backlog dropped, and a
+                // client without pause-after that falls CONTROL_MAXIMUM_AGE
+                // behind is disconnected (#826). The writer thread decides
+                // between %output and %extended-output and measures the age.
                 let now = std::time::Instant::now();
                 for (pane_id, data) in &pane_outputs {
                     for client in app.control_clients.values_mut() {
                         if client.paused_panes.contains(pane_id) {
                             continue;
                         }
-                        if client.output_paused_panes.contains(pane_id) {
-                            // Pane is paused for this client; drop output
-                            continue;
-                        }
-                        if let Some(pause_secs) = client.pause_after_secs {
-                            // Track output timing per pane
-                            let last = client.pane_last_output.entry(*pane_id).or_insert(now);
-                            let age = now.duration_since(*last);
-                            *last = now;
-                            if age.as_secs() >= pause_secs {
-                                // Client fell behind: pause this pane
-                                client.output_paused_panes.insert(*pane_id);
+                        match client.output_gate.enqueue(*pane_id, now) {
+                            crate::control::GateEnqueue::Send(seq) => {
+                                let sent = client.notification_tx.try_send(
+                                    crate::types::ControlNotification::PaneOutput {
+                                        pane_id: *pane_id,
+                                        data: data.clone(),
+                                        seq,
+                                        queued_at: now,
+                                    }
+                                );
+                                if sent.is_err() {
+                                    client.output_gate.unqueue(*pane_id, seq);
+                                }
+                            }
+                            crate::control::GateEnqueue::Paused => {
+                                // Wakes the writer, which prints the %pause.
                                 let _ = client.notification_tx.try_send(
                                     crate::types::ControlNotification::Pause { pane_id: *pane_id }
                                 );
-                                continue;
                             }
-                            // Send as extended-output with age
-                            let age_ms = age.as_millis() as u64;
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::ExtendedOutput {
-                                    pane_id: *pane_id,
-                                    age_ms,
-                                    data: data.clone(),
-                                }
-                            );
-                        } else {
-                            // No pause-after: send normal %output
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::Output {
-                                    pane_id: *pane_id,
-                                    data: data.clone(),
-                                }
-                            );
+                            crate::control::GateEnqueue::Skip
+                            | crate::control::GateEnqueue::TooFarBehind => {}
                         }
                     }
                 }
@@ -8235,7 +8229,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::ControlRegister { client_id, echo, notif_tx, pid } => {
+                CtrlReq::ControlRegister { client_id, echo, notif_tx, pid, output_gate } => {
                     app.control_clients.insert(client_id, crate::types::ControlClient {
                         client_id,
                         cmd_counter: 0,
@@ -8245,9 +8239,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         subscriptions: std::collections::HashMap::new(),
                         subscription_values: std::collections::HashMap::new(),
                         subscription_last_check: std::collections::HashMap::new(),
-                        pause_after_secs: None,
-                        output_paused_panes: std::collections::HashSet::new(),
-                        pane_last_output: std::collections::HashMap::new(),
+                        output_gate,
                         size: None,
                         window_sizes: std::collections::HashMap::new(),
                     });
@@ -8286,19 +8278,28 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::ControlSetPauseAfter { client_id, pause_after_secs } => {
                     if let Some(cc) = app.control_clients.get_mut(&client_id) {
-                        cc.pause_after_secs = pause_after_secs;
-                        if pause_after_secs.is_none() {
-                            // Clear all pause state when disabling
-                            cc.output_paused_panes.clear();
-                            cc.pane_last_output.clear();
-                        }
+                        // tmux only sets or clears the flag: a pane already
+                        // paused stays paused until continue.
+                        cc.output_gate.set_pause_after(
+                            pause_after_secs.map(|s| s.saturating_mul(1000)),
+                        );
                     }
                 }
                 CtrlReq::ControlContinuePane { client_id, pane_id } => {
                     if let Some(cc) = app.control_clients.get_mut(&client_id) {
-                        if cc.output_paused_panes.remove(&pane_id) {
+                        if cc.output_gate.continue_pane(pane_id) {
                             let _ = cc.notification_tx.try_send(
                                 crate::types::ControlNotification::Continue { pane_id }
+                            );
+                        }
+                    }
+                }
+                CtrlReq::ControlPausePane { client_id, pane_id } => {
+                    if let Some(cc) = app.control_clients.get_mut(&client_id) {
+                        if cc.output_gate.pause_pane(pane_id) {
+                            // Wakes the writer, which prints the %pause.
+                            let _ = cc.notification_tx.try_send(
+                                crate::types::ControlNotification::Pause { pane_id }
                             );
                         }
                     }
