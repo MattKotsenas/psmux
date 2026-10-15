@@ -276,13 +276,22 @@ pub fn window_change_notifications(
     out
 }
 
-/// Emit what a command did to the window list. These used to come from the
-/// command's hook and named whatever window was current when it fired, so
-/// `kill-window -t @2` with @1 current announced `%window-close @1` (#811).
-pub fn emit_window_changes(app: &AppState, before: &WindowSnapshot) {
-    for notif in window_change_notifications(before, &window_snapshot(app), app.session_id) {
-        emit_notification(app, notif);
+/// Announce what changed in the window list since the last call, whatever
+/// changed it: a request, a key binding, a hook, or a pane that exited or was
+/// killed from outside. These used to come from the command's hook and named
+/// whatever window was current when it fired, so `kill-window -t @2` with @1
+/// current announced `%window-close @1` (#811). Call it only where no -t temp
+/// focus is applied.
+pub fn sync_window_changes(app: &mut AppState) {
+    let now = window_snapshot(app);
+    if let Some(before) = app.control_windows_seen.take() {
+        if !app.control_clients.is_empty() {
+            for notif in window_change_notifications(&before, &now, app.session_id) {
+                emit_notification(app, notif);
+            }
+        }
     }
+    app.control_windows_seen = Some(now);
 }
 
 #[cfg(test)]

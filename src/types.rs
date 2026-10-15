@@ -2033,6 +2033,10 @@ pub struct AppState {
     pub pending_plugin_scripts: Vec<String>,
     /// Connected control mode clients (keyed by client_id).
     pub control_clients: HashMap<u64, ControlClient>,
+    /// The window list as control clients were last told about it
+    /// (control::sync_window_changes), so any change, whatever made it, is
+    /// announced once (#811).
+    pub control_windows_seen: Option<crate::control::WindowSnapshot>,
     /// Session group name (set by `new-session -t target` for tmux group semantics).
     /// Sessions in the same group logically share a window list.
     pub session_group: Option<String>,
@@ -3206,6 +3210,7 @@ impl AppState {
             warm_refill_rx: None,
             pending_plugin_scripts: Vec::new(),
             control_clients: HashMap::new(),
+            control_windows_seen: None,
             session_group: None,
             defaults_suppressed: false,
             copy_mode_defaults_unbound: std::collections::HashSet::new(),

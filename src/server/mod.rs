@@ -3176,9 +3176,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // switched (one whose arm skipped the restore at the end
                     // of its iteration) is put back before this one runs.
                     temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
-                    // The real window list and current window, before any -t
-                    // focus, to diff against once the focus is put back.
-                    let windows_before = (!app.control_clients.is_empty()).then(|| control::window_snapshot(&app));
                     let req = match req {
                         CtrlReq::Targeted(target, inner) => {
                             match temp_target::apply_temp_target(&mut app, &mut temp_focus_restore, &target) {
@@ -8516,9 +8513,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             // The request that carried a -t target is done: put the real
             // focus back (by pane id, see restore_temp_focus).
             temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
-            if let Some(before) = windows_before {
-                control::emit_window_changes(&app, &before);
-            }
+            // What the request did to the window list, now that the real
+            // focus is back.
+            control::sync_window_changes(&mut app);
             if mutates_state {
                 state_dirty = true;
             }
@@ -8987,10 +8984,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     tree::count_panes(&w.root),
                 )).collect()
             } else { Vec::new() };
-            let pre_active_win_id: Option<usize> = if !app.control_clients.is_empty() && app.active_idx < app.windows.len() {
-                Some(app.windows[app.active_idx].id)
-            } else { None };
-
             let (all_empty, any_pruned, any_newly_dead) = tree::reap_children(&mut app)?;
             if any_pruned {
                 // A pane was removed from the tree - resize remaining panes to fill the space
@@ -9016,25 +9009,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     });
                                 }
                             }
-                        } else {
-                            // Window completely removed (last pane died).
-                            control::emit_notification(&app, crate::types::ControlNotification::WindowClose {
-                                window_id: *win_id,
-                            });
                         }
-                    }
-                    // If the session's active window changed (because the
-                    // previous active window was removed), tell iTerm2.
-                    if let Some(prev) = pre_active_win_id {
-                        if app.active_idx < app.windows.len() {
-                            let new_win_id = app.windows[app.active_idx].id;
-                            if new_win_id != prev {
-                                control::emit_notification(&app, crate::types::ControlNotification::SessionWindowChanged {
-                                    session_id: app.session_id,
-                                    window_id: new_win_id,
-                                });
-                            }
-                        }
+                        // A window that lost its last pane is announced by
+                        // sync_window_changes below.
                     }
                 }
             }
@@ -9046,6 +9023,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::commands::fire_hooks(&mut app, "pane-died");
                 crate::commands::fire_hooks(&mut app, "pane-exited");
             }
+            // Windows a pane exit removed, and any the hooks above made or
+            // closed, outside any request (#811).
+            control::sync_window_changes(&mut app);
             if app.exit_empty && all_empty && !app.forwarded_panes.is_empty() {
                 // The session's last pane went, and one of them went into
                 // another session through join-pane. In tmux the session is

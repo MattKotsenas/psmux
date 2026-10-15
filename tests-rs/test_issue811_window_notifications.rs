@@ -53,3 +53,71 @@ fn last_window_gone_announces_only_the_close() {
     let after = WindowSnapshot { ids: vec![], current: None };
     assert_eq!(lines(&snap(&[7], 7), &after), vec!["%window-close @7"]);
 }
+
+fn make_window(id: usize) -> crate::types::Window {
+    crate::types::Window {
+        root: crate::types::Node::Split { kind: crate::types::LayoutKind::Horizontal, sizes: vec![], children: vec![] },
+        active_path: vec![],
+        name: format!("w{}", id),
+        id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
+        activity_flag: false,
+        bell_flag: false,
+        silence_flag: false,
+        last_output_time: std::time::Instant::now(),
+        last_seen_version: 0,
+        manual_rename: false,
+        layout_index: 0,
+        pane_mru: vec![],
+        zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
+    }
+}
+
+/// A change made outside any request (a pane that exited, a hook run by the
+/// reaper) is announced by the next sync, once, against what clients were
+/// last told.
+#[test]
+fn sync_announces_each_change_once() {
+    let mut app = crate::types::AppState::new("s".to_string());
+    app.windows = vec![make_window(1), make_window(2)];
+    app.active_idx = 1;
+    app.session_id = 5;
+    let (ntx, nrx) = std::sync::mpsc::sync_channel(64);
+    app.control_clients.insert(1, crate::types::ControlClient {
+        client_id: 1,
+        cmd_counter: 0,
+        echo_enabled: false,
+        notification_tx: ntx,
+        paused_panes: Default::default(),
+        subscriptions: Default::default(),
+        subscription_values: Default::default(),
+        subscription_last_check: Default::default(),
+        pause_after_secs: None,
+        output_paused_panes: Default::default(),
+        pane_last_output: Default::default(),
+        size: None,
+        window_sizes: Default::default(),
+    });
+    let drain = |rx: &std::sync::mpsc::Receiver<ControlNotification>| -> Vec<String> {
+        rx.try_iter().map(|n| format_notification(&n)).collect()
+    };
+    // The first sync only records the state.
+    sync_window_changes(&mut app);
+    assert!(drain(&nrx).is_empty());
+    // The current window @2 goes away on its own.
+    app.windows.remove(1);
+    app.active_idx = 0;
+    sync_window_changes(&mut app);
+    assert_eq!(drain(&nrx), vec!["%window-close @2", "%session-window-changed $5 @1"]);
+    // Nothing changed since: nothing to say.
+    sync_window_changes(&mut app);
+    assert!(drain(&nrx).is_empty());
+    app.windows.push(make_window(3));
+    sync_window_changes(&mut app);
+    assert_eq!(drain(&nrx), vec!["%window-add @3"]);
+}
