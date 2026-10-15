@@ -97,6 +97,14 @@ fn shutdown_this_server(app: &mut AppState) -> ! {
     // reconnecting to a server that is dying; the kills follow immediately; the
     // client-facing courtesies come after, since a client that is about to be
     // detached does not care whether its panes died a millisecond earlier.
+    //
+    // The ownership marker goes before the `.port`. Every psmux invocation
+    // reaps a server this data dir claims that no `.port` names
+    // (session::reap_orphaned_servers), and from here until the exit below,
+    // which can wait seconds for spares inside CreateProcessW, that is exactly
+    // this server: any psmux command run meanwhile, from any namespace,
+    // terminated it halfway and orphaned those spares (#686 follow up).
+    let _ = std::fs::remove_file(crate::paths::server_marker_file(std::process::id()));
     let regpath = crate::paths::port_file(&app.port_file_base());
     let keypath = crate::paths::key_file(&app.port_file_base());
     let _ = std::fs::remove_file(&regpath);
