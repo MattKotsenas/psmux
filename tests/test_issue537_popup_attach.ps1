@@ -284,9 +284,13 @@ $e = Watch-Popup -Session "i537tui" -Ms 12000
 if ($e.SawActive) { Write-Pass "TUI: popup with an attached session is live on a real window" }
 else { Write-Fail "TUI: popup never opened on the real window" }
 
+# session_attached is a count (format.c, s->attached; #825). Part D2's
+# PSMUX_ALLOW_NESTING attach is still on this session, so the popup's client
+# makes it 2: the count must be at least 1 and agree with list-clients.
 $tuiAttached = (& $PSMUX display-message -t $POP_S -p '#{session_attached}' 2>&1 | Out-String).Trim()
-if ($tuiAttached -eq "1") { Write-Pass "TUI: target session reports an attached client" }
-else { Write-Fail "TUI: target session_attached='$tuiAttached', expected 1" }
+$tuiClients = @(& $PSMUX list-clients -t $POP_S 2>$null | Where-Object { $_ -match '\S' }).Count
+if ($tuiAttached -match '^\d+$' -and [int]$tuiAttached -ge 1 -and [int]$tuiAttached -eq $tuiClients) { Write-Pass "TUI: target session reports $tuiAttached attached client(s), as list-clients does" }
+else { Write-Fail "TUI: target session_attached='$tuiAttached', list-clients shows $tuiClients" }
 
 # The host TUI session must still be usable while the popup holds a client.
 & $PSMUX split-window -v -t "i537tui" 2>&1 | Out-Null
