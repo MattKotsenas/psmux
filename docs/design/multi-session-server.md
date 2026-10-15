@@ -142,6 +142,27 @@ new-window number. That is a projection, not a measurement.
 * **psmux-continuum** uses `session-created` and `client-attached` hooks. In a
   shared server `session-created` fires inside the same process for every new
   session, which is tmux's behaviour; today each process fires it once for itself.
+* **Periodic work and hook affinity** (raised by MattKotsenas). psmux-continuum runs
+  its own save loop. Driving it from the status refresh instead, the way
+  tmux-continuum does with a `#()` job in `status-right`, would today run the save
+  once per SERVER, so N times per interval in a namespace with N sessions, although
+  one save already covers every session. tmux does not deduplicate this by hook
+  scope either: a `#()` job is cached per client (`format_job_get`, format.c:396 to
+  403, `ft->client->jobs`), so two attached clients run it twice, and
+  tmux-continuum stays correct only because the script itself checks a last save
+  timestamp (`@continuum-save-last-timestamp`) and returns early. The rules for
+  psmux:
+  * In shared mode a server or session event (`session-created`,
+    `session-closed`) fires once in the one server, for that session; a status
+    `#()` job runs once per attached client, as in tmux.
+  * Work that covers the whole namespace must be idempotent per interval no matter
+    how often it is triggered: the plugin keeps a namespace wide timestamp (a
+    server option `@continuum-save-last-timestamp`, which is shared in shared mode,
+    or a file in the data dir in today's mode) and returns early, exactly like
+    tmux-continuum.
+  * Stage 1 adds a test: two sessions in one shared namespace with a status driven
+    save fire it once per interval, and with one server per session the timestamp
+    check still keeps it to one save.
 * No plugin in `psmux-plugins` reads `.port` or `.key` files directly (grep over
   `*.ps1`, `*.psm1`, `*.conf`).
 
