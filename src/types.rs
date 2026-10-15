@@ -2198,7 +2198,9 @@ impl AppState {
             return;
         }
         while self.paste_buffers.len() >= PASTE_BUFFER_LIMIT {
-            self.paste_buffers.pop();
+            if let Some(old) = self.paste_buffers.pop() {
+                self.paste_notify(false, old.name);
+            }
         }
         let name = loop {
             let n = format!("buffer{}", self.paste_next_index);
@@ -2207,7 +2209,22 @@ impl AppState {
                 break n;
             }
         };
-        self.paste_buffers.insert(0, PasteBuffer { name, data });
+        self.paste_buffers.insert(0, PasteBuffer { name: name.clone(), data });
+        self.paste_notify(true, name);
+    }
+
+    /// Tell control clients a buffer changed or went away, as paste.c's
+    /// paste_fire_event does for every add, set, rename and free (#813).
+    fn paste_notify(&self, changed: bool, name: String) {
+        if self.control_clients.is_empty() {
+            return;
+        }
+        let notif = if changed {
+            ControlNotification::PasteBufferChanged { name }
+        } else {
+            ControlNotification::PasteBufferDeleted { name }
+        };
+        crate::control::emit_notification(self, notif);
     }
 
     /// Tests: make the automatic buffers exactly these, newest first, named as
@@ -2242,17 +2259,28 @@ impl AppState {
         if data.is_empty() {
             return;
         }
+        // paste_set frees a buffer of the same name first (paste.c:293).
+        let before = self.paste_buffers.len();
         self.paste_buffers.retain(|b| b.name != name);
-        self.named_buffers.insert(name.to_string(), data);
+        let replaced = self.paste_buffers.len() != before;
+        if self.named_buffers.insert(name.to_string(), data).is_some() || replaced {
+            self.paste_notify(false, name.to_string());
+        }
+        self.paste_notify(true, name.to_string());
     }
 
     /// Delete the buffer of this name. False when there is none.
     pub fn paste_delete(&mut self, name: &str) -> bool {
-        if let Some(i) = self.paste_buffers.iter().position(|b| b.name == name) {
+        let found = if let Some(i) = self.paste_buffers.iter().position(|b| b.name == name) {
             self.paste_buffers.remove(i);
-            return true;
+            true
+        } else {
+            self.named_buffers.remove(name).is_some()
+        };
+        if found {
+            self.paste_notify(false, name.to_string());
         }
-        self.named_buffers.remove(name).is_some()
+        found
     }
 
     /// Every buffer as list-buffers prints it, `name: size bytes: "sample"`,
@@ -2286,8 +2314,10 @@ impl AppState {
         let Some(prev) = prev else { return };
         if self.paste_buffers.first().map(|b| b.name != prev).unwrap_or(false) {
             let new = self.paste_buffers.remove(0);
+            self.paste_notify(false, new.name.clone());
             if let Some(b) = self.paste_buffers.iter_mut().find(|b| b.name == prev) {
                 b.data.push_str(&new.data);
+                self.paste_notify(true, prev);
             }
         }
     }
@@ -3687,6 +3717,18 @@ pub enum CtrlReq {
     SetNamedBuffer(String, String),
     /// `set-buffer -a -b name`: append to the buffer of that name, or make it.
     AppendNamedBuffer(String, String),
+    /// A whole control mode `set-buffer` (-a, -b, -n and the data), run by
+    /// commands::run_set_buffer; the reply is tmux's error, if any (#813).
+    SetBufferCmd {
+        name: Option<String>,
+        data: String,
+        append: bool,
+        new_name: Option<String>,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// Control mode `delete-buffer [-b name]`, run by
+    /// commands::run_delete_buffer (#813).
+    DeleteBufferCmd(Option<String>, mpsc::Sender<Result<(), String>>),
     ListBuffers(mpsc::Sender<String>),
     ListBuffersFormat(mpsc::Sender<String>, String),
     ShowBuffer(mpsc::Sender<String>),

@@ -1606,18 +1606,72 @@ fn run_paste_buffer_here(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result
     deliver_paste_buffer(app, &text, pb)?;
 
     if pb.delete {
-        match &pb.buffer {
-            Some(name) => {
-                app.paste_delete(name);
-            }
-            None => {
-                if !app.paste_buffers.is_empty() {
-                    app.paste_buffers.remove(0);
-                }
-            }
+        // paste_delete announces it (%paste-buffer-deleted, paste.c paste_free).
+        let name = match &pb.buffer {
+            Some(name) => Some(name.clone()),
+            None => app.paste_buffers.first().map(|b| b.name.clone()),
+        };
+        if let Some(name) = name {
+            app.paste_delete(&name);
         }
     }
     Ok(None)
+}
+
+/// set-buffer as cmd-set-buffer.c runs it: `-n` renames the `-b` buffer (or
+/// the newest one), otherwise the data replaces the `-b` buffer (`-a`
+/// appends to it) or becomes a new automatic buffer. Empty data changes
+/// nothing. `Err` is tmux's message.
+pub(crate) fn run_set_buffer(
+    app: &mut AppState,
+    name: Option<&str>,
+    data: &str,
+    append: bool,
+    new_name: Option<&str>,
+) -> Result<(), String> {
+    if let Some(new) = new_name {
+        let from = match name {
+            Some(n) if app.paste_get(n).is_some() => n.to_string(),
+            Some(n) => return Err(format!("unknown buffer: {}", n)),
+            None => app.paste_buffers.first().map(|b| b.name.clone()).ok_or("no buffer")?,
+        };
+        // paste.c paste_rename.
+        if new.is_empty() {
+            return Err("new name is empty".to_string());
+        }
+        if from == new {
+            return Ok(());
+        }
+        let text = app.paste_get(&from).unwrap_or_default().to_string();
+        app.paste_delete(&from);
+        app.paste_set(new, text);
+        return Ok(());
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    match name {
+        Some(n) => {
+            let text = if append { format!("{}{}", app.paste_get(n).unwrap_or(""), data) } else { data.to_string() };
+            app.paste_set(n, text);
+        }
+        None => app.paste_add(data.to_string()),
+    }
+    Ok(())
+}
+
+/// delete-buffer as cmd-set-buffer.c runs it: the `-b` buffer, or the newest
+/// automatic one.
+pub(crate) fn run_delete_buffer(app: &mut AppState, name: Option<&str>) -> Result<(), String> {
+    let target = match name {
+        Some(n) => n.to_string(),
+        None => app.paste_buffers.first().map(|b| b.name.clone()).ok_or("no buffer")?,
+    };
+    if app.paste_delete(&target) {
+        Ok(())
+    } else {
+        Err(format!("unknown buffer: {}", target))
+    }
 }
 
 /// Execute a command string (used by menus, hooks, confirm dialogs, etc.)

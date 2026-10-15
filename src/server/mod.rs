@@ -5680,10 +5680,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(app.paste_get(&name).map(str::to_string));
                 }
                 CtrlReq::DeleteBuffer => {
-                    if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
+                    // By name, so paste_delete announces it.
+                    if let Some(name) = app.paste_buffers.first().map(|b| b.name.clone()) {
+                        app.paste_delete(&name);
+                    }
                 }
                 CtrlReq::DeleteBufferAt(idx) => {
-                    if idx < app.paste_buffers.len() { app.paste_buffers.remove(idx); }
+                    if let Some(name) = app.paste_buffers.get(idx).map(|b| b.name.clone()) {
+                        app.paste_delete(&name);
+                    }
+                }
+                CtrlReq::SetBufferCmd { name, data, append, new_name, resp } => {
+                    let _ = resp.send(crate::commands::run_set_buffer(
+                        &mut app, name.as_deref(), &data, append, new_name.as_deref()));
+                }
+                CtrlReq::DeleteBufferCmd(name, resp) => {
+                    let _ = resp.send(crate::commands::run_delete_buffer(&mut app, name.as_deref()));
                 }
                 CtrlReq::DeleteNamedBuffer(name, resp) => {
                     let found = app.paste_delete(&name);

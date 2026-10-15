@@ -171,6 +171,16 @@ pub(crate) fn is_catalog_command(name: &str) -> bool {
     })
 }
 
+/// Whether the control mode parser accepts `name` as a command besides the
+/// [`TMUX_COMMANDS`] catalog: the psmux and iTerm2 names its dispatcher runs,
+/// and a prefix of a catalog name, which tmux resolves to the one command it
+/// abbreviates (cmd.c cmd_find_entry) and the dispatcher answers on its own.
+pub(crate) fn is_control_extension_command(name: &str) -> bool {
+    matches!(name, "dump" | "dump-state" | "new-pane" | "newp" | "split-pane" | "splitp"
+        | "zoom-pane" | "phony-command" | "run-command" | "runcmd")
+        || (!name.is_empty() && TMUX_COMMANDS.iter().any(|entry| entry.starts_with(name)))
+}
+
 /// Expand a `set-option -F` value as a format before it is stored.
 ///
 /// tmux's set-option takes `-F` and runs the value through format_expand before
@@ -849,6 +859,108 @@ fn capture_pane_special(
         None if has('q') => Ok(String::new()),
         None => Err("no alternate screen".to_string()),
     })
+}
+
+/// A parsed control mode `set-buffer` (#813), run on the server by
+/// commands::run_set_buffer.
+pub(crate) struct SetBufferArgs {
+    /// `-b`: the buffer by name; none means a new automatic buffer.
+    pub name: Option<String>,
+    pub content: String,
+    /// `-w`: also put the text on the system clipboard.
+    pub clipboard: bool,
+    /// `-a`: append to the buffer instead of replacing it.
+    pub append: bool,
+    /// `-n`: rename the buffer instead of setting it.
+    pub new_name: Option<String>,
+}
+
+/// Parse `set-buffer [-aw] [-b name] [-n new-name] [-H hex] [--] data`.
+///
+/// `Ok(None)` is an empty data argument, which tmux accepts and ignores
+/// (cmd-set-buffer.c returns before paste_set when the length is 0); no data
+/// at all is its "no data specified" error.
+pub(crate) fn parse_set_buffer_args(args: &[&str]) -> Result<Option<SetBufferArgs>, String> {
+    let mut buf_name: Option<String> = None;
+    let mut new_name: Option<String> = None;
+    let mut append = false;
+    let mut propagate_to_clipboard = false;
+    let mut hex_content: Option<&str> = None;
+    let mut i = 0;
+    let mut content_parts: Vec<&str> = Vec::new();
+    while i < args.len() {
+        if args[i] == "-b" {
+            if let Some(name) = args.get(i + 1) {
+                buf_name = Some(name.to_string());
+            }
+            i += 2; // skip -b and its value (buffer name)
+        } else if args[i] == "-n" {
+            new_name = args.get(i + 1).map(|n| n.to_string());
+            i += 2;
+        } else if args[i] == "-a" {
+            append = true;
+            i += 1;
+        } else if args[i] == "-w" {
+            propagate_to_clipboard = true;
+            i += 1;
+        } else if args[i] == "-H" {
+            // Byte-exact content, hex encoded. Bare words cannot carry a
+            // buffer: this line has already been split on `;`, tokenized
+            // with quote grouping stripped, and had runs of whitespace
+            // collapsed, so quotes, tabs, control bytes and newlines are
+            // gone before the handler runs. tmux's paste is verbatim, and
+            // for a buffer pasted at a shell prompt the lost quoting is a
+            // DIFFERENT command, not cosmetic damage.
+            hex_content = args.get(i + 1).copied();
+            i += 2;
+        } else if args[i] == "--" {
+            // End of options: the data follows even when it starts with
+            // `-` (issue #795: `set-buffer -- -x=foo` stored nothing).
+            content_parts.extend_from_slice(&args[i + 1..]);
+            break;
+        } else if args[i].starts_with('-') {
+            i += 1; // skip unknown flags
+        } else {
+            content_parts.extend_from_slice(&args[i..]);
+            break;
+        }
+    }
+    let clipboard = propagate_to_clipboard;
+    if new_name.is_some() {
+        return Ok(Some(SetBufferArgs { name: buf_name, content: String::new(), clipboard, append, new_name }));
+    }
+    // A control-mode client is an external boundary, so a bad payload is
+    // refused loudly rather than stored half-decoded. psmux buffers are
+    // Rust `String`s, so non-UTF-8 bytes are rejected here too (the CLI
+    // never sends them: load-buffer reads the file as UTF-8 and errors on
+    // the file itself).
+    let content = match hex_content {
+        Some(hex) => crate::util::hex_decode(hex)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(|| "set-buffer: -H requires hex-encoded UTF-8".to_string())?,
+        None if content_parts.is_empty() => return Err("no data specified".to_string()),
+        None => content_parts.join(" "),
+    };
+    if content.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SetBufferArgs { name: buf_name, content, clipboard, append, new_name }))
+}
+
+/// Run a parsed set-buffer on the server: `Err` is tmux's error text.
+fn run_set_buffer(tx: &TargetedSender, set: SetBufferArgs) -> Result<(), String> {
+    if set.clipboard && set.new_name.is_none() {
+        crate::clipboard::copy_to_system_clipboard(&set.content);
+    }
+    let (rtx, rrx) = mpsc::channel();
+    let _ = tx.send(CtrlReq::SetBufferCmd {
+        name: set.name,
+        data: set.content,
+        append: set.append,
+        new_name: set.new_name,
+        resp: rtx,
+    });
+    rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(Ok(()))
 }
 
 /// Re-join already-tokenized command args into a single command string,
@@ -2023,6 +2135,34 @@ if control_echo || control_noecho {
             // and is required for iTerm2's multi-command kickoff lines like
             // `show -v -q -t $0 @x; refresh-client -C 80,25; show ...`.
             let parts = split_top_level_semicolons(stripped);
+            // tmux parses the whole line before it runs any of it, so an
+            // unknown command anywhere in it is one `parse error` block and
+            // nothing runs (control.c control_error, issue #813).
+            let unknown = parts.iter().find_map(|part| {
+                let name = parse_command_line(part).into_iter().next()?;
+                let known = is_catalog_command(&name)
+                    || is_control_extension_command(&name)
+                    || aliases_ctrl.read().map(|m| m.contains_key(&name)).unwrap_or(false);
+                (!known).then_some(name)
+            });
+            if let Some(name) = unknown {
+                cmd_counter += 1;
+                let ts = chrono::Utc::now().timestamp();
+                let mut out = String::new();
+                if control_echo {
+                    out.push_str(stripped);
+                    out.push('\n');
+                }
+                out.push_str(&control::format_begin(ts, cmd_counter));
+                out.push('\n');
+                out.push_str(&format!("parse error: unknown command: {}\n", name));
+                out.push_str(&control::format_error(ts, cmd_counter));
+                out.push('\n');
+                let mut ws = write_lock.lock().unwrap();
+                let _ = ws.write_all(out.as_bytes());
+                let _ = ws.flush();
+                continue;
+            }
             let parts = coalesce_send_commands(parts);
             if parts.is_empty() { continue; }
             let mut iter = parts.into_iter();
@@ -2409,6 +2549,7 @@ if control_echo || control_noecho {
             out.push('\n');
         }
 
+        let mut failed = false;
         match response_result {
             Some(Ok(response)) => {
                 // Sentinel-encoded error: dispatcher signals %error
@@ -2431,11 +2572,13 @@ if control_echo || control_noecho {
                 };
                 out.push_str(&footer);
                 out.push('\n');
+                failed = is_error;
             }
             Some(Err(_)) => {
                 out.push_str("command timed out\n");
                 out.push_str(&control::format_error(ts, cmd_counter));
                 out.push('\n');
+                failed = true;
             }
             None => {
                 // Command dispatched without response channel (fire and forget)
@@ -2447,6 +2590,14 @@ if control_echo || control_noecho {
         let _ = ws.write_all(out.as_bytes());
         let _ = ws.flush();
         drop(ws);
+        // A failed command drops the rest of its line: tmux removes the
+        // remaining items of the command list (cmd-queue.c cmdq_next,
+        // cmdq_remove_group after CMD_RETURN_ERROR), so `set-buffer ... ;
+        // paste-buffer ...` never pastes when set-buffer fails (issue #813).
+        // `pending` only ever holds the rest of the current line.
+        if failed {
+            pending.clear();
+        }
     }
 
     // Deregister and clean up.
@@ -3744,9 +3895,9 @@ match cmd {
             None => {
                 let err = "set-buffer: -H requires hex-encoded UTF-8\n";
                 if persistent {
-                    let _ = tx.send(CtrlReq::ShowTextPopup("set-buffer".to_string(), format!("ERROR: {}", err.trim_end())));
+                    let _ = tx.send(CtrlReq::ShowTextPopup("set-buffer".to_string(), format!("ERROR: {}", err)));
                 } else {
-                    let _ = write!(write_stream, "ERROR: {}", err);
+                    let _ = write!(write_stream, "ERROR: {}\n", err);
                     let _ = write_stream.flush();
                 }
             }
@@ -6394,10 +6545,11 @@ fn dispatch_control_command(
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {
+                // An empty template prints an empty line; only a missing one
+                // is the default message (cmd-display-message.c, issue #813).
                 parsed
                     .template()
                     .map(|t| t.trim_matches('"').to_string())
-                    .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| crate::commands::DISPLAY_MESSAGE_DEFAULT_FMT.to_string())
             };
             let verbose_template = (parsed.verbose && !parsed.list_all && !parsed.literal).then(|| fmt.clone());
@@ -6426,7 +6578,11 @@ fn dispatch_control_command(
                     None if print_mode => shown,
                     None => text,
                 };
-                let _ = resp_tx.send(reply.trim_end_matches('\n').to_string());
+                let reply = reply.trim_end_matches('\n');
+                // `-p` always prints its one line, an empty one included
+                // (control_write of the expanded message).
+                let reply = if print_mode && reply.is_empty() { "\n" } else { reply };
+                let _ = resp_tx.send(reply.to_string());
             }
             true
         }
@@ -6959,7 +7115,9 @@ fn dispatch_control_command(
                         name, &value, inherited, value_only,
                     ).trim_end_matches('\n').to_string(),
                     None if combined_has2('q') => String::new(),
-                    None => format!("ERROR: invalid option: {}", name),
+                    // tmux answers %error here (cmd-show-options.c), not a
+                    // body under %end (issue #813).
+                    None => format!("\u{0001}ERR\u{0001}invalid option: {}", name),
                 };
                 let _ = resp_tx.send(reply);
                 return true;
@@ -7772,6 +7930,45 @@ fn dispatch_control_command(
             }
             true
         }
+        // set-buffer, paste-buffer and delete-buffer were "unknown command"
+        // here (issue #813) although the CLI route has them; a client that
+        // pastes with `set-buffer` + `paste-buffer -p` could not paste.
+        "set-buffer" | "setb" => {
+            match parse_set_buffer_args(args).and_then(|set| match set {
+                Some(set) => run_set_buffer(tx, set),
+                None => Ok(()),
+            }) {
+                Ok(()) => { let _ = resp_tx.send(String::new()); }
+                Err(err) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", err)); }
+            }
+            true
+        }
+        "paste-buffer" | "pasteb" => {
+            // The one shot route's parser and executor (issue #684); `-t` was
+            // peeled off into raw_target.
+            let mut pb_args = crate::commands::parse_paste_buffer_args(args);
+            if pb_args.target.is_none() {
+                pb_args.target = raw_target.map(|s| s.to_string());
+            }
+            let (rtx, rrx) = mpsc::channel::<Option<String>>();
+            let _ = tx.send(CtrlReq::PasteBuffer(pb_args, rtx));
+            match rrx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Some(msg)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", msg)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
+            true
+        }
+        "delete-buffer" | "deleteb" => {
+            // tmux: "unknown buffer: NAME" for a -b that names nothing, and
+            // "no buffer" with no automatic buffer (cmd-set-buffer.c).
+            let (rtx, rrx) = mpsc::channel();
+            let _ = tx.send(CtrlReq::DeleteBufferCmd(flag_value(args, "-b"), rtx));
+            match rrx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
+            true
+        }
         "run-command" | "runcmd" => {
             let full_cmd = args.join(" ");
             let (rtx, rrx) = mpsc::channel::<String>();
@@ -7890,3 +8087,7 @@ mod tests_reply_stream_error;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue734_followup_new_session_reply.rs"]
 mod tests_issue734_followup_new_session_reply;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue813_cc_buffers_cmdlist.rs"]
+mod tests_issue813_cc_buffers_cmdlist;
