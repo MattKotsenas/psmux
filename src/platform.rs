@@ -901,17 +901,17 @@ pub fn disable_vti_on_stdin() {
 ///
 /// `RTL_USER_PROCESS_PARAMETERS.ConsoleFlags` bit 0 is the process's "Ctrl+C is
 /// disabled" state.  `SetConsoleCtrlHandler(NULL, TRUE)` sets it, so does
-/// `CreateProcess` with `CREATE_NEW_PROCESS_GROUP`, and — this is the part that
-/// makes it a psmux problem — it is INHERITED by every child, including across
+/// `CreateProcess` with `CREATE_NEW_PROCESS_GROUP`, and (this is the part that
+/// makes it a psmux problem) it is INHERITED by every child, including across
 /// `CREATE_NEW_CONSOLE` (measured: a child created with
 /// `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP` from a clean parent reads
 /// clear, and the same child from a parent holding the bit reads set).  Windows
 /// offers no API to read it back.
 ///
-/// So when anything above psmux holds that bit — a launcher that backgrounds a
+/// So when anything above psmux holds that bit (a launcher that backgrounds a
 /// shell with `CREATE_NEW_PROCESS_GROUP` (Node's `spawn({detached:true})` does
 /// exactly this), a build/CI harness, a wrapper that called
-/// `SetConsoleCtrlHandler(NULL, TRUE)` and did not restore it — the psmux CLI
+/// `SetConsoleCtrlHandler(NULL, TRUE)` and did not restore it), the psmux CLI
 /// inherits it, `spawn_server_hidden` hands it to the server, and the server
 /// hands it to every ConPTY pane shell and thereby to every program the user
 /// runs in a pane.  `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` then still
@@ -923,7 +923,7 @@ pub fn disable_vti_on_stdin() {
 /// get default signal dispositions (`proc_clear_signals`), so a tmux started
 /// with SIGINT ignored still gives its panes a working interrupt.  A pane's
 /// interrupt belongs to the pane, not to whatever shell happened to start the
-/// server, so the bit is cleared once at server startup — before any pane, warm
+/// server, so the bit is cleared once at server startup, before any pane, warm
 /// spare or child server is spawned, so all of them are born able to hear it.
 ///
 /// The server's own protection against the broadcasts it relays does not depend
