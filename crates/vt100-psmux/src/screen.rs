@@ -115,6 +115,10 @@ pub struct Screen {
     /// DECSET 1049 restored the app's colors instead of the shell's, and every
     /// line printed afterwards inherited them.
     alternate_saved_attrs: crate::attrs::Attrs,
+    /// Where the cursor was on the main screen when the alternate screen was
+    /// entered, `None` while it is not in use (tmux's `saved_cx`/`saved_cy`,
+    /// set by screen_alternate_on and reset by screen_alternate_off).
+    alternate_saved_cursor: Option<(u16, u16)>,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -232,6 +236,7 @@ impl Screen {
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
             alternate_saved_attrs: crate::attrs::Attrs::default(),
+            alternate_saved_cursor: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -1303,6 +1308,10 @@ impl Screen {
     }
 
     fn enter_alternate_grid(&mut self) {
+        if !self.mode(MODE_ALTERNATE_SCREEN) {
+            let pos = self.grid.pos();
+            self.alternate_saved_cursor = Some((pos.col, pos.row));
+        }
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
@@ -1323,6 +1332,27 @@ impl Screen {
             self.copy_alt_visible_to_main_scrollback();
         }
         self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.alternate_saved_cursor = None;
+    }
+
+    /// The main screen cursor `(col, row)` saved when the alternate screen
+    /// was entered, `None` when the alternate screen is not in use.
+    #[must_use]
+    pub fn alternate_saved_cursor(&self) -> Option<(u16, u16)> {
+        if self.alternate_screen() {
+            self.alternate_saved_cursor
+        } else {
+            None
+        }
+    }
+
+    /// While the alternate screen is in use, show the main screen it covers
+    /// (tmux's saved grid) instead. Meant for a snapshot, never the live
+    /// screen: the alternate screen stays allocated and comes back on the
+    /// next write.
+    pub(crate) fn show_saved_normal_grid(&mut self) {
+        self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.alternate_saved_cursor = None;
     }
 
     /// Append every non-blank visible row of the alt grid to the

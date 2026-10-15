@@ -1255,6 +1255,12 @@ fn capture_target(app: &AppState, pane_id: Option<usize>) -> (usize, Vec<usize>)
 }
 
 pub fn capture_active_pane_text(app: &mut AppState, pane_id: Option<usize>, preserve_trailing: bool) -> io::Result<Option<String>> {
+    capture_pane_text_from(app, pane_id, preserve_trailing, false)
+}
+
+/// `saved` reads the main screen the alternate screen covers (`capture-pane
+/// -a`), `Ok(None)` when the alternate screen is not in use.
+pub fn capture_pane_text_from(app: &mut AppState, pane_id: Option<usize>, preserve_trailing: bool, saved: bool) -> io::Result<Option<String>> {
     // A floating pane: named by %id, or the focused one when the request has
     // no id (a -t naming it by index runs with it focused). capture_target
     // knows the tiled tree only, so a floating %id captured the ACTIVE pane
@@ -1276,7 +1282,13 @@ pub fn capture_active_pane_text(app: &mut AppState, pane_id: Option<usize>, pres
         let win = &mut app.windows[win_idx];
         match active_pane_mut(&mut win.root, &path) { Some(p) => p, None => return Ok(None) }
     };
-    let parser = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let guard = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let saved_parser;
+    let parser: &vt100::Parser = if saved {
+        match guard.saved_normal_snapshot() { Some(snap) => { saved_parser = snap; &saved_parser } None => return Ok(None) }
+    } else {
+        &guard
+    };
     let screen = parser.screen();
     let mut text = String::new();
     for r in 0..p.last_rows {
@@ -2211,10 +2223,21 @@ pub fn compute_capture_range(s: Option<i32>, e: Option<i32>, last_row: u16) -> (
 }
 
 pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i32>, pane_id: Option<usize>, preserve_trailing: bool) -> io::Result<Option<String>> {
+    capture_pane_range_from(app, s, e, pane_id, preserve_trailing, false)
+}
+
+/// `saved`: see [`capture_pane_text_from`].
+pub fn capture_pane_range_from(app: &mut AppState, s: Option<i32>, e: Option<i32>, pane_id: Option<usize>, preserve_trailing: bool, saved: bool) -> io::Result<Option<String>> {
     let (win_idx, path) = capture_target(app, pane_id);
     let win = &mut app.windows[win_idx];
     let p = match active_pane_mut(&mut win.root, &path) { Some(p) => p, None => return Ok(None) };
-    let mut parser = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let mut guard = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let mut saved_parser;
+    let parser: &mut vt100::Parser = if saved {
+        match guard.saved_normal_snapshot() { Some(snap) => { saved_parser = snap; &mut saved_parser } None => return Ok(None) }
+    } else {
+        &mut guard
+    };
     let rows = p.last_rows;
     let cols = p.last_cols;
     let last_row = rows.saturating_sub(1) as i32;
@@ -2326,10 +2349,21 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
 /// the indexed colour the pane actually wrote, and a caller that wants the
 /// resolved RGB reads the rendered frame instead.
 pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<i32>, pane_id: Option<usize>, preserve_trailing: bool) -> io::Result<Option<String>> {
+    capture_pane_styled_from(app, s, e, pane_id, preserve_trailing, false)
+}
+
+/// `saved`: see [`capture_pane_text_from`].
+pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i32>, pane_id: Option<usize>, preserve_trailing: bool, saved: bool) -> io::Result<Option<String>> {
     let (win_idx, path) = capture_target(app, pane_id);
     let win = &mut app.windows[win_idx];
     let p = match active_pane_mut(&mut win.root, &path) { Some(p) => p, None => return Ok(None) };
-    let mut parser = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let mut guard = match p.live_parser().lock() { Ok(g) => g, Err(_) => return Ok(None) };
+    let mut saved_parser;
+    let parser: &mut vt100::Parser = if saved {
+        match guard.saved_normal_snapshot() { Some(snap) => { saved_parser = snap; &mut saved_parser } None => return Ok(None) }
+    } else {
+        &mut guard
+    };
     let rows = p.last_rows;
     let cols = p.last_cols;
     let last_row = rows.saturating_sub(1) as i32;
@@ -2998,3 +3032,6 @@ mod test_issue789_copy_prompt_editor;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue789_followup_keys_quotes.rs"]
 mod test_issue789_followup_keys_quotes;
+#[cfg(test)]
+#[path = "../tests-rs/test_issue810_saved_screen.rs"]
+mod tests_issue810_saved_screen;

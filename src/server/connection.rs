@@ -815,6 +815,42 @@ fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
     Some((target.unwrap_or_else(|| String::new()), bytes))
 }
 
+/// The capture-pane forms that do not read the visible grid
+/// (cmd-capture-pane.c cmd_capture_pane_exec): `-P` is the pending incomplete
+/// escape sequence, which psmux's parser does not keep, so it is always empty;
+/// `-a` is the main screen behind the alternate screen, "no alternate screen"
+/// (or with `-q`, nothing) when the pane is not on it. `None` for any other
+/// capture.
+fn capture_pane_special(
+    args: &[&str],
+    tx: &TargetedSender,
+    start: Option<i32>,
+    end: Option<i32>,
+    pane_id: Option<usize>,
+) -> Option<Result<String, String>> {
+    let has = |c: char| crate::cli::has_short_flag(args, c);
+    if has('P') {
+        return Some(Ok(String::new()));
+    }
+    if !has('a') {
+        return None;
+    }
+    let (rtx, rrx) = mpsc::channel::<Option<String>>();
+    let _ = tx.send(CtrlReq::CapturePaneSaved {
+        resp: rtx,
+        start,
+        end,
+        pane_id,
+        styled: has('e'),
+        preserve_trailing: has('N'),
+    });
+    Some(match rrx.recv_timeout(Duration::from_secs(5)).ok().flatten() {
+        Some(text) => Ok(text),
+        None if has('q') => Ok(String::new()),
+        None => Err("no alternate screen".to_string()),
+    })
+}
+
 /// Re-join already-tokenized command args into a single command string,
 /// re-quoting any token that held whitespace or quote characters so the
 /// grouping survives a later re-parse by `parse_command_line` (#476).
@@ -3016,15 +3052,32 @@ match cmd {
             Some(v) => v.parse::<i32>().ok(),
             None => None,
         };
-        let (rtx, rrx) = mpsc::channel::<String>();
-        if escape_seqs {
-            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end, capture_pane_id, preserve_trailing));
-        } else if s_arg.is_some() || e_arg.is_some() {
-            let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end, capture_pane_id, preserve_trailing));
-        } else {
-            let _ = tx.send(CtrlReq::CapturePane(rtx, capture_pane_id, preserve_trailing));
-        }
-        if let Ok(mut text) = rrx.recv() {
+        // -P and -a answer before the visible grid is read (#810).
+        let captured = match capture_pane_special(&args, &tx, start, end, capture_pane_id) {
+            Some(Ok(text)) => Some(if text.is_empty() && print_stdout { "\n".to_string() } else { text }),
+            Some(Err(e)) => {
+                if persistent {
+                    let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), format!("ERROR: {}", e)));
+                } else {
+                    let _ = write!(write_stream, "ERROR: {}\n", e);
+                    let _ = write_stream.flush();
+                }
+                None
+            }
+            None => {
+                let (rtx, rrx) = mpsc::channel::<String>();
+                if escape_seqs {
+                    let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end, capture_pane_id, preserve_trailing));
+                } else if s_arg.is_some() || e_arg.is_some() {
+                    let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end, capture_pane_id, preserve_trailing));
+                } else {
+                    let _ = tx.send(CtrlReq::CapturePane(rtx, capture_pane_id, preserve_trailing));
+                }
+                rrx.recv().ok()
+            }
+        };
+        if captured.is_none() && !persistent && pending_chain.is_empty() { break; }
+        if let Some(mut text) = captured {
             if join_lines {
                 // Remove trailing whitespace from each line (join wrapped lines)
                 text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
@@ -6511,6 +6564,19 @@ fn dispatch_control_command(
             let preserve_trailing = crate::cli::has_short_flag(&args, 'N');
             // -t %N target: resolved server-side by pane id across all windows.
             let capture_pane_id = if pane_is_id { target_pane } else { None };
+            // -P and -a answer before the visible grid is read (#810).
+            match capture_pane_special(args, tx, start, end, capture_pane_id) {
+                Some(Ok(text)) => {
+                    // tmux writes one line even for an empty result.
+                    let _ = resp_tx.send(if text.is_empty() { "\n".to_string() } else { text });
+                    return true;
+                }
+                Some(Err(e)) => {
+                    let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e));
+                    return true;
+                }
+                None => {}
+            }
             let (rtx, rrx) = mpsc::channel::<String>();
             if styled {
                 let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end, capture_pane_id, preserve_trailing));

@@ -3573,6 +3573,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::CapturePaneRange(resp, s, e, pane_id, preserve_trailing) => {
                     if let Some(text) = capture_active_pane_range(&mut app, s, e, pane_id, preserve_trailing)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
+                CtrlReq::CapturePaneSaved { resp, start, end, pane_id, styled, preserve_trailing } => {
+                    let text = if styled {
+                        crate::copy_mode::capture_pane_styled_from(&mut app, start, end, pane_id, preserve_trailing, true)?
+                    } else if start.is_some() || end.is_some() {
+                        crate::copy_mode::capture_pane_range_from(&mut app, start, end, pane_id, preserve_trailing, true)?
+                    } else {
+                        crate::copy_mode::capture_pane_text_from(&mut app, pane_id, preserve_trailing, true)?
+                    };
+                    let _ = resp.send(text);
+                }
                 CtrlReq::FocusWindow(wid) => {
                     // wid is a display index (same as tmux window number), convert to internal array index
                     if let Some(internal_idx) = app.win_pos(wid) {

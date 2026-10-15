@@ -67,6 +67,22 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
         }
     }
 
+    /// A [`snapshot`](Self::snapshot) of the main screen that the alternate
+    /// screen covers, or `None` when the alternate screen is not in use.
+    /// This is what tmux's `capture-pane -a` reads (`wp->base.saved_grid`).
+    #[must_use]
+    pub fn saved_normal_snapshot(&self) -> Option<Self>
+    where
+        CB: Default,
+    {
+        if !self.screen().alternate_screen() {
+            return None;
+        }
+        let mut snap = self.snapshot();
+        snap.screen.screen.show_saved_normal_grid();
+        Some(snap)
+    }
+
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {

@@ -3482,6 +3482,17 @@ pub enum CtrlReq {
     /// target pane id (`-t %N`, None = active pane), preserve trailing
     /// spaces (`-N`).
     CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
+    /// `capture-pane -a`: the main screen the alternate screen covers, with
+    /// the same -S/-E/-e/-N handling as the captures above. `None` when the
+    /// pane is not on the alternate screen (issue #810).
+    CapturePaneSaved {
+        resp: mpsc::Sender<Option<String>>,
+        start: Option<i32>,
+        end: Option<i32>,
+        pane_id: Option<usize>,
+        styled: bool,
+        preserve_trailing: bool,
+    },
     /// (client id, process id of the attaching client when the server could
     /// read it from the connection, issue #724).
     ClientAttach(u64, Option<u32>),

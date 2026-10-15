@@ -2908,6 +2908,13 @@ fn run_main() -> io::Result<()> {
                         "-e" => { cmd.push_str(" -e"); }
                         "-J" => { cmd.push_str(" -J"); }
                         "-N" => { cmd.push_str(" -N"); }
+                        // -P (pending partial sequence), -C (octal escape),
+                        // -a (saved normal screen), -q (quiet) reach the
+                        // server too (issue #810).
+                        "-P" => { cmd.push_str(" -P"); }
+                        "-C" => { cmd.push_str(" -C"); }
+                        "-a" => { cmd.push_str(" -a"); }
+                        "-q" => { cmd.push_str(" -q"); }
                         "-b" => {
                             if let Some(buf) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -b {}", buf));
@@ -2917,7 +2924,7 @@ fn run_main() -> io::Result<()> {
                         a if a.len() > 2
                             && a.starts_with('-')
                             && !a.starts_with("--")
-                            && a.chars().skip(1).all(|c| matches!(c, 'p' | 'e' | 'J' | 'N')) =>
+                            && a.chars().skip(1).all(|c| matches!(c, 'p' | 'e' | 'J' | 'N' | 'P' | 'C' | 'a' | 'q')) =>
                         {
                             // POSIX cluster of capture-pane booleans (-ep, -pe, -pJ, -eJ,
                             // -epJ, ...). -t/-S/-E/-b take a value, so they are NOT
@@ -2926,6 +2933,9 @@ fn run_main() -> io::Result<()> {
                             if a.contains('e') { cmd.push_str(" -e"); }
                             if a.contains('J') { cmd.push_str(" -J"); }
                             if a.contains('N') { cmd.push_str(" -N"); }
+                            for f in ['P', 'C', 'a', 'q'] {
+                                if a.contains(f) { cmd.push_str(&format!(" -{}", f)); }
+                            }
                         }
                         // Cluster ending in a value-taking flag: -pt <target>,
                         // -pet <target>, -pS <start>, etc.
@@ -2935,7 +2945,7 @@ fn run_main() -> io::Result<()> {
                             && {
                                 let last = a.chars().last().unwrap_or(' ');
                                 matches!(last, 't' | 'S' | 'E' | 'b')
-                                    && a[1..a.len()-1].chars().all(|c| matches!(c, 'p' | 'e' | 'J' | 'N'))
+                                    && a[1..a.len()-1].chars().all(|c| matches!(c, 'p' | 'e' | 'J' | 'N' | 'P' | 'C' | 'a' | 'q'))
                             } =>
                         {
                             let last = a.chars().last().unwrap();
@@ -2944,6 +2954,9 @@ fn run_main() -> io::Result<()> {
                             if a.contains('e') { cmd.push_str(" -e"); }
                             if a.contains('J') { cmd.push_str(" -J"); }
                             if a.contains('N') { cmd.push_str(" -N"); }
+                            for f in ['P', 'C', 'a', 'q'] {
+                                if a.contains(f) { cmd.push_str(&format!(" -{}", f)); }
+                            }
                             // Consume the next arg as the value for the trailing flag
                             if let Some(val) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -{} {}", last, val));
@@ -2957,6 +2970,11 @@ fn run_main() -> io::Result<()> {
                 cmd.push('\n');
                 if print_stdout {
                     let resp = send_control_with_response(cmd)?;
+                    // `-a` with no alternate screen is tmux's error.
+                    if let Some(msg) = resp.strip_prefix("ERROR: ") {
+                        eprintln!("psmux: {}", msg.trim_end());
+                        std::process::exit(1);
+                    }
                     print!("{}", resp);
                 } else {
                     send_control(cmd)?;

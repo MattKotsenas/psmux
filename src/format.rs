@@ -2249,7 +2249,16 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             }
             String::new()
         }
-        "cursor_flag" => "0".into(),
+        // DECTCEM, as tmux's MODE_CURSOR (format.c format_cb_cursor_flag);
+        // it was a constant 0 (issue #810).
+        "cursor_flag" => {
+            if let Some(p) = target_pane() {
+                if let Ok(parser) = p.term.lock() {
+                    return if parser.screen().hide_cursor() { "0".into() } else { "1".into() };
+                }
+            }
+            "0".into()
+        }
 
         // ── Mouse ──
         "mouse_x" => app.last_mouse_x.to_string(),
@@ -2508,7 +2517,17 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             }
             "0".into()
         }
-        "alternate_saved_x" | "alternate_saved_y" => "0".into(),
+        // tmux prints saved_cx/saved_cy, UINT_MAX while nothing is saved
+        // (screen.c screen_alternate_off); it was a constant 0 (issue #810).
+        "alternate_saved_x" | "alternate_saved_y" => {
+            let saved = target_pane()
+                .and_then(|p| p.term.lock().ok().and_then(|parser| parser.screen().alternate_saved_cursor()));
+            match saved {
+                Some((x, _)) if var == "alternate_saved_x" => x.to_string(),
+                Some((_, y)) => y.to_string(),
+                None => u32::MAX.to_string(),
+            }
+        }
 
         // ── Mouse tracking flags (#662) ──
         //
