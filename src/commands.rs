@@ -1438,6 +1438,14 @@ pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: 
             if plain.starts_with('{') {
                 return Ok(None);
             }
+            // This session's own name, when no window has it, is the session
+            // and so its current pane, which may be a focused float; the
+            // tiled path below would name the pane under it.
+            if !t.contains(':') && plain == app.session_name
+                && !matches!(app.resolve_window_spec(t, false), Ok(crate::types::WindowTarget::Pos(_)))
+            {
+                return Ok(None);
+            }
             // A bare index is a pane of the current window before it is a
             // window (cmd_find_get_pane, cmd-find.c:575 to :600).
             if !app.windows.is_empty() && plain.chars().all(|c| c.is_ascii_digit()) {

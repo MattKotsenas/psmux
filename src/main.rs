@@ -1320,9 +1320,18 @@ fn run_main() -> io::Result<()> {
             let session = parsed_target.session.unwrap_or_else(|| "default".to_string());
             // Store the full target for the server to parse, with $N resolved
             // to the actual session name so the server can look up port files.
+            // A lone `$N` of a window or pane command becomes `name:`: bare,
+            // the server reads the name as a window of its session first and
+            // the on disk name never matches. Session commands take it bare.
+            let window_or_pane_command = command_index
+                .is_some_and(|i| crate::commands::in_server_target_kind(&args[i]).is_some()
+                    || crate::cli::window_target_command(&args[i])
+                    || matches!(args[i].as_str(), "unlink-window" | "unlinkw" | "link-window" | "linkw"));
             let resolved_full = if target.starts_with('$') {
                 if let Some(colon_pos) = target.find(':') {
                     format!("{}{}", session, &target[colon_pos..])
+                } else if window_or_pane_command {
+                    format!("{}:", session)
                 } else {
                     session.clone()
                 }
@@ -1363,10 +1372,7 @@ fn run_main() -> io::Result<()> {
             // a session of that name exists, it routes like no `-t` at all
             // and the server resolves it; it used to die here with "no server
             // running on session '<ns>__w2'".
-            let bare_window_or_pane = command_index
-                .is_some_and(|i| crate::commands::in_server_target_kind(&args[i]).is_some()
-                    || crate::cli::window_target_command(&args[i])
-                    || matches!(args[i].as_str(), "unlink-window" | "unlinkw" | "link-window" | "linkw"))
+            let bare_window_or_pane = window_or_pane_command
                 && crate::cli::bare_target_token(&target)
                 && !std::path::Path::new(&crate::paths::port_file(&port_file_base)).exists();
             if has_explicit_session && !is_switch_client && !is_detach_client && !bare_window_or_pane {

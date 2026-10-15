@@ -80,6 +80,17 @@ fn in_server_resolution_rewrites_bare_names_only() {
 }
 
 #[test]
+fn the_session_name_as_a_pane_is_left_to_the_session_path() {
+    // `display-message -t demo` must reach the session's current pane, which
+    // may be a focused float the tiled tree does not hold (issue #767 suite).
+    let app = app();
+    assert_eq!(resolve_in_server_target(&app, InServerTarget::Pane, "demo"), Ok(None));
+    assert_eq!(resolve_in_server_target(&app, InServerTarget::Pane, "=demo"), Ok(None));
+    // Any other unknown bare name is still refused, never the current pane.
+    assert!(resolve_in_server_target(&app, InServerTarget::Pane, "nosuch").is_err());
+}
+
+#[test]
 fn bare_target_token_shape() {
     for t in ["keywin", "=keywin", "0", "+1", "!", "{end}"] {
         assert!(crate::cli::bare_target_token(t), "{} is bare", t);
