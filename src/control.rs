@@ -237,6 +237,54 @@ pub fn has_control_clients(app: &AppState) -> bool {
     !app.control_clients.is_empty()
 }
 
+/// The session's window ids and its current window id, taken before a
+/// command runs so the window notifications can name what really changed.
+pub struct WindowSnapshot {
+    pub ids: Vec<usize>,
+    pub current: Option<usize>,
+}
+
+pub fn window_snapshot(app: &AppState) -> WindowSnapshot {
+    WindowSnapshot {
+        ids: app.windows.iter().map(|w| w.id).collect(),
+        current: app.windows.get(app.active_idx).map(|w| w.id),
+    }
+}
+
+/// The window notifications between two snapshots, in tmux's order: a window
+/// that left the session first (session.c session_detach fires window-unlinked
+/// before it picks a new current window), then the current window change, then
+/// a window that joined (spawn.c selects the new window before it fires
+/// window-linked).
+pub fn window_change_notifications(
+    before: &WindowSnapshot,
+    after: &WindowSnapshot,
+    session_id: usize,
+) -> Vec<ControlNotification> {
+    let mut out = Vec::new();
+    for id in before.ids.iter().filter(|id| !after.ids.contains(id)) {
+        out.push(ControlNotification::WindowClose { window_id: *id });
+    }
+    if let Some(cur) = after.current {
+        if before.current != Some(cur) {
+            out.push(ControlNotification::SessionWindowChanged { session_id, window_id: cur });
+        }
+    }
+    for id in after.ids.iter().filter(|id| !before.ids.contains(id)) {
+        out.push(ControlNotification::WindowAdd { window_id: *id });
+    }
+    out
+}
+
+/// Emit what a command did to the window list. These used to come from the
+/// command's hook and named whatever window was current when it fired, so
+/// `kill-window -t @2` with @1 current announced `%window-close @1` (#811).
+pub fn emit_window_changes(app: &AppState, before: &WindowSnapshot) {
+    for notif in window_change_notifications(before, &window_snapshot(app), app.session_id) {
+        emit_notification(app, notif);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,3 +606,7 @@ mod tests {
         assert_eq!(line, "%subscription-changed test_sub $1 @2 3 %4 : ");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue811_window_notifications.rs"]
+mod tests_issue811_window_notifications;

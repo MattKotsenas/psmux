@@ -3176,6 +3176,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // switched (one whose arm skipped the restore at the end
                     // of its iteration) is put back before this one runs.
                     temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
+                    // The real window list and current window, before any -t
+                    // focus, to diff against once the focus is put back.
+                    let windows_before = (!app.control_clients.is_empty()).then(|| control::window_snapshot(&app));
                     let req = match req {
                         CtrlReq::Targeted(target, inner) => {
                             match temp_target::apply_temp_target(&mut app, &mut temp_focus_restore, &target) {
@@ -8447,20 +8450,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let win_id = active_win.id;
                     let active_pane_id = get_active_pane_id(&active_win.root, &active_win.active_path).unwrap_or(0);
                     match event {
-                        "after-new-window" => {
-                            control::emit_notification(&app, crate::types::ControlNotification::WindowAdd { window_id: win_id });
-                        }
-                        "after-kill-pane" | "window-closed" => {
-                            control::emit_notification(&app, crate::types::ControlNotification::WindowClose { window_id: win_id });
-                        }
+                        // %window-add, %window-close and
+                        // %session-window-changed come from the window list
+                        // diff after the request (emit_window_changes), which
+                        // names the window that changed, not the current one.
                         "after-rename-window" => {
                             let name = active_win.name.clone();
                             control::emit_notification(&app, crate::types::ControlNotification::WindowRenamed { window_id: win_id, name });
-                        }
-                        "after-select-window" => {
-                            control::emit_notification(&app, crate::types::ControlNotification::SessionWindowChanged {
-                                session_id: app.session_id, window_id: win_id,
-                            });
                         }
                         "after-select-pane" => {
                             control::emit_notification(&app, crate::types::ControlNotification::WindowPaneChanged {
@@ -8495,12 +8491,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 layout,
                             });
                         }
-                        "window-linked" => {
-                            control::emit_notification(&app, crate::types::ControlNotification::WindowAdd { window_id: win_id });
-                        }
-                        "window-unlinked" => {
-                            control::emit_notification(&app, crate::types::ControlNotification::WindowClose { window_id: win_id });
-                        }
                         _ => {}
                     }
                 }
@@ -8514,6 +8504,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             // The request that carried a -t target is done: put the real
             // focus back (by pane id, see restore_temp_focus).
             temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
+            if let Some(before) = windows_before {
+                control::emit_window_changes(&app, &before);
+            }
             if mutates_state {
                 state_dirty = true;
             }
