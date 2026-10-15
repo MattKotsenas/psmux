@@ -1043,6 +1043,54 @@ fn list_keys_notes_args(args: &[&str]) -> (Option<String>, bool, Option<String>)
     (table, all, key)
 }
 
+/// The request a `set-hook [-agu] [-t target] hook [command]` makes, or
+/// `None` when there is nothing to do. Flags are read only before the hook
+/// name and `--` ends them (#583). A single command argument is the command
+/// string itself, as tmux takes it (cmd-set-option.c parses the hook's value
+/// as a command), so `set-hook -g h 'new-window -d'` stores
+/// `new-window -d`; it used to keep the quotes on the control mode and raw
+/// TCP routes and the hook ran nothing. Several words are re-quoted so they
+/// parse back the same.
+fn set_hook_request(args: &[&str]) -> Option<CtrlReq> {
+    let mut flag_chars = String::new();
+    let mut non_flag: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if non_flag.is_empty() {
+            if a == "--" {
+                non_flag.extend(args[i + 1..].iter().copied());
+                break;
+            }
+            if a == "-t" {
+                i += 2;
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) {
+                flag_chars.push_str(&a[1..]);
+                i += 1;
+                continue;
+            }
+        }
+        non_flag.push(a);
+        i += 1;
+    }
+    let name = non_flag.first()?.to_string();
+    if flag_chars.contains('u') {
+        return Some(CtrlReq::RemoveHook(name));
+    }
+    let command = match &non_flag[1..] {
+        [] => return None,
+        [one] => one.to_string(),
+        words => requote_command_tail(words),
+    };
+    Some(if flag_chars.contains('a') {
+        CtrlReq::AppendHook(name, command)
+    } else {
+        CtrlReq::SetHook(name, command)
+    })
+}
+
 fn requote_command_tail(args: &[&str]) -> String {
     // One encoder for the argv form, the one build_command decodes (#794).
     crate::pane::requote_argv(args)
@@ -5571,50 +5619,8 @@ match cmd {
         // after-new-window -u` used to route to the unset path and silently
         // delete the hook at rc 0; a dash-leading token after the hook name
         // is part of the hook command.
-        let mut flag_chars = String::new();
-        let mut non_flag: Vec<&str> = Vec::new();
-        {
-            let mut i = 0;
-            while i < args.len() {
-                let a = args[i];
-                if non_flag.is_empty() {
-                    if a == "--" {
-                        non_flag.extend(args[i + 1..].iter().copied());
-                        break;
-                    }
-                    if a.starts_with('-') && a.len() > 1
-                        && a.chars().skip(1).all(|c| c.is_ascii_alphabetic())
-                    {
-                        flag_chars.push_str(&a[1..]);
-                        i += 1;
-                        continue;
-                    }
-                }
-                non_flag.push(a);
-                i += 1;
-            }
-        }
-        let has_unset = flag_chars.contains('u');
-        let has_append = flag_chars.contains('a');
-        if has_unset {
-            // set-hook -gu <hook-name>  →  remove the hook
-            if let Some(name) = non_flag.first() {
-                let _ = tx.send(CtrlReq::RemoveHook(name.to_string()));
-            }
-        } else if non_flag.len() >= 2 {
-            // Extract hook command from raw line to preserve quoting
-            // (join of parsed tokens loses quotes around paths with spaces)
-            let hook_name = non_flag[0];
-            let hook_cmd = if let Some(pos) = line.find(hook_name) {
-                line[pos + hook_name.len()..].trim().to_string()
-            } else {
-                non_flag[1..].join(" ")
-            };
-            if has_append {
-                let _ = tx.send(CtrlReq::AppendHook(hook_name.to_string(), hook_cmd));
-            } else {
-                let _ = tx.send(CtrlReq::SetHook(hook_name.to_string(), hook_cmd));
-            }
+        if let Some(req) = set_hook_request(&args) {
+            let _ = tx.send(req);
         }
     }
     "show-hooks" => {
@@ -7611,20 +7617,10 @@ fn dispatch_control_command(
             true
         }
         "set-hook" => {
-            if let Some(command_start) = crate::cli::deferred_command_start(cmd, args) {
-                if command_start < args.len() {
-                    let name = args[command_start - 1].to_string();
-                    let command = requote_command_tail(&args[command_start..]);
-                    let has_append = args.iter().any(|a| {
-                        if *a == "-a" { return true; }
-                        a.starts_with('-') && a.len() > 2 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) && a.contains('a')
-                    });
-                    if has_append {
-                        let _ = tx.send(CtrlReq::AppendHook(name, command));
-                    } else {
-                        let _ = tx.send(CtrlReq::SetHook(name, command));
-                    }
-                }
+            // The one shot route's parser: `-u` unsets, and one quoted
+            // command argument is stored without its quotes.
+            if let Some(req) = set_hook_request(args) {
+                let _ = tx.send(req);
             }
             let _ = resp_tx.send(String::new());
             true
@@ -8159,3 +8155,7 @@ mod tests_issue734_followup_new_session_reply;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue813_cc_buffers_cmdlist.rs"]
 mod tests_issue813_cc_buffers_cmdlist;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_set_hook_quoted_command.rs"]
+mod tests_set_hook_quoted_command;
