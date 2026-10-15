@@ -717,9 +717,17 @@ fn display_message_t_flag_consumed() {
     // -t target should be consumed (ignored locally), not leaked into message
     let mut app = mock_app_with_window();
     app.control_port = None;
-    let _ = execute_command_string(&mut app, "display-message -t mysession target_test");
+    // The session's own name: its current pane (cmd-find.c, a bare name is a
+    // window first and then a session).
+    let _ = execute_command_string(&mut app, "display-message -t test_session target_test");
     assert!(app.status_message.is_some());
     let (msg, _, _) = app.status_message.as_ref().unwrap();
     assert!(msg.contains("target_test"), "message should contain 'target_test', got: {}", msg);
-    assert!(!msg.contains("mysession"), "message should not contain -t target value, got: {}", msg);
+    assert!(!msg.contains("test_session"), "message should not contain -t target value, got: {}", msg);
+    // A name that is neither a window nor this session is tmux's error, and
+    // the message is not shown for the current pane instead.
+    app.status_message = None;
+    let _ = execute_command_string(&mut app, "display-message -t mysession target_test");
+    let (msg, _, _) = app.status_message.as_ref().unwrap();
+    assert_eq!(msg, "can't find pane: mysession");
 }

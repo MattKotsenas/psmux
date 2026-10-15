@@ -831,6 +831,11 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::SplitVertical)
             }
         }
+        // A bare command is the simple Action; with arguments (a `-t` above
+        // all) the whole line is kept, or `kill-pane -t %3` bound to a key
+        // killed the ACTIVE pane and `rename-window -t w x` opened the rename
+        // prompt for the current window instead.
+        "kill-pane" | "killp" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "kill-pane" | "killp" => Some(Action::KillPane),
         "next-window" | "next" => Some(Action::NextWindow),
         "previous-window" | "prev" => Some(Action::PrevWindow),
@@ -856,13 +861,14 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
             }
         }
         "detach-client" | "detach" => Some(Action::Detach),
+        "rename-window" | "renamew" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "rename-window" | "renamew" => Some(Action::RenameWindow),
         "choose-window" | "choose-tree" => Some(Action::WindowChooser),
         "choose-session" => Some(Action::SessionChooser),
-        "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") => Some(Action::ZoomPane),
+        "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") && !parts.contains(&"-t") => Some(Action::ZoomPane),
         "zoom-pane" => Some(Action::ZoomPane),
         "select-pane" | "selectp" => {
-            if parts.iter().any(|p| *p == "-Z") {
+            if parts.iter().any(|p| *p == "-Z" || *p == "-t") {
                 Some(Action::Command(cmd.to_string()))
             } else if parts.iter().any(|p| *p == "-U") {
                 Some(Action::MoveFocus(FocusDir::Up))
@@ -898,7 +904,9 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         | "show-option" | "show-window-option" => Some(Action::Command(cmd.to_string())),
         "source-file" | "source" => Some(Action::Command(cmd.to_string())),
         "select-layout" | "selectl" => Some(Action::Command(cmd.to_string())),
+        "next-layout" | "nextl" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "next-layout" | "nextl" => Some(Action::Command("next-layout".to_string())),
+        "previous-layout" | "prevl" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "previous-layout" | "prevl" => Some(Action::Command("previous-layout".to_string())),
         "confirm-before" | "confirm" => Some(Action::Command(cmd.to_string())),
         "display-menu" | "menu" => Some(Action::Command(cmd.to_string())),
@@ -906,8 +914,10 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "display-message" | "display" => Some(Action::Command(cmd.to_string())),
         "pipe-pane" | "pipep" => Some(Action::Command(cmd.to_string())),
         "rename-session" | "rename" => Some(Action::Command(cmd.to_string())),
+        "clear-history" | "clearhist" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "clear-history" | "clearhist" => Some(Action::Command("clear-history".to_string())),
         "set-buffer" | "setb" => Some(Action::Command(cmd.to_string())),
+        "delete-buffer" | "deleteb" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "delete-buffer" | "deleteb" => Some(Action::Command("delete-buffer".to_string())),
         "list-buffers" | "lsb" => Some(Action::Command(cmd.to_string())),
         "show-buffer" | "showb" => Some(Action::Command(cmd.to_string())),
@@ -1376,6 +1386,65 @@ pub(crate) fn paste_buffer_payload(text: &str, pb: &PasteBufferArgs) -> String {
     apply_separator(text, pb.effective_separator())
 }
 
+/// What the `-t` of a command on the in server route names, for the commands
+/// whose target is an existing window or pane (tmux CMD_FIND_WINDOW /
+/// CMD_FIND_PANE without CMD_FIND_WINDOW_INDEX).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InServerTarget {
+    Window,
+    Pane,
+}
+
+pub(crate) fn in_server_target_kind(cmd: &str) -> Option<InServerTarget> {
+    match cmd {
+        "kill-window" | "killw" | "rename-window" | "renamew" | "rotate-window" | "rotatew"
+        | "next-layout" | "nextl" | "previous-layout" | "prevl" | "select-window" | "selectw"
+        | "respawn-window" | "respawnw" | "resize-window" | "resizew" => Some(InServerTarget::Window),
+        "kill-pane" | "killp" | "respawn-pane" | "respawnp" | "resize-pane" | "resizep"
+        | "capture-pane" | "capturep" | "clear-history" | "clearhist" | "pipe-pane" | "pipep"
+        | "send-keys" | "send" | "display-message" | "display" | "select-layout" | "selectl"
+        | "paste-buffer" | "pasteb" | "split-window" | "splitw" | "split-pane" | "splitp" => Some(InServerTarget::Pane),
+        _ => None,
+    }
+}
+
+/// Resolve a window or pane `-t` on the in server route to the `@id` or
+/// `%id` it names. `Ok(None)` leaves the target to the command as it is: an
+/// id already, a mouse, marked or layout token, or a session other than this
+/// one (routed elsewhere). `Err` is tmux's "can't find ..." message.
+pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: &str) -> Result<Option<String>, String> {
+    let t = t.trim();
+    let plain = crate::cli::strip_exact_match_prefix(t);
+    if plain.is_empty() || plain.starts_with('%') || plain.starts_with('@')
+        || plain == "~" || plain == "{marked}" || plain == "{mouse}" || t == "="
+    {
+        return Ok(None);
+    }
+    if let Some(colon) = t.find(':') {
+        let sess = crate::cli::strip_exact_match_prefix(&t[..colon]);
+        if !sess.is_empty() && sess != app.session_name {
+            return Ok(None);
+        }
+    }
+    match kind {
+        InServerTarget::Window => {
+            if plain.starts_with('{') && !matches!(plain, "{start}" | "{last}" | "{end}" | "{next}" | "{previous}") {
+                return Ok(None);
+            }
+            let pos = app.resolve_window_target(t)?;
+            Ok(Some(format!("@{}", app.windows[pos].id)))
+        }
+        InServerTarget::Pane => {
+            if plain.starts_with('{') {
+                return Ok(None);
+            }
+            let (wp, path) = crate::window_ops::resolve_pane_spec(app, t)?;
+            Ok(crate::tree::get_active_pane_id_at_path(&app.windows[wp].root, &path)
+                .map(|id| format!("%{}", id)))
+        }
+    }
+}
+
 /// The `-t` of an in-server `select-pane -d/-e` or `last-pane -d/-e`, in the
 /// shape `server::set_pane_input_off` resolves.
 fn input_toggle_temp_target(raw_target: Option<&str>) -> Option<crate::types::TempTarget> {
@@ -1711,6 +1780,58 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         return Ok(());
     }
 
+    // A bare `-t` name of a window or pane command on this route (hooks,
+    // menus, confirm dialogs) is resolved here by tmux's rules (cmd-find.c,
+    // a window of this session before a session name) and rewritten to the
+    // `@id` / `%id` it names, so the arms below and the server route a
+    // command is forwarded to agree on it. A name matching nothing is tmux's
+    // error and the command does not run: parse_target filed it as a session
+    // and `kill-window -t keywin` killed the CURRENT window.
+    let rewritten: Vec<String>;
+    let rewritten_cmd: String;
+    let mut parts = parts;
+    let mut cmd = cmd;
+    let mut has_target = false;
+    if let Some(kind) = in_server_target_kind(parts[0]) {
+        if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
+            if let Some(t) = parts.get(t_pos + 1) {
+                has_target = true;
+                let resolved = if crate::cli::bare_target_name(t) {
+                    resolve_in_server_target(app, kind, t)
+                } else {
+                    Ok(None)
+                };
+                match resolved {
+                    Ok(Some(id)) => {
+                        rewritten = parts.iter().enumerate()
+                            .map(|(i, p)| if i == t_pos + 1 { id.clone() } else { p.to_string() })
+                            .collect();
+                        parts = rewritten.iter().map(String::as_str).collect();
+                        rewritten_cmd = requote(&parts);
+                        cmd = &rewritten_cmd;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        app.status_message = Some((e, std::time::Instant::now(), None));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    // These arms act on the current window or pane and never read `-t`; with
+    // one, the server route runs the command against it.
+    if has_target && matches!(parts[0],
+        "kill-pane" | "killp" | "rename-window" | "renamew" | "rotate-window" | "rotatew"
+        | "next-layout" | "nextl" | "previous-layout" | "prevl" | "clear-history" | "clearhist"
+        | "capture-pane" | "capturep" | "resize-pane" | "resizep")
+    {
+        if let Some(port) = app.control_port {
+            let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            return Ok(());
+        }
+    }
+
 
     match parts[0] {
         "new-window" | "neww" => {
@@ -1738,26 +1859,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let mut removed_pos = Some(app.active_idx);
             if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
                 if let Some(t) = parts.get(t_pos + 1) {
-                    let pt = crate::cli::parse_target(t);
-                    removed_pos = if let Some(w) = pt.window {
-                        if pt.window_is_id {
-                            app.windows.iter().position(|x| x.id == w)
-                        } else {
-                            app.win_pos(w)
+                    // cmd_find_get_window: a bare word is a window of this
+                    // session before it is this session's name, and one
+                    // naming neither is an error, never the current window.
+                    removed_pos = match app.resolve_window_target(t) {
+                        Ok(pos) => Some(pos),
+                        Err(e) => {
+                            app.status_message = Some((e, std::time::Instant::now(), None));
+                            None
                         }
-                    } else if let Some(ref n) = pt.window_name {
-                        app.windows.iter().position(|x| x.name == *n)
-                    } else {
-                        // Bare session target: the active window, like tmux.
-                        Some(app.active_idx)
                     };
-                    if removed_pos.is_none() {
-                        app.status_message = Some((
-                            format!("can't find window: {}", t),
-                            std::time::Instant::now(),
-                            None,
-                        ));
-                    }
                 }
             }
             if let Some(pos) = removed_pos {
@@ -3631,3 +3742,7 @@ mod test_cross_session_source_targets;
 #[cfg(test)]
 #[path = "../tests-rs/test_disc776_in_process_clients.rs"]
 mod test_disc776_in_process_clients;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_bare_window_target.rs"]
+mod tests_bare_window_target;

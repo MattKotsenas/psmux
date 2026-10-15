@@ -3716,6 +3716,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // (issue #545), never a silent fallback to the active window.
                 // The resolved form (stable ids) is what the command's own
                 // requests then carry in CtrlReq::Targeted.
+                CtrlReq::ResolveTarget { kind, spec, resp } => {
+                    let result = crate::commands::resolve_in_server_target(&app, kind, &spec);
+                    if let Err(ref msg) = result {
+                        // The status bar, as for ValidateTarget below.
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(result);
+                }
                 CtrlReq::ValidateTarget { target, resp } => {
                     match temp_target::resolve_temp_target(&app, &target) {
                         Ok(resolved) => { let _ = resp.send(Ok(resolved)); }

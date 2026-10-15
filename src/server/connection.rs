@@ -422,6 +422,34 @@ fn validate_target(
     }
 }
 
+/// Rewrite a bare `-t` name of a window or pane command to the `@id` / `%id`
+/// it names on live state (`CtrlReq::ResolveTarget`). `Ok(None)`: nothing to
+/// rewrite. `Err`: tmux's "can't find ..."; the command must not run.
+fn bare_target_rewrite(
+    cmd: &str,
+    args: &[&str],
+    tx: &mpsc::Sender<CtrlReq>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(kind) = crate::commands::in_server_target_kind(cmd) else { return Ok(None) };
+    let end = crate::cli::outer_target_scan_end(cmd, args).min(args.len());
+    let Some(i) = args[..end].iter().position(|a| *a == "-t") else { return Ok(None) };
+    let Some(t) = args.get(i + 1) else { return Ok(None) };
+    if !crate::cli::bare_target_name(t) {
+        return Ok(None);
+    }
+    let (s, r) = mpsc::channel();
+    if tx.send(CtrlReq::ResolveTarget { kind, spec: t.to_string(), resp: s }).is_err() {
+        return Ok(None);
+    }
+    match r.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(Some(id))) => Ok(Some(args.iter().enumerate()
+            .map(|(j, a)| if j == i + 1 { id.clone() } else { a.to_string() })
+            .collect())),
+        Ok(Err(e)) => Err(e),
+        _ => Ok(None),
+    }
+}
+
 /// Does `cmd`'s outer `-t` name a session that must be THIS server's own?
 ///
 /// One psmux server holds one session, so the session part of a `-t` (or of a
@@ -2235,6 +2263,21 @@ if control_echo || control_noecho {
         } else {
             cmd_args
         };
+        // A bare `-t` name, resolved as on the attached route (see
+        // bare_target_rewrite); an error is this command's %error.
+        let ctrl_resolved_args: Vec<String>;
+        let mut ctrl_target_err: Option<String> = None;
+        let cmd_args: Vec<&str> = match bare_target_rewrite(cmd_name, &cmd_args, &tx_ctrl) {
+            Ok(Some(new)) => {
+                ctrl_resolved_args = new;
+                ctrl_resolved_args.iter().map(String::as_str).collect()
+            }
+            Ok(None) => cmd_args,
+            Err(e) => {
+                ctrl_target_err = Some(e);
+                cmd_args
+            }
+        };
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -2366,7 +2409,8 @@ if control_echo || control_noecho {
                 ctrl_set_args.as_ref().and_then(|parsed_set| {
                     parsed_set.validate(ctrl_set_window_option).err()
                 })
-            });
+            })
+            .or(ctrl_target_err);
         if focus_err.is_none() && is_focus_cmd {
             if let Some(ref s) = ctrl_target_session {
                 let spec = crate::types::TempTarget { session: Some(s.clone()), ..Default::default() };
@@ -2785,6 +2829,30 @@ if persistent && client_readonly && !readonly_client_may_run(cmd) {
     line.clear();
     continue;
 }
+
+// A bare `-t` name of a window or pane command (`kill-window -t keywin`,
+// from a key binding or the command prompt) is a window of this session
+// before it is a session name, as in tmux; parse_target alone filed it as a
+// session and the command acted on the CURRENT window. Resolved on live
+// state and rewritten to its id; naming nothing, the command does not run.
+let resolved_target_args: Vec<String>;
+let args: Vec<&str> = match bare_target_rewrite(cmd, &args, &tx) {
+    Ok(Some(new)) => {
+        resolved_target_args = new;
+        resolved_target_args.iter().map(String::as_str).collect()
+    }
+    Ok(None) => args,
+    Err(e) => {
+        // An attached client sees it in the status bar (set by the server).
+        if !persistent {
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
+            break;
+        }
+        line.clear();
+        continue;
+    }
+};
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;

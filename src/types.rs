@@ -2864,6 +2864,28 @@ impl AppState {
         }
     }
 
+    /// Resolve the `-t` of a command that acts on an existing window
+    /// (kill-window, rename-window, ...) to its Vec position, the way tmux's
+    /// cmd_find_get_window does (cmd-find.c:328): `sess:win` is the window
+    /// part in this session, and a target without a colon is a window of
+    /// this session first (index, name, `@id`, `+`/`-`/`!`/`^`/`$`) and then
+    /// this session's name, meaning its current window. Anything else is
+    /// "can't find window: X"; it never falls back to the current window.
+    pub fn resolve_window_target(&self, spec: &str) -> Result<usize, String> {
+        let spec = spec.trim();
+        let plain = crate::cli::strip_exact_match_prefix(spec);
+        if !spec.contains(':') && !plain.is_empty() && plain == self.session_name {
+            if let Ok(WindowTarget::Pos(p)) = self.resolve_window_spec(spec, false) {
+                return Ok(p);
+            }
+            return Ok(self.active_idx.min(self.windows.len().saturating_sub(1)));
+        }
+        match self.resolve_window_spec(spec, false)? {
+            WindowTarget::Pos(p) => Ok(p),
+            WindowTarget::FreeIndex(i) => Err(format!("can't find window: {}", i)),
+        }
+    }
+
     /// Display (tmux-style) index of the window at Vec position `pos`.
     pub fn win_display_index(&self, pos: usize) -> usize {
         if self.window_indices_valid() {
@@ -3491,6 +3513,15 @@ pub enum CtrlReq {
     ValidateTarget {
         target: TempTarget,
         resp: mpsc::Sender<Result<TempTarget, String>>,
+    },
+    /// A bare `-t` name of a window or pane command, resolved on live state
+    /// by tmux's rules (commands::resolve_in_server_target) to the `@id` /
+    /// `%id` it names. `Err` is tmux's "can't find ..." and the command does
+    /// not run; it never falls back to the current window.
+    ResolveTarget {
+        kind: crate::commands::InServerTarget,
+        spec: String,
+        resp: mpsc::Sender<Result<Option<String>, String>>,
     },
     /// A request together with the -t target it acts on.  The server loop
     /// resolves the target, focuses it, runs `inner` and restores the real

@@ -1632,6 +1632,20 @@ pub fn bare_target_names_a_window(target: &str) -> bool {
     false
 }
 
+/// A `-t` that is a plain name: no session, window or pane separator, no id
+/// or special prefix, and not window shaped. `parse_target` files it as a
+/// session name, but for a window or pane target tmux reads it as a window
+/// of the current session first and as a session only after that
+/// (cmd-find.c:328 to :354), so it is resolved on live state instead.
+pub fn bare_target_name(target: &str) -> bool {
+    let t = strip_exact_match_prefix(target.trim());
+    !t.is_empty()
+        && !t.contains(':')
+        && !t.contains('.')
+        && !t.starts_with(['%', '@', '$', '{', '~', '='])
+        && !bare_target_names_a_window(t)
+}
+
 /// Commands whose `-t` is a window target, where a bare token must be read as
 /// a window before it is read as a session.
 ///
