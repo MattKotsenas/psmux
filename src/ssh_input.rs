@@ -573,12 +573,42 @@ pub fn keepalive_reasserts_mouse_input() -> bool {
 /// How long a bare Escape is held back waiting for the key a terminal sent
 /// along with it.
 ///
-/// This is the local-path twin of the SSH reader's `ESC_TIMEOUT_MS`, and it is
+/// This is the local-path twin of the SSH reader's escape timeout, and it is
 /// the same idea as tmux's `escape-time`: `tty-keys.c` treats a lone `\033`
 /// with nothing behind it as a *partial* key and arms a timer, delivering a
 /// plain Escape only when that timer fires.  50 ms matches what the SSH path
 /// has used since #397.
+///
+/// It is a CEILING, not the wait itself: the wait is `escape-time` capped at
+/// this value (see [`escape_wait_ms`]), and on the console route an Escape
+/// that is a real key press is not held at all (see
+/// [`EscCoalesce::feed_with`]).
 pub(crate) const ESC_COALESCE_MS: u64 = 50;
+
+/// The server's `escape-time`, pushed to the client with every state frame.
+/// Until the first frame arrives it reads as the ceiling, so nothing waits
+/// longer than it did before the option was honoured.
+static ESCAPE_TIME_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(ESC_COALESCE_MS);
+
+/// Record the server's `escape-time` (client side).
+pub fn set_escape_time(ms: u64) {
+    ESCAPE_TIME_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long an ambiguous Escape may be held: tmux's rule, `escape-time` with
+/// 0 read as 1 ms (tty-keys.c: `if (delay == 0) delay = 1`), capped at
+/// [`ESC_COALESCE_MS`] so the 500 ms default psmux inherited from tmux 3.4
+/// never turns into a half second hold.  tmux itself lowered that default to
+/// 10 ms in 3.5 (options-table.c, commit 2e9d7ebf).
+pub fn escape_wait_ms() -> u64 {
+    escape_wait_for(ESCAPE_TIME_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`escape_wait_ms`] for a given `escape-time`, without the global.
+pub(crate) fn escape_wait_for(escape_time_ms: u64) -> u64 {
+    escape_time_ms.clamp(1, ESC_COALESCE_MS)
+}
 
 /// Ceiling on the parameter bytes collected for one `CSI` sequence.  A real
 /// key sequence is a handful of bytes; anything longer is a stream that merely
@@ -684,8 +714,9 @@ pub struct EscCoalesce {
     /// Off on Unix: crossterm's own VT parser already folds `\x1b\r` into
     /// Alt+Enter there, so holding Escape back would only add latency.
     enabled: bool,
-    /// Length of the hold window.
-    window: Duration,
+    /// Length of the hold window.  `None` follows the live `escape-time`
+    /// ([`escape_wait_ms`]); tests pin it with [`EscCoalesce::with_window`].
+    window: Option<Duration>,
     /// When the last ordinary character was handed to the client as text.
     /// A `[` arriving within [`TEXT_BURST_MS`] of one is part of that run,
     /// which is to say a paste, and never opens an extended key.
@@ -698,9 +729,20 @@ impl EscCoalesce {
             pending: None,
             queue: VecDeque::new(),
             enabled,
-            window: Duration::from_millis(ESC_COALESCE_MS),
+            window: None,
             last_text: None,
         }
+    }
+
+    /// A coalescer with a fixed hold window instead of the live
+    /// `escape-time`, so tests do not depend on (or race over) the global.
+    pub fn with_window(enabled: bool, window: Duration) -> Self {
+        EscCoalesce { window: Some(window), ..EscCoalesce::new(enabled) }
+    }
+
+    fn window(&self) -> Duration {
+        self.window
+            .unwrap_or_else(|| Duration::from_millis(escape_wait_ms()))
     }
 
     /// True when a character was handed on as text so recently that whatever
@@ -826,14 +868,36 @@ impl EscCoalesce {
                 merged.kind = KeyEventKind::Press;
                 Some(Event::Key(merged))
             }
+            // A bare Escape.  Whether it can be ambiguous at all depends on
+            // what the console has ALREADY queued behind it (issue #841 follow
+            // up, measured through a real pseudoconsole on 26200):
+            //
+            //   * a key a person pressed reaches the console as a DOWN record
+            //     on its own, Windows Terminal's win32-input-mode report and a
+            //     classic console window alike.  Its UP follows only when the
+            //     key is let go, tens of milliseconds later, so at this point
+            //     nothing is queued behind it.  Nothing can be merged into a
+            //     key press, so it goes out now, with no hold.
+            //   * an Escape the console synthesised from a VT byte (a host
+            //     writing `1b 0d` for Shift+Enter, #611) arrives as a DOWN and
+            //     UP pair in the same read, and a pair written in one
+            //     WriteConsoleInput call has its partner queued too.  That is
+            //     the case the hold exists for, so it keeps its window, which
+            //     now follows `escape-time` like tmux's own (tty-keys.c).
             Event::Key(k)
                 if self.pending.is_none()
                     && matches!(k.code, KeyCode::Esc)
                     && k.modifiers.is_empty()
                     && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
-                self.pending = Some(now);
-                None
+                let mut pull = pull;
+                match pull() {
+                    None => Some(Event::Key(k)),
+                    Some(next) => {
+                        self.pending = Some(now);
+                        self.feed_with(next, now, pull)
+                    }
+                }
             }
             other => {
                 self.note_text(&other, now);
@@ -850,7 +914,7 @@ impl EscCoalesce {
     /// Milliseconds left on the held Escape, `None` when nothing is held.
     pub fn deadline_ms(&self, now: Instant) -> Option<u64> {
         self.pending.map(|t| {
-            self.window
+            self.window()
                 .saturating_sub(now.saturating_duration_since(t))
                 .as_millis() as u64
         })
@@ -859,7 +923,7 @@ impl EscCoalesce {
     /// Release a held Escape whose window has run out.
     pub fn expire(&mut self, now: Instant) -> Option<Event> {
         match self.pending {
-            Some(t) if now.saturating_duration_since(t) >= self.window => {
+            Some(t) if now.saturating_duration_since(t) >= self.window() => {
                 self.pending = None;
                 Some(Self::escape_event())
             }
@@ -2746,8 +2810,8 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             let mut records: Vec<INPUT_RECORD> = Vec::with_capacity(64);
             records.resize_with(64, || unsafe { std::mem::zeroed() });
 
-            // Escape-timeout: 50 ms matches tmux's default.
-            const ESC_TIMEOUT_MS: u32 = 50;
+            // Escape-timeout: escape-time capped at 50 ms (escape_wait_ms),
+            // read afresh each pass so a changed option takes effect live.
 
             let mut alive = true;
             let verbose = ssh_verbose();
@@ -2764,7 +2828,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // Dynamic timeout: short when the parser has a pending Esc
                 // or is inside a paste (need to detect stale paste quickly).
                 let wait_ms = if parser.has_pending_escape() {
-                    ESC_TIMEOUT_MS
+                    escape_wait_ms() as u32
                 } else if parser.is_in_paste() || parser.state == PS::PasteDrain {
                     200 // check paste timeout / drain expiry frequently
                 } else {
@@ -2935,7 +2999,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // After processing all records from this batch, flush any
                 // pending escape if no more input is immediately available.
                 if parser.has_pending_escape() {
-                    let peek_wait = unsafe { WaitForSingleObject(handle, ESC_TIMEOUT_MS) };
+                    let peek_wait = unsafe { WaitForSingleObject(handle, escape_wait_ms() as u32) };
                     if peek_wait == WAIT_TIMEOUT {
                         parser.flush_escape(&mut |evt| {
                             if tx.send(evt).is_err() { alive = false; }
@@ -3336,3 +3400,7 @@ impl InputSource {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue658_frame_wake_escape.rs"]
 mod test_issue658_frame_wake_escape;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue841_escape_no_hold.rs"]
+mod test_issue841_escape_no_hold;

@@ -67,6 +67,15 @@ fn release(code: KeyCode, mods: KeyModifiers) -> Event {
     })
 }
 
+/// Feed an Escape the way the console delivers one it SYNTHESISED from a VT
+/// byte: the DOWN with its UP already queued behind it (issue #841 follow up).
+/// That is the only bare Escape the coalescer still holds; a key press with
+/// nothing queued behind it goes straight through.
+fn hold_escape(c: &mut EscCoalesce, t: Instant) -> Option<Event> {
+    let mut up = Some(release(KeyCode::Esc, KeyModifiers::NONE));
+    c.feed_with(press(KeyCode::Esc, KeyModifiers::NONE), t, move || up.take())
+}
+
 fn key_of(ev: &Event) -> KeyEvent {
     match ev {
         Event::Key(k) => *k,
@@ -195,7 +204,7 @@ fn a_surviving_escape_is_consumed_by_the_sequence() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
 
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
 
     let mut batch = Batch::from_sequence("\x1b[13;2u");
     let out = batch.feed_into(&mut c, t0).expect("must produce a key");
@@ -372,7 +381,7 @@ fn an_undecoded_final_byte_replays_every_character() {
 fn a_held_escape_precedes_an_abandoned_sequence() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
 
     let (out, left) = drain(
         &mut c,
@@ -483,7 +492,7 @@ fn a_modified_bracket_opens_nothing() {
 fn esc_then_enter_still_merges() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     let out = c
         .feed(press(KeyCode::Enter, KeyModifiers::NONE), t0)
         .expect("the pair must produce one event");
@@ -495,7 +504,7 @@ fn esc_then_enter_still_merges() {
 fn a_lone_escape_still_comes_out_after_the_window() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     assert!(c
         .expire(t0 + Duration::from_millis(ESC_COALESCE_MS - 1))
         .is_none());

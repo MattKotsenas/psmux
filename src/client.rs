@@ -3664,6 +3664,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     fn default_status_lines() -> usize { 1 }
     fn default_status_visible() -> bool { true }
     fn default_repeat_time() -> u64 { 500 }
+    fn default_escape_time() -> u64 { 500 }
     fn default_bold_is_bright() -> bool { true }
     fn default_paste_detection() -> bool { true }
     fn default_mouse_selection() -> bool { true }
@@ -3904,6 +3905,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// Repeat key timeout in ms (default: 500, synced from server)
         #[serde(default = "default_repeat_time")]
         repeat_time: u64,
+        /// escape-time in ms (issue #841 follow up): bounds how long the
+        /// input layer may hold an ambiguous Escape.
+        #[serde(default = "default_escape_time")]
+        escape_time: u64,
         /// bold-is-bright option (issue #425): controls whether the console
         /// writer rewrites crossterm's 256-indexed basic colors to standard SGR.
         /// The writer lives in this client process, so the value is synced from
@@ -8383,6 +8388,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         );
         // Sync repeat-time from server
         repeat_time_ms = state.repeat_time;
+        crate::ssh_input::set_escape_time(state.escape_time);
         // Sync bold-is-bright (issue #425) into the console writer's atomic.
         // The writer lives in this client process, so the server-side option
         // value must be pushed here for the rewrite toggle to take effect.

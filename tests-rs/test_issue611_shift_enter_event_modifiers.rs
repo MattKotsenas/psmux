@@ -66,6 +66,15 @@ fn release(code: KeyCode, mods: KeyModifiers) -> Event {
     })
 }
 
+/// Feed an Escape the way the console delivers one it SYNTHESISED from a VT
+/// byte: the DOWN with its UP already queued behind it (issue #841 follow up).
+/// That is the only bare Escape the coalescer still holds; a key press with
+/// nothing queued behind it goes straight through.
+fn hold_escape(c: &mut EscCoalesce, t: Instant) -> Option<Event> {
+    let mut up = Some(release(KeyCode::Esc, KeyModifiers::NONE));
+    c.feed_with(press(KeyCode::Esc, KeyModifiers::NONE), t, move || up.take())
+}
+
 fn key_of(ev: &Event) -> KeyEvent {
     match ev {
         Event::Key(k) => *k,
@@ -159,7 +168,7 @@ fn esc_then_enter_merges_into_one_alt_enter() {
     let t0 = Instant::now();
 
     // The Escape is held, not forwarded.
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     // Its own key release must not close the window.
     assert!(c
         .feed(release(KeyCode::Esc, KeyModifiers::NONE), t0)
@@ -190,7 +199,7 @@ fn esc_then_enter_merges_into_one_alt_enter() {
 fn the_merged_key_encodes_to_esc_cr() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     let out = c
         .feed(
             press(KeyCode::Enter, KeyModifiers::NONE),
@@ -217,7 +226,7 @@ fn shift_enter_from_the_record_also_encodes_to_esc_cr() {
 fn a_lone_escape_is_delivered_after_the_window() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
 
     // Inside the window it is still held back.
     assert!(c.expire(t0 + Duration::from_millis(ESC_COALESCE_MS - 1)).is_none());
@@ -240,7 +249,7 @@ fn a_lone_escape_is_delivered_after_the_window() {
 fn escape_then_another_key_keeps_both_in_order() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
 
     let first = c
         .feed(
@@ -260,7 +269,7 @@ fn escape_then_another_key_keeps_both_in_order() {
 fn enter_after_the_window_is_not_merged() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     let esc = c
         .expire(t0 + Duration::from_millis(ESC_COALESCE_MS))
         .unwrap();
@@ -281,7 +290,7 @@ fn enter_after_the_window_is_not_merged() {
 fn ctrl_enter_after_escape_is_not_merged() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     let first = c
         .feed(
             press(KeyCode::Enter, KeyModifiers::CONTROL),
@@ -403,7 +412,7 @@ mod send_keys_parity {
 fn a_resize_while_holding_flushes_the_escape_first() {
     let mut c = EscCoalesce::new(true);
     let t0 = Instant::now();
-    assert!(c.feed(press(KeyCode::Esc, KeyModifiers::NONE), t0).is_none());
+    assert!(hold_escape(&mut c, t0).is_none());
     let first = c.feed(Event::Resize(80, 24), t0 + Duration::from_millis(1)).unwrap();
     assert_eq!(key_of(&first).code, KeyCode::Esc);
     assert!(matches!(c.pop(), Some(Event::Resize(80, 24))));

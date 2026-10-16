@@ -31,7 +31,10 @@ fn is_escape(ev: &Event) -> bool {
 /// A coalescer holding one bare Escape that arrived at `t0`.
 fn holding_an_escape(t0: Instant) -> EscCoalesce {
     let mut esc = EscCoalesce::new(true);
-    let out = esc.feed(esc_key(), t0);
+    // The DOWN arrives with its UP already queued: an Escape the console
+    // synthesised, the only kind still held (issue #841 follow up).
+    let mut up = Some(Event::Key(KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::empty(), KeyEventKind::Release)));
+    let out = esc.feed_with(esc_key(), t0, move || up.take());
     assert!(
         out.is_none(),
         "a bare Escape is held for its coalescing window, not handed straight on: \
