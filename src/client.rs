@@ -577,23 +577,30 @@ pub(crate) fn chooser_kill_session_prompt(current_session: &str, row: &str) -> S
 ///
 /// The frame carries the short name; the base is `<ns>__<name>` under `-L ns`,
 /// prefixed whatever the name looks like, as `AppState::port_file_base` and
-/// RenameSession build it. A warm standby's base `<ns>____warm__` has no
-/// namespace for `session_namespace`, so it is read off the warm suffix. An
-/// empty name, or a standby that has not been claimed yet, leaves the base as
-/// it is.
-pub(crate) fn session_base_after_rename(current_base: &str, live_name: &str) -> String {
-    use crate::session::is_warm_session;
-    if live_name.is_empty() || is_warm_session(live_name) {
+/// RenameSession build it. `ns` is the client's namespace, read once from the
+/// base it attached with (`client_namespace`): a rename never changes the
+/// socket a server listens on, so it is never read back off a renamed base,
+/// where a name such as `my__x` in the default namespace would pass for
+/// namespace `my` and send the next rename to `my__<name>`. An empty name, or
+/// a standby that has not been claimed yet, leaves the base as it is.
+pub(crate) fn session_base_after_rename(ns: Option<&str>, current_base: &str, live_name: &str) -> String {
+    if live_name.is_empty() || crate::session::is_warm_session(live_name) {
         return current_base.to_string();
     }
-    let ns = if is_warm_session(current_base) {
-        current_base.strip_suffix("____warm__")
-    } else {
-        crate::session::session_namespace(current_base)
-    };
     match ns {
         Some(n) => format!("{}__{}", n, live_name),
         None => live_name.to_string(),
+    }
+}
+
+/// The `-L` namespace of the base a client attached with. A warm standby's
+/// base `<ns>____warm__` has no namespace for `session_namespace`, so it is
+/// read off the warm suffix.
+pub(crate) fn client_namespace(attach_base: &str) -> Option<String> {
+    if crate::session::is_warm_session(attach_base) {
+        attach_base.strip_suffix("____warm__").map(str::to_string)
+    } else {
+        crate::session::session_namespace(attach_base).map(str::to_string)
     }
 }
 
@@ -3413,6 +3420,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // back into a base. The port and key this client attached with (`port`,
     // `session_key`) need no such care, because a rename keeps both.
     let mut current_session = name.clone();
+    // The namespace that base lives in, fixed at attach (see
+    // session_base_after_rename for why it is not read off a renamed base).
+    let own_namespace = client_namespace(&name);
     // What the session is CALLED, as against `current_session`, which is the
     // port file base. The server puts the live name in every frame
     // (`session_name`, issue #7 batch D), so this follows a rename. Until the
@@ -8139,7 +8149,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             // frame with the new name never arrives before the file moved,
             // and a rename it refuses (`duplicate session`) never changes the
             // name it sends at all.
-            let base = session_base_after_rename(&current_session, &sn);
+            let base = session_base_after_rename(own_namespace.as_deref(), &current_session, &sn);
             if base != current_session {
                 current_session = base;
                 activity_name = if crate::session::is_warm_session(&current_session) {

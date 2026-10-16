@@ -19,63 +19,94 @@ use super::*;
 
 // ── the registry base follows the frame's live name ─────────────────────────
 
+/// The base after the first frame that names `live`, for a client that
+/// attached with `base`.
+fn rebase(base: &str, live: &str) -> String {
+    session_base_after_rename(client_namespace(base).as_deref(), base, live)
+}
+
+#[test]
+fn a_second_rename_keeps_the_namespace_the_client_attached_in() {
+    // Default namespace: a session renamed to `my__x` lives at base `my__x`,
+    // and its next rename to `yy` at base `yy`. Reading the namespace back off
+    // the renamed base sent the client to `my__yy`, a session that does not
+    // exist, which choose-session then drew as `* my__yy: (current)` while
+    // prefix = and prefix ) stopped working again.
+    let ns = client_namespace("sesA");
+    let first = session_base_after_rename(ns.as_deref(), "sesA", "my__x");
+    assert_eq!(first, "my__x");
+    assert_eq!(session_base_after_rename(ns.as_deref(), &first, "yy"), "yy");
+    // Under -L ns both renames stay in ns, prefixed as RenameSession does.
+    let ns = client_namespace("ns__sesA");
+    let first = session_base_after_rename(ns.as_deref(), "ns__sesA", "my__x");
+    assert_eq!(first, "ns__my__x");
+    assert_eq!(session_base_after_rename(ns.as_deref(), &first, "yy"), "ns__yy");
+}
+
+#[test]
+fn an_empty_or_warm_frame_keeps_the_renamed_base() {
+    // Not the base the client attached with: the one it has now.
+    assert_eq!(session_base_after_rename(None, "sesX", ""), "sesX");
+    assert_eq!(session_base_after_rename(Some("ns"), "ns__sesX", "__warm__"), "ns__sesX");
+}
+
 #[test]
 fn a_rename_moves_the_base_to_the_new_name() {
-    assert_eq!(session_base_after_rename("sesA", "sesX"), "sesX");
+    assert_eq!(rebase("sesA", "sesX"), "sesX");
 }
 
 #[test]
 fn a_namespaced_base_keeps_its_namespace() {
     // The frame carries the short name; the server's base is `<ns>__<name>`
     // (AppState::port_file_base).
-    assert_eq!(session_base_after_rename("ns__sesA", "sesX"), "ns__sesX");
+    assert_eq!(rebase("ns__sesA", "sesX"), "ns__sesX");
 }
 
 #[test]
 fn the_namespace_is_prefixed_the_way_the_server_does_it() {
     // RenameSession builds `format!("{}__{}", socket_name, name)` without
     // looking at the name, so `ns__x` under `-L ns` lives at `ns__ns__x`.
-    assert_eq!(session_base_after_rename("ns__a", "ns__x"), "ns__ns__x");
+    assert_eq!(rebase("ns__a", "ns__x"), "ns__ns__x");
 }
 
 #[test]
 fn the_same_name_leaves_the_base_alone() {
-    assert_eq!(session_base_after_rename("sesA", "sesA"), "sesA");
-    assert_eq!(session_base_after_rename("ns__sesA", "sesA"), "ns__sesA");
+    assert_eq!(rebase("sesA", "sesA"), "sesA");
+    assert_eq!(rebase("ns__sesA", "sesA"), "ns__sesA");
 }
 
 #[test]
 fn a_case_only_rename_is_a_rename() {
     // Issue #774: the registry heals to the spelling the rename asked for.
-    assert_eq!(session_base_after_rename("sesA", "SESA"), "SESA");
-    assert_eq!(session_base_after_rename("ns__sesA", "SESA"), "ns__SESA");
+    assert_eq!(rebase("sesA", "SESA"), "SESA");
+    assert_eq!(rebase("ns__sesA", "SESA"), "ns__SESA");
 }
 
 #[test]
 fn an_empty_name_leaves_the_base_alone() {
-    assert_eq!(session_base_after_rename("sesA", ""), "sesA");
-    assert_eq!(session_base_after_rename("ns__sesA", ""), "ns__sesA");
+    assert_eq!(rebase("sesA", ""), "sesA");
+    assert_eq!(rebase("ns__sesA", ""), "ns__sesA");
 }
 
 #[test]
 fn a_warm_name_in_the_frame_leaves_the_base_alone() {
     // A standby that has not been claimed yet still reports `__warm__`.
-    assert_eq!(session_base_after_rename("ns__sesA", "__warm__"), "ns__sesA");
-    assert_eq!(session_base_after_rename("__warm__", "__warm__"), "__warm__");
+    assert_eq!(rebase("ns__sesA", "__warm__"), "ns__sesA");
+    assert_eq!(rebase("__warm__", "__warm__"), "__warm__");
 }
 
 #[test]
 fn a_claimed_standby_takes_the_session_name() {
     // session_namespace answers None for a warm base, so the namespace of
     // `<ns>____warm__` has to come from the warm suffix.
-    assert_eq!(session_base_after_rename("__warm__", "work"), "work");
-    assert_eq!(session_base_after_rename("ns____warm__", "work"), "ns__work");
+    assert_eq!(rebase("__warm__", "work"), "work");
+    assert_eq!(rebase("ns____warm__", "work"), "ns__work");
 }
 
 #[test]
 fn the_namespace_never_changes() {
     for (base, name) in [("sesA", "b"), ("ns__sesA", "b"), ("ns__sesA", "SESA"), ("x__y", "z")] {
-        let after = session_base_after_rename(base, name);
+        let after = rebase(base, name);
         assert_eq!(
             crate::session::session_namespace(&after),
             crate::session::session_namespace(base),
