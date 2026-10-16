@@ -22,6 +22,8 @@ fn detector_and_live_parser_share_queries_at_every_split() {
         (&b"\x1b[5n"[..], TerminalQuery::DsrStatus),
         (&b"\x1b[?2026$p"[..], TerminalQuery::DecrqmPrivate(2026)),
         (&b"\x1b[4$p"[..], TerminalQuery::DecrqmAnsi(4)),
+        (&b"\x1b[14t"[..], TerminalQuery::WindowReport(14)),
+        (&b"\x1b[16t"[..], TerminalQuery::WindowReport(16)),
         (&b"\x1b]7501;?\x07"[..], TerminalQuery::ProgramStatus),
         (&b"\x1b]7501;?\x1b\\"[..], TerminalQuery::ProgramStatus),
     ] {

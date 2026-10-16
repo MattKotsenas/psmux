@@ -320,6 +320,8 @@ pub enum TerminalQuery {
     DecrqmPrivate(u16),
     /// ANSI mode status.
     DecrqmAnsi(u16),
+    /// XTWINOPS pixel size report request (`CSI 14 t`, `15`, `16`).
+    WindowReport(u16),
 }
 
 /// The fixed capability reply contains no application-controlled text.

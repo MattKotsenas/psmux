@@ -3935,6 +3935,9 @@ pub(crate) struct DecrqmState {
     pub mouse_sgr: bool,
     /// A synchronized update (DECSET 2026) is open in the pane's `SyncGate`.
     pub synchronized_output: bool,
+    /// The pane's size in cells, for the XTWINOPS size reports (issue #841).
+    pub rows: u16,
+    pub cols: u16,
 }
 
 impl DecrqmState {
@@ -3950,6 +3953,8 @@ impl DecrqmState {
             mouse_utf8: s.mouse_utf8_flag(),
             mouse_sgr: s.mouse_sgr_flag(),
             synchronized_output: false,
+            rows: s.size().0,
+            cols: s.size().1,
         }
     }
 }
@@ -3999,6 +4004,39 @@ pub(crate) fn device_reply(q: DeviceQuery, st: &DecrqmState) -> String {
         DeviceQuery::DecrqmAnsi(m) if m > 0 => {
             format!("\x1b[{};{}$y", m, decrqm_ansi_value(m))
         }
+        DeviceQuery::WindowReport(op) => window_report(op, st.rows, st.cols),
+        _ => String::new(),
+    }
+}
+
+/// tmux's cell size in pixels when the client never reported one
+/// (`DEFAULT_XPIXEL` / `DEFAULT_YPIXEL`, tmux.h:121-122).  psmux never learns
+/// the host terminal's pixel size either (every pane is opened with
+/// `pixel_width: 0`), so it answers with the same defaults tmux would.
+const DEFAULT_XPIXEL: u32 = 16;
+const DEFAULT_YPIXEL: u32 = 32;
+
+/// Issue #841: the XTWINOPS pixel size reports, exactly as tmux's
+/// `input_csi_dispatch_winops` (input.c:2162-2176) writes them.
+///
+/// The one that matters is `CSI 14 t`.  tmux 3.8 sends `CSI 18 t CSI 14 t` to
+/// its outer terminal whenever the tty reports no pixel size (tty.c:146-150,
+/// always the case for a pty under WSL) and keeps `TTY_WINSIZEQUERY` set until
+/// the `CSI 4 ; h ; w t` answer arrives (tty-keys.c:732).  While that flag is
+/// set every lone Escape is held for 500 ms whatever `escape-time` says
+/// (tty-keys.c:980-987).  The inbox console host answers `CSI 18 t` itself
+/// but forwards `CSI 14 t` to psmux, so with nobody answering it, tmux nested
+/// in a psmux pane delivered every Escape half a second late, forever.
+///
+/// The cell reports `CSI 18 t` and `CSI 19 t` are not answered here: the
+/// console host answers them itself and does not forward them, so a second
+/// answer from psmux could only ever be a duplicate.
+fn window_report(op: u16, rows: u16, cols: u16) -> String {
+    let (rows, cols) = (u32::from(rows), u32::from(cols));
+    match op {
+        14 => format!("\x1b[4;{};{}t", rows * DEFAULT_YPIXEL, cols * DEFAULT_XPIXEL),
+        15 => format!("\x1b[5;{};{}t", rows * DEFAULT_YPIXEL, cols * DEFAULT_XPIXEL),
+        16 => format!("\x1b[6;{};{}t", DEFAULT_YPIXEL, DEFAULT_XPIXEL),
         _ => String::new(),
     }
 }
@@ -4612,6 +4650,10 @@ mod test_issue597_xtversion_reply;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue597_da_replies.rs"]
 mod tests_issue597_da_replies;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue841_winops_replies.rs"]
+mod tests_issue841_winops_replies;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue399_env_prefix.rs"]
