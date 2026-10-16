@@ -142,6 +142,12 @@ class QueryProbe {
             // that tells "psmux could not deliver" apart from "ConPTY ate an
             // OSC reply on the pipe".
             new string[] { "CSI_SCHEME", "\x1b[?996n" },
+            // Issue #841: the XTWINOPS size reports.  tmux 3.8 holds every
+            // lone Escape for 500 ms until its `CSI 14 t` is answered; the
+            // console host answers `CSI 18 t` itself but forwards 14 and 16.
+            new string[] { "XTWINOPS_14", "\x1b[14t" },
+            new string[] { "XTWINOPS_16", "\x1b[16t" },
+            new string[] { "XTWINOPS_18", "\x1b[18t" },
         };
 
         foreach (string[] q in queries) {
