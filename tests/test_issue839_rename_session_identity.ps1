@@ -106,7 +106,7 @@ function Run-Scenario($label, $ns) {
     function Check-SessionStar($name) {
         Send "^b{SLEEP:500}s"
         $sc = Screen
-        $row = $sc | Where-Object { $_ -match "\d+\.\s+\*\s+.*$([regex]::Escape($name)):" } | Select-Object -First 1
+        $row = $sc | Where-Object { $_ -match "\d+\.\s+\*\s+$([regex]::Escape($name)):" } | Select-Object -First 1
         Check ([bool]$row) "prefix s marks $name with *" "no row marks $name with *"
         Send "q"
     }
@@ -183,6 +183,20 @@ function Run-Scenario($label, $ns) {
         Check ($names -eq ((@($B, $XZ) | Sort-Object) -join ' ')) "both sessions keep their names" "list-sessions reads [$names]"
         Check-SessionStar $XZ
         Check-Buffers "prefix =" "^b{SLEEP:500}="
+
+        # The namespace is the one the client attached in. Read back off a
+        # renamed base, `my__x` in the default namespace passed for namespace
+        # `my`, and the next rename sent the client to `my__<name>`: prefix s
+        # drew a phantom `* my__ry...: (current)` row and prefix ) did nothing.
+        $D = "m__$tag"; $Y = "ry$tag"
+        Write-Head "two renames through a name with __, $XZ to $D to $Y"
+        P rename-session -t $XZ $D | Out-Null
+        Check (Wait-Status $D) "the status line reads [$D]" "the status line never read [$D]"
+        P rename-session -t $D $Y | Out-Null
+        Check (Wait-Status $Y) "the status line reads [$Y]" "the status line never read [$Y]"
+        Check-SessionStar $Y
+        Check-Buffers "prefix =" "^b{SLEEP:500}="
+        Cycle-Check $Y
     } finally {
         P kill-server | Out-Null
         Start-Sleep -Milliseconds 800
