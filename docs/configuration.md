@@ -206,8 +206,8 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `codepoint-widths` | Str | | Comma separated overrides for how many columns Unicode codepoints occupy (see [Codepoint widths](#codepoint-widths)) |
 | `terminal-overrides` | Str | | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
 | `set-clipboard` | Str | `external` | Clipboard interaction (`on`/`off`/`external`). A copy mode yank reaches the Windows clipboard on every value, with OSC 52 to the outer terminal unless `off`. An application's own OSC 52 creates a paste buffer only on `on`, as in tmux; on `external` psmux still forwards it to the outer terminal and the Windows clipboard, where tmux ignores it; `off` ignores it |
-| `main-pane-width` | Int | `0` | Main pane width in main-vertical layout |
-| `main-pane-height` | Int | `0` | Main pane height in main-horizontal layout |
+| `main-pane-width` | String | `80` | Main pane width in the main-vertical layout, in cells or a percentage such as `30%` |
+| `main-pane-height` | String | `24` | Main pane height in the main-horizontal layout, in cells or a percentage such as `30%` |
 | `session-group` | Str | | Name of the session group this session joins. `none` or an empty value clears it. See [Session Groups](#session-groups) |
 | `command-alias` | Str | | Define your own command alias as `alias=expansion`. See [Command Aliases](#command-aliases) |
 

@@ -71,13 +71,18 @@ pub(crate) fn append_codepoint_widths(app: &mut AppState, value: &str) {
 
 /// Parse a main-pane-width / main-pane-height value.
 ///
-/// psmux stores both as a percentage (see AppState::main_pane_width), and tmux
-/// documents the percentage spelling for them (options-table.c:1474, "This may
-/// be a percentage, for example '10%'"), so a trailing `%` is accepted and
-/// dropped. A value that is not a number at all leaves the current setting
-/// alone, which is what both setters did before.
-pub(crate) fn parse_main_pane_size(value: &str) -> Option<u16> {
-    value.trim().trim_end_matches('%').parse::<u16>().ok()
+/// tmux keeps both as strings (options-table.c:1466-1480, defaults "24" and
+/// "80") holding a cell count or a percentage ("This may be a percentage,
+/// for example '10%'"), and resolves them when the layout is applied
+/// (layout_set_main_v: args_string_percentage of the window less the
+/// border). They used to be stored as a bare number read as a PERCENT, so
+/// `main-pane-width 50` gave a 59 column pane on 120 columns and the
+/// default gave 71 instead of 80. A value that is neither a number nor `N%`
+/// leaves the current setting alone, as both setters always did.
+pub(crate) fn parse_main_pane_size(value: &str) -> Option<String> {
+    let v = value.trim();
+    v.strip_suffix('%').unwrap_or(v).trim().parse::<u16>().ok()?;
+    Some(v.to_string())
 }
 
 pub(crate) fn is_window_option(name: &str) -> bool {
@@ -850,8 +855,10 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "allow-passthrough" => app.allow_passthrough.clone(),
         "copy-command" => app.copy_command.clone(),
         "set-clipboard" => app.set_clipboard.clone(),
-        "main-pane-width" => app.main_pane_width.to_string(),
-        "main-pane-height" => app.main_pane_height.to_string(),
+        "main-pane-width" => app.main_pane_width.clone(),
+        "main-pane-height" => app.main_pane_height.clone(),
+        // tmux options-table.c default "0" (the main pane decides).
+        "other-pane-width" | "other-pane-height" => app.user_options.get(name).cloned().unwrap_or_else(|| "0".to_string()),
         "codepoint-widths" => app.codepoint_widths.join(","),
         "terminal-overrides" => app.terminal_overrides.join(","),
         "command-alias" => {

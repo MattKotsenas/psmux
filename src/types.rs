@@ -1945,10 +1945,12 @@ pub struct AppState {
     pub format_shell_cache: std::sync::Mutex<std::collections::HashMap<String, ShellEntry>>,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
-    /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
-    pub main_pane_width: u16,
-    /// main-pane-height: percentage for main pane in main-horizontal layout (0 = use 60% heuristic)
-    pub main_pane_height: u16,
+    /// main-pane-width as written: cells or `N%` of the window less the
+    /// border (tmux options-table.c default "80", layout_set_main_v).
+    pub main_pane_width: String,
+    /// main-pane-height as written: cells or `N%` (tmux default "24",
+    /// layout_set_main_h).
+    pub main_pane_height: String,
     /// status-left-length: max display width for status-left (default 10)
     pub status_left_length: usize,
     /// status-right-length: max display width for status-right (default 40)
@@ -3255,8 +3257,8 @@ impl AppState {
             last_status_interval_fire: std::time::Instant::now(),
             format_shell_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             status_justify: "left".to_string(),
-            main_pane_width: 0,
-            main_pane_height: 0,
+            main_pane_width: "80".to_string(),
+            main_pane_height: "24".to_string(),
             status_left_length: 10,
             status_right_length: 40,
             status_lines: 1,

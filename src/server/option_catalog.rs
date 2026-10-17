@@ -329,8 +329,8 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     // tmux types both of these OPTIONS_TABLE_STRING (options-table.c:1474) and
     // documents a percentage form ("10%"), so they cannot be validated as a
     // number without rejecting input real tmux accepts.
-    OptionDef { name: "main-pane-width", scope: Window, option_type: OptionType::String, default: "0", description: "Width of main pane in main-* layouts (0 sizes it automatically, percentages accepted)" },
-    OptionDef { name: "main-pane-height", scope: Window, option_type: OptionType::String, default: "0", description: "Height of main pane in main-* layouts (0 sizes it automatically, percentages accepted)" },
+    OptionDef { name: "main-pane-width", scope: Window, option_type: OptionType::String, default: "80", description: "Width of the main pane in the main-vertical layout, in cells or a percentage such as 10%" },
+    OptionDef { name: "main-pane-height", scope: Window, option_type: OptionType::String, default: "24", description: "Height of the main pane in the main-horizontal layout, in cells or a percentage such as 10%" },
     OptionDef { name: "window-size", scope: Window, option_type: UNVALIDATED_CHOICE, default: "latest", description: "Window sizing strategy" },
     OptionDef { name: "window-status-format", scope: Window, option_type: OptionType::String, default: "#I:#W#{?window_flags,#{window_flags}, }", description: "Window status bar format" },
     OptionDef { name: "window-status-current-format", scope: Window, option_type: OptionType::String, default: "#I:#W#{?window_flags,#{window_flags}, }", description: "Active window status bar format" },

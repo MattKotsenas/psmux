@@ -1295,6 +1295,21 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     Ok(out)
 }
 
+/// tmux `args_string_percentage(value, 0, maxval, curval)`: `N%` is that
+/// share of `curval` (truncated), a plain number must be in 0..=maxval.
+/// None is tmux's `cause` (not a number, or out of range).
+pub fn layout_string_percentage(value: &str, maxval: u16, curval: u16) -> Option<u16> {
+    let v = value.trim();
+    if let Some(pct) = v.strip_suffix('%') {
+        let p: u32 = pct.trim().parse().ok()?;
+        if p > 100 { return None; }
+        return Some((curval as u32 * p / 100) as u16);
+    }
+    let n: u32 = v.parse().ok()?;
+    if n > maxval as u32 { return None; }
+    Some(n as u16)
+}
+
 /// tmux layout_set_tiled's grid: rows and columns grow alternately, rows
 /// first, until there is a cell for every pane.
 pub fn layout_tiled_grid(n: usize) -> (usize, usize) {
@@ -1320,6 +1335,28 @@ pub fn layout_spread_sizes(size: u16, n: usize) -> Option<Vec<u16>> {
     Some(v)
 }
 
+/// tmux `layout_set_main_v` / `layout_set_main_h` size arithmetic along the
+/// main axis: `total` is the window's width (height), `main_opt` the
+/// main-pane-width (height) option string, `other_opt` other-pane-width
+/// (height), `min` the narrowest cell. Returns (main, other).
+pub fn layout_main_sizes(total: u16, main_opt: &str, other_opt: &str, default_main: u16, min: u16) -> (u16, u16) {
+    // Take off one cell for the border.
+    let sx = total.saturating_sub(1);
+    let mut mainw = layout_string_percentage(main_opt, sx, sx).unwrap_or(default_main);
+    let otherw;
+    if mainw + min >= sx {
+        mainw = if sx <= min + min { min } else { sx - min };
+        otherw = min;
+    } else {
+        match layout_string_percentage(other_opt, sx, sx) {
+            None | Some(0) => { otherw = sx - mainw; }
+            Some(o) if o > sx || sx - o < mainw => { otherw = sx - mainw; }
+            Some(o) => { otherw = o; mainw = sx - o; }
+        }
+    }
+    (mainw, otherw)
+}
+
 /// Apply a named layout to the current window.
 /// Collects ALL leaf panes and rebuilds the tree structure from scratch, in
 /// cells, the way tmux's layout-set.c does it, and leaves the active pane
@@ -1329,13 +1366,15 @@ pub fn apply_layout(app: &mut AppState, layout: &str) {
     // layout this window gets comes from this window's own entries with the
     // server wide values as the parent. Resolved before the mutable borrow.
     let window_index = app.active_idx;
-    let window_main_size = |name: &str, global: u16| -> u16 {
+    let window_opt = |name: &str, global: &str| -> String {
         crate::server::options::window_local_option(app, window_index, name)
-            .and_then(crate::server::options::parse_main_pane_size)
-            .unwrap_or(global)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| global.to_string())
     };
-    let main_pane_height = window_main_size("main-pane-height", app.main_pane_height);
-    let main_pane_width = window_main_size("main-pane-width", app.main_pane_width);
+    let main_pane_height = window_opt("main-pane-height", &app.main_pane_height);
+    let main_pane_width = window_opt("main-pane-width", &app.main_pane_width);
+    let other_pane_height = window_opt("other-pane-height", app.user_options.get("other-pane-height").map(String::as_str).unwrap_or("0"));
+    let other_pane_width = window_opt("other-pane-width", app.user_options.get("other-pane-width").map(String::as_str).unwrap_or("0"));
     let fallback_area = app.last_window_area;
     let win = &mut app.windows[app.active_idx];
     let area = if win.area.width > 0 && win.area.height > 0 { win.area } else { fallback_area };
@@ -1364,10 +1403,7 @@ pub fn apply_layout(app: &mut AppState, layout: &str) {
         sizes
     }
     let spread = |size: u16, n: usize| layout_spread_sizes(size, n).unwrap_or_else(|| equal_sizes(n));
-
-    // Determine main-pane percentage
-    let main_h_pct = if main_pane_height > 0 { main_pane_height.min(95) } else { 60 };
-    let main_v_pct = if main_pane_width > 0 { main_pane_width.min(95) } else { 60 };
+    let min_cols = crate::pane::MIN_PTY_COLS;
 
     // tmux layout_set_select records the layout for next/previous-layout.
     let lname = layout.to_lowercase();
@@ -1387,44 +1423,26 @@ pub fn apply_layout(app: &mut AppState, layout: &str) {
             win.root = Node::Split { kind: LayoutKind::Vertical, sizes, children: leaves };
         }
         "main-horizontal" | "main-h" => {
-            // Vertical split: top pane (main) + bottom horizontal split of remaining
+            // Top pane (main), the rest spread along the bottom row
+            // (layout_set_main_h: main-pane-height, default 24).
+            let (mainh, otherh) = layout_main_sizes(h, &main_pane_height, &other_pane_height, 24, 1);
             let main_pane = leaves.remove(0);
-            if leaves.len() == 1 {
-                let other = leaves.remove(0);
-                win.root = Node::Split {
-                    kind: LayoutKind::Vertical,
-                    sizes: vec![main_h_pct, 100 - main_h_pct],
-                    children: vec![main_pane, other],
-                };
-            } else {
-                let bottom_sizes = equal_sizes(leaves.len());
-                let bottom = Node::Split { kind: LayoutKind::Horizontal, sizes: bottom_sizes, children: leaves };
-                win.root = Node::Split {
-                    kind: LayoutKind::Vertical,
-                    sizes: vec![main_h_pct, 100 - main_h_pct],
-                    children: vec![main_pane, bottom],
-                };
-            }
+            let rest = if leaves.len() == 1 { leaves.remove(0) } else {
+                let n = leaves.len();
+                Node::Split { kind: LayoutKind::Horizontal, sizes: spread(w, n), children: leaves }
+            };
+            win.root = Node::Split { kind: LayoutKind::Vertical, sizes: vec![mainh, otherh], children: vec![main_pane, rest] };
         }
         "main-vertical" | "main-v" => {
-            // Horizontal split: left pane (main) + right vertical split of remaining
+            // Left pane (main), the rest spread down the right column
+            // (layout_set_main_v: main-pane-width, default 80).
+            let (mainw, otherw) = layout_main_sizes(w, &main_pane_width, &other_pane_width, 80, min_cols);
             let main_pane = leaves.remove(0);
-            if leaves.len() == 1 {
-                let other = leaves.remove(0);
-                win.root = Node::Split {
-                    kind: LayoutKind::Horizontal,
-                    sizes: vec![main_v_pct, 100 - main_v_pct],
-                    children: vec![main_pane, other],
-                };
-            } else {
-                let right_sizes = equal_sizes(leaves.len());
-                let right = Node::Split { kind: LayoutKind::Vertical, sizes: right_sizes, children: leaves };
-                win.root = Node::Split {
-                    kind: LayoutKind::Horizontal,
-                    sizes: vec![main_v_pct, 100 - main_v_pct],
-                    children: vec![main_pane, right],
-                };
-            }
+            let rest = if leaves.len() == 1 { leaves.remove(0) } else {
+                let n = leaves.len();
+                Node::Split { kind: LayoutKind::Vertical, sizes: spread(h, n), children: leaves }
+            };
+            win.root = Node::Split { kind: LayoutKind::Horizontal, sizes: vec![mainw, otherw], children: vec![main_pane, rest] };
         }
         "tiled" => {
             // tmux layout_set_tiled: a grid of rows of columns, filled row
@@ -1695,6 +1713,10 @@ fn parse_layout_children(s: &str, closing: char) -> Option<(Vec<LayoutNode>, usi
 #[cfg(test)]
 #[path = "../tests-rs/test_layout.rs"]
 mod test_layout;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_layout_set_tmux.rs"]
+mod test_layout_set_tmux;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_serialize_hyperlink.rs"]
