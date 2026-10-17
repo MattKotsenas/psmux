@@ -3436,6 +3436,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.temp_focus_saved_active = None;
                     }
                     if zoom_after_split && split_succeeded {
+                        // Give every pane its new cell BEFORE zooming: a zoom
+                        // skips the hidden panes, so the pane just split stayed
+                        // at its old height (tmux layout_fix_panes runs first).
+                        resize_all_panes(&mut app);
                         toggle_zoom(&mut app);
                     }
                     // Replenish warm pane for the next new-window/split
@@ -3493,6 +3497,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.temp_focus_saved_active = None;
                     }
                     if zoom_after_split && split_succeeded {
+                        // Give every pane its new cell BEFORE zooming: a zoom
+                        // skips the hidden panes, so the pane just split stayed
+                        // at its old height (tmux layout_fix_panes runs first).
+                        resize_all_panes(&mut app);
                         toggle_zoom(&mut app);
                     }
                     let _ = resp.send(pane_info);

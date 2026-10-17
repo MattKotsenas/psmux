@@ -517,6 +517,42 @@ pub fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>)
     rec(node, area, &mut path, out);
 }
 
+/// The rects `#{pane_left}`, `#{pane_top}` and friends report: the layout's,
+/// and while the window is zoomed, the layout it had before the zoom with
+/// the zoomed pane over the whole window.
+///
+/// tmux (window_zoom) lays out only the zoomed pane and leaves every other
+/// pane's xoff/yoff/sx/sy as they were, so list-panes on a zoomed window
+/// shows the zoomed pane at 0,0 at full size and the rest where they were.
+/// The weights during a zoom are the 100/0 mask, so computing from them put
+/// the zoomed pane at x 3 and squeezed the hidden ones into two column
+/// slivers at the edge.
+pub fn format_rects(win: &crate::types::Window, out: &mut Vec<(Vec<usize>, Rect)>) {
+    let Some(saved) = win.zoom_saved.as_ref() else {
+        compute_rects(&win.root, win.area, out);
+        return;
+    };
+    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, saved: &[(Vec<usize>, Vec<u16>)], out: &mut Vec<(Vec<usize>, Rect)>) {
+        match node {
+            Node::Leaf(_) => out.push((path.clone(), area)),
+            Node::Split { kind, sizes, children } => {
+                let base = saved.iter().find(|(p, _)| p == path).map(|(_, s)| s).unwrap_or(sizes);
+                let effective: Vec<u16> = if base.len() == children.len() { base.clone() }
+                    else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+                let rects = split_with_gaps(matches!(*kind, LayoutKind::Horizontal), &effective, area);
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() { path.push(i); rec(child, rects[i], path, saved, out); path.pop(); }
+                }
+            }
+        }
+    }
+    let mut path = Vec::new();
+    rec(&win.root, win.area, &mut path, saved, out);
+    if let Some((_, r)) = out.iter_mut().find(|(p, _)| *p == win.active_path) {
+        *r = win.area;
+    }
+}
+
 /// The pseudoconsole size a pane gets for the layout slot it owns.
 ///
 /// `border_rows` is the row `pane-border-status` takes out of the slot for the

@@ -18,9 +18,16 @@
 #     psmux equalised the survivors
 #   * split-window -b and -f (psmux ignored both), and join-pane -b sizes
 #
+#   * select-layout keeps the active pane (tmux layout_set never touches
+#     w->active), even-*, tiled, main-* in cells with tmux's layout-set.c
+#     arithmetic, main-pane-width / main-pane-height (defaults 80 and 24,
+#     cells or N%), other-pane-width / other-pane-height, and the first
+#     next-layout / previous-layout
+#   * a zoomed window: a split unzooms first, and list-panes reports the
+#     zoomed pane over the window and the others where they were
+#
 # Not compared here, on purpose: a pane pushed to the minimum (psmux keeps two
-# columns, MIN_PTY_COLS, where tmux allows one), and select-layout (see the
-# layout suites).
+# columns, MIN_PTY_COLS, where tmux allows one).
 #
 # Binary: $env:PSMUX_BIN if set, else psmux on PATH. Own -L namespace;
 # honours PSMUX_DATA_DIR. Set PSMUX_PARITY_ONLY to a regex to run some cases.
@@ -87,6 +94,44 @@ $cases = @(
     ,@('resD_nested', 120, 30, 'split-window -h;;split-window -v;;resize-pane -t 1 -D 2', 'e8a2,120x30,0,0{60x30,0,0,0,59x30,61,0[59x17,61,0,1,59x12,61,18,2]}', '0:0:0,0:60x30:0 1:1:61,0:59x17:0 2:2:61,18:59x12:1')
     ,@('resU_on_last', 120, 30, 'split-window -v;;split-window -v;;resize-pane -t 2 -U 3', '6f9a,120x30,0,0[120x15,0,0,0,120x4,0,16,1,120x9,0,21,2]', '0:0:0,0:120x15:0 1:1:0,16:120x4:0 2:2:0,21:120x9:1')
     ,@('hb_cluster', 120, 30, 'split-window -hb', '709f,120x30,0,0{60x30,0,0,1,59x30,61,0,0}', '0:1:0,0:60x30:1 1:0:61,0:59x30:0')
+    ,@('sl_evenh', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout even-horizontal', '04f7,120x30,0,0{29x30,0,0,0,29x30,30,0,1,29x30,60,0,2,30x30,90,0,3}', '0:0:0,0:29x30:0 1:1:30,0:29x30:0 2:2:60,0:29x30:0 3:3:90,0:30x30:1')
+    ,@('sl_evenv', 120, 30, 'split-window -v;;split-window -v;;split-window -v;;select-layout even-vertical', '7fc8,120x30,0,0[120x6,0,0,0,120x6,0,7,1,120x6,0,14,2,120x9,0,21,3]', '0:0:0,0:120x6:0 1:1:0,7:120x6:0 2:2:0,14:120x6:0 3:3:0,21:120x9:1')
+    ,@('sl_tiled', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout tiled', '69c5,120x30,0,0[120x14,0,0{59x14,0,0,0,60x14,60,0,1},120x15,0,15{59x15,0,15,2,60x15,60,15,3}]', '0:0:0,0:59x14:0 1:1:60,0:60x14:0 2:2:0,15:59x15:0 3:3:60,15:60x15:1')
+    ,@('sl_evenh_sel1', 120, 30, 'split-window -h;;split-window -h;;select-pane -t 1;;select-layout even-horizontal', '62c4,120x30,0,0{39x30,0,0,0,39x30,40,0,1,40x30,80,0,2}', '0:0:0,0:39x30:0 1:1:40,0:39x30:1 2:2:80,0:40x30:0')
+    ,@('sl_tiled_sel0', 120, 30, 'split-window -h;;split-window -v;;split-window -h;;select-pane -t 0;;select-layout tiled', '69c5,120x30,0,0[120x14,0,0{59x14,0,0,0,60x14,60,0,1},120x15,0,15{59x15,0,15,2,60x15,60,15,3}]', '0:0:0,0:59x14:1 1:1:60,0:60x14:0 2:2:0,15:59x15:0 3:3:60,15:60x15:0')
+    ,@('sl_mainv', 120, 30, 'split-window -h;;split-window -h;;select-layout main-vertical', '3d1d,120x30,0,0{80x30,0,0,0,39x30,81,0[39x14,81,0,1,39x15,81,15,2]}', '0:0:0,0:80x30:0 1:1:81,0:39x14:0 2:2:81,15:39x15:1')
+    ,@('sl_mainh', 120, 30, 'split-window -v;;split-window -v;;select-layout main-horizontal', '3d63,120x30,0,0[120x24,0,0,0,120x5,0,25{59x5,0,25,1,60x5,60,25,2}]', '0:0:0,0:120x24:0 1:1:0,25:59x5:0 2:2:60,25:60x5:1')
+    ,@('sl_mainv_sel1', 120, 30, 'split-window -h;;split-window -h;;select-pane -t 1;;select-layout main-vertical', '3d1d,120x30,0,0{80x30,0,0,0,39x30,81,0[39x14,81,0,1,39x15,81,15,2]}', '0:0:0,0:80x30:0 1:1:81,0:39x14:1 2:2:81,15:39x15:0')
+    ,@('sl_mainv4', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout main-vertical', '5ff0,120x30,0,0{80x30,0,0,0,39x30,81,0[39x9,81,0,1,39x9,81,10,2,39x10,81,20,3]}', '0:0:0,0:80x30:0 1:1:81,0:39x9:0 2:2:81,10:39x9:0 3:3:81,20:39x10:1')
+    ,@('sl_mainh4', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout main-horizontal', 'f241,120x30,0,0[120x24,0,0,0,120x5,0,25{39x5,0,25,1,39x5,40,25,2,40x5,80,25,3}]', '0:0:0,0:120x24:0 1:1:0,25:39x5:0 2:2:40,25:39x5:0 3:3:80,25:40x5:1')
+    ,@('sl_mainv_w50', 120, 30, 'split-window -h;;split-window -h;;set-option -w main-pane-width 50;;select-layout main-vertical', '6e85,120x30,0,0{50x30,0,0,0,69x30,51,0[69x14,51,0,1,69x15,51,15,2]}', '0:0:0,0:50x30:0 1:1:51,0:69x14:0 2:2:51,15:69x15:1')
+    ,@('sl_mainv_w30p', 120, 30, 'split-window -h;;split-window -h;;set-option -w main-pane-width 30%;;select-layout main-vertical', '956f,120x30,0,0{35x30,0,0,0,84x30,36,0[84x14,36,0,1,84x15,36,15,2]}', '0:0:0,0:35x30:0 1:1:36,0:84x14:0 2:2:36,15:84x15:1')
+    ,@('sl_mainh_h10', 120, 30, 'split-window -v;;split-window -v;;set-option -w main-pane-height 10;;select-layout main-horizontal', '699c,120x30,0,0[120x10,0,0,0,120x19,0,11{59x19,0,11,1,60x19,60,11,2}]', '0:0:0,0:120x10:0 1:1:0,11:59x19:0 2:2:60,11:60x19:1')
+    ,@('sl_mainh_h50p', 120, 30, 'split-window -v;;split-window -v;;set-option -w main-pane-height 50%;;select-layout main-horizontal', 'a0c4,120x30,0,0[120x14,0,0,0,120x15,0,15{59x15,0,15,1,60x15,60,15,2}]', '0:0:0,0:120x14:0 1:1:0,15:59x15:0 2:2:60,15:60x15:1')
+    ,@('sl_mainh_small', 80, 20, 'split-window -v;;split-window -v;;select-layout main-horizontal', 'd8fe,80x20,0,0[80x18,0,0,0,80x1,0,19{39x1,0,19,1,40x1,40,19,2}]', '0:0:0,0:80x18:0 1:1:0,19:39x1:0 2:2:40,19:40x1:1')
+    ,@('sl_mainv_odd', 121, 31, 'split-window -h;;split-window -h;;select-layout main-vertical', '49dd,121x31,0,0{80x31,0,0,0,40x31,81,0[40x15,81,0,1,40x15,81,16,2]}', '0:0:0,0:80x31:0 1:1:81,0:40x15:0 2:2:81,16:40x15:1')
+    ,@('sl_next', 120, 30, 'split-window -h;;split-window -h;;next-layout', '62c4,120x30,0,0{39x30,0,0,0,39x30,40,0,1,40x30,80,0,2}', '0:0:0,0:39x30:0 1:1:40,0:39x30:0 2:2:80,0:40x30:1')
+    ,@('sl_then_split', 120, 30, 'split-window -h;;split-window -h;;select-layout even-horizontal;;split-window -v', '8c74,120x30,0,0{39x30,0,0,0,39x30,40,0,1,40x30,80,0[40x15,80,0,2,40x14,80,16,3]}', '0:0:0,0:39x30:0 1:1:40,0:39x30:0 2:2:80,0:40x15:0 3:3:80,16:40x14:1')
+    ,@('sl_then_res', 120, 30, 'split-window -h;;split-window -h;;select-layout main-vertical;;resize-pane -t 0 -R 1', 'c6d7,120x30,0,0{81x30,0,0,0,38x30,82,0[38x14,82,0,1,38x15,82,15,2]}', '0:0:0,0:81x30:0 1:1:82,0:38x14:0 2:2:82,15:38x15:1')
+    ,@('zoom_split_v', 120, 30, 'split-window -h;;resize-pane -Z;;split-window -v', 'c522,120x30,0,0{60x30,0,0,0,59x30,61,0[59x15,61,0,1,59x14,61,16,2]}', '0:0:0,0:60x30:0 1:1:61,0:59x15:0 2:2:61,16:59x14:1')
+    ,@('zoom_split_h', 120, 30, 'split-window -h;;select-pane -t 0;;resize-pane -Z;;split-window -h', '7377,120x30,0,0{30x30,0,0,0,29x30,31,0,2,59x30,61,0,1}', '0:0:0,0:30x30:0 1:2:31,0:29x30:1 2:1:61,0:59x30:0')
+    ,@('zoom_split_res', 120, 30, 'split-window -h;;resize-pane -t 0 -R 3;;resize-pane -Z;;split-window -v', '6252,120x30,0,0{63x30,0,0,0,56x30,64,0[56x15,64,0,1,56x14,64,16,2]}', '0:0:0,0:63x30:0 1:1:64,0:56x15:0 2:2:64,16:56x14:1')
+    ,@('zoom_kill', 120, 30, 'split-window -h;;split-window -h;;resize-pane -Z;;kill-pane', 'f09b,120x30,0,0{60x30,0,0,0,59x30,61,0,1}', '0:0:0,0:60x30:0 1:1:61,0:59x30:1')
+    ,@('zoom_split_Z', 120, 30, 'split-window -h;;resize-pane -Z;;split-window -v -Z', 'c522,120x30,0,0{60x30,0,0,0,59x30,61,0[59x15,61,0,1,59x14,61,16,2]}', '0:0:0,0:60x30:0 1:1:61,0:59x15:0 2:2:0,0:120x30:1')
+    ,@('zoom_only', 120, 30, 'split-window -h;;resize-pane -Z', 'f09b,120x30,0,0{60x30,0,0,0,59x30,61,0,1}', '0:0:0,0:60x30:0 1:1:0,0:120x30:1')
+    ,@('zoom_only3', 120, 30, 'split-window -h;;split-window -v;;select-pane -t 0;;resize-pane -Z', 'c522,120x30,0,0{60x30,0,0,0,59x30,61,0[59x15,61,0,1,59x14,61,16,2]}', '0:0:0,0:120x30:1 1:1:61,0:59x15:0 2:2:61,16:59x14:0')
+    ,@('sl_tiled3', 120, 30, 'split-window -h;;split-window -h;;select-layout tiled', '40cf,120x30,0,0[120x14,0,0{59x14,0,0,0,60x14,60,0,1},120x15,0,15,2]', '0:0:0,0:59x14:0 1:1:60,0:60x14:0 2:2:0,15:120x15:1')
+    ,@('sl_tiled5', 120, 30, 'split-window -h;;split-window -v;;select-pane -t 0;;split-window -v;;split-window -h;;select-layout tiled', '4631,120x30,0,0[120x9,0,0{59x9,0,0,0,60x9,60,0,3},120x9,0,10{59x9,0,10,4,60x9,60,10,1},120x10,0,20,2]', '0:0:0,0:59x9:0 1:3:60,0:60x9:0 2:4:0,10:59x9:1 3:1:60,10:60x9:0 4:2:0,20:120x10:0')
+    ,@('sl_tiled6', 120, 30, 'split-window -h;;split-window -v;;select-pane -t 0;;split-window -v;;split-window -h;;select-pane -t 4;;split-window -h;;select-layout tiled', 'cf05,120x30,0,0[120x9,0,0{59x9,0,0,0,60x9,60,0,3},120x9,0,10{59x9,0,10,4,60x9,60,10,1},120x10,0,20{59x10,0,20,2,60x10,60,20,5}]', '0:0:0,0:59x9:0 1:3:60,0:60x9:0 2:4:0,10:59x9:0 3:1:60,10:60x9:0 4:2:0,20:59x10:0 5:5:60,20:60x10:1')
+    ,@('sl_evenh5', 120, 30, 'split-window -h;;split-window -v;;select-pane -t 0;;split-window -v;;split-window -h;;select-layout even-horizontal', 'd7e1,120x30,0,0{23x30,0,0,0,23x30,24,0,3,23x30,48,0,4,23x30,72,0,1,24x30,96,0,2}', '0:0:0,0:23x30:0 1:3:24,0:23x30:0 2:4:48,0:23x30:1 3:1:72,0:23x30:0 4:2:96,0:24x30:0')
+    ,@('sl_mainv_ow30', 120, 30, 'split-window -h;;split-window -h;;set-option -w other-pane-width 30;;select-layout main-vertical', '6998,120x30,0,0{89x30,0,0,0,30x30,90,0[30x14,90,0,1,30x15,90,15,2]}', '0:0:0,0:89x30:0 1:1:90,0:30x14:0 2:2:90,15:30x15:1')
+    ,@('sl_mainh_oh10', 120, 30, 'split-window -v;;split-window -v;;set-option -w other-pane-height 10;;select-layout main-horizontal', '3d63,120x30,0,0[120x24,0,0,0,120x5,0,25{59x5,0,25,1,60x5,60,25,2}]', '0:0:0,0:120x24:0 1:1:0,25:59x5:0 2:2:60,25:60x5:1')
+    ,@('sl_mainv_g', 120, 30, 'set-option -g main-pane-width 60;;split-window -h;;split-window -h;;select-layout main-vertical', 'b362,120x30,0,0{60x30,0,0,0,59x30,61,0[59x14,61,0,1,59x15,61,15,2]}', '0:0:0,0:60x30:0 1:1:61,0:59x14:0 2:2:61,15:59x15:1')
+    ,@('sl_prev', 120, 30, 'split-window -h;;split-window -h;;previous-layout', '40cf,120x30,0,0[120x14,0,0{59x14,0,0,0,60x14,60,0,1},120x15,0,15,2]', '0:0:0,0:59x14:0 1:1:60,0:60x14:0 2:2:0,15:120x15:1')
+    ,@('evenh_res', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout even-horizontal;;resize-pane -t 1 -R 1', 'fff6,120x30,0,0{29x30,0,0,0,30x30,30,0,1,28x30,61,0,2,30x30,90,0,3}', '0:0:0,0:29x30:0 1:1:30,0:30x30:0 2:2:61,0:28x30:0 3:3:90,0:30x30:1')
+    ,@('evenh_kill', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout even-horizontal;;kill-pane -t 1', '3639,120x30,0,0{59x30,0,0,0,29x30,60,0,2,30x30,90,0,3}', '0:0:0,0:59x30:0 1:1:60,0:29x30:0 2:2:90,0:30x30:1')
+    ,@('tiled4', 120, 30, 'split-window -h;;split-window -h;;split-window -h;;select-layout tiled', '69c5,120x30,0,0[120x14,0,0{59x14,0,0,0,60x14,60,0,1},120x15,0,15{59x15,0,15,2,60x15,60,15,3}]', '0:0:0,0:59x14:0 1:1:60,0:60x14:0 2:2:0,15:59x15:0 3:3:60,15:60x15:1')
+    ,@('mainv', 120, 30, 'split-window -h;;split-window -h;;select-layout main-vertical', '3d1d,120x30,0,0{80x30,0,0,0,39x30,81,0[39x14,81,0,1,39x15,81,15,2]}', '0:0:0,0:80x30:0 1:1:81,0:39x14:0 2:2:81,15:39x15:1')
 )
 
 function Strip-Layout([string]$l) {

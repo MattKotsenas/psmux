@@ -1747,7 +1747,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             }
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
@@ -2007,7 +2007,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_left" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { rect.x.to_string() } else { "0".into() }
@@ -2016,7 +2016,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_top" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { rect.y.to_string() } else { "0".into() }
@@ -2025,7 +2025,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_right" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { (rect.x + rect.width).saturating_sub(1).to_string() } else { "79".into() }
@@ -2034,7 +2034,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_bottom" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { (rect.y + rect.height).saturating_sub(1).to_string() } else { "23".into() }
@@ -2043,7 +2043,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_top" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
@@ -2054,7 +2054,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_bottom" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
@@ -2067,7 +2067,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_left" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
@@ -2078,7 +2078,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_right" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                crate::tree::format_rects(win, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
@@ -2182,7 +2182,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                         let cols = p.last_cols;
                         // Convert screen-absolute mouse_y to pane-relative row
                         let mut rects = Vec::new();
-                        crate::tree::compute_rects(&w.root, w.area, &mut rects);
+                        crate::tree::format_rects(w, &mut rects);
                         let pane_y_offset = rects.iter()
                             .find(|(path, _)| crate::tree::get_active_pane_id_at_path(&w.root, path) == Some(p.id))
                             .map(|(_, rect)| rect.y)
@@ -2208,7 +2208,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                         let screen = parser.screen();
                         let cols = p.last_cols;
                         let mut rects = Vec::new();
-                        crate::tree::compute_rects(&w.root, w.area, &mut rects);
+                        crate::tree::format_rects(w, &mut rects);
                         let (pane_x_offset, pane_y_offset) = rects.iter()
                             .find(|(path, _)| crate::tree::get_active_pane_id_at_path(&w.root, path) == Some(p.id))
                             .map(|(_, rect)| (rect.x, rect.y))
