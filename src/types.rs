@@ -1264,7 +1264,8 @@ pub struct Window {
     /// True when the user has manually renamed this window (auto-rename won't override).
     /// Cleared when `set automatic-rename on` is explicitly set.
     pub manual_rename: bool,
-    /// Current position in the named layout cycle (0..4)
+    /// The last named layout applied, plus one (0: none yet, tmux
+    /// `lastlayout == -1`). See `layout::cycle_layout`.
     pub layout_index: usize,
     /// Per-pane MRU (most-recently-used) order: pane IDs ordered by recency.
     /// Front = most recently focused.  Used for:
