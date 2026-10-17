@@ -3949,7 +3949,7 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
         root: pane_node,
         active_path: vec![],
         name: win_name,
-        id: app.ids.alloc_window(),
+        id: app.next_win_id,
         area: app.client_area,
         window_size: None,
         window_options: Default::default(),
@@ -3968,6 +3968,7 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
         floating: Vec::new(),
         floating_focus: None,
     });
+    app.next_win_id += 1;
     app.on_window_appended();
     let new_win_id = app.windows.last().map(|w| w.id);
     if src_empty {

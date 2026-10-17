@@ -925,7 +925,7 @@ impl WarmPool {
         let wp = self.spares.pop_front();
         if let Some(ref w) = wp {
             // Handing this id out puts every lower id in the past, exactly as a
-            // cold spawn taking `ids.next_pane` does, so record it as issued.
+            // cold spawn taking `next_pane_id` does, so record it as issued.
             //
             // The pool is sorted and this took its front, so normally the id
             // handed out IS the lowest outstanding one and this changes
@@ -1297,7 +1297,7 @@ pub struct FloatingPane {
     /// Border line style: a `pane-border-lines` value
     /// (single/double/heavy/simple/none). Empty or "single" => default single.
     pub border: String,
-    /// Unique pane id (shares the `ids.next_pane` space with tiled panes).
+    /// Unique pane id (shares the `next_pane_id` space with tiled panes).
     pub id: usize,
     pub title: String,
     /// Last `-P` position keyword (top-left/centre/...), kept so the float can
@@ -1493,56 +1493,6 @@ pub struct ShellEntry {
     pub value: String,
     /// A background worker for this command is currently in flight.
     pub running: bool,
-}
-
-#[derive(Debug)]
-pub struct ServerIds {
-    next_window: usize,
-    next_pane: usize,
-    next_forward: u64,
-}
-
-impl Default for ServerIds {
-    fn default() -> Self {
-        Self {
-            next_window: 1,
-            next_pane: 1,
-            next_forward: 1,
-        }
-    }
-}
-
-impl ServerIds {
-    pub fn peek_pane(&self) -> usize {
-        self.next_pane
-    }
-    pub fn commit_pane(&mut self, id: usize) {
-        debug_assert_eq!(id, self.next_pane);
-        self.next_pane += 1;
-    }
-    pub fn alloc_pane(&mut self) -> usize {
-        let id = self.next_pane;
-        self.next_pane += 1;
-        id
-    }
-    pub fn alloc_window(&mut self) -> usize {
-        let id = self.next_window;
-        self.next_window += 1;
-        id
-    }
-    pub fn alloc_forward(&mut self) -> u64 {
-        let id = self.next_forward;
-        self.next_forward += 1;
-        id
-    }
-    #[cfg(test)]
-    pub fn set_next_window(&mut self, id: usize) {
-        self.next_window = id;
-    }
-    #[cfg(test)]
-    pub fn set_next_pane(&mut self, id: usize) {
-        self.next_pane = id;
-    }
 }
 
 pub struct AppState {
@@ -1825,7 +1775,8 @@ pub struct AppState {
     /// each gets its reply when the prompt closes, as tmux's client waits.
     pub prompt_waiters: Vec<(u64, std::sync::mpsc::Sender<String>)>,
     pub created_at: chrono::DateTime<Local>,
-    pub ids: ServerIds,
+    pub next_win_id: usize,
+    pub next_pane_id: usize,
     /// Pane ids already auto-healed once by `@heal-crashed-panes`. A pane is
     /// respawned at most once so a shell that crashes on every startup can't
     /// spin an infinite respawn loop; after one heal it falls through to the
@@ -2141,6 +2092,8 @@ pub struct AppState {
     /// Panes extracted for cross-session forwarding, keyed by forward_id.
     /// The source server keeps these alive so the real ConPTY continues running.
     pub forwarded_panes: HashMap<u64, ForwardedPane>,
+    /// Counter for generating unique forward IDs.
+    pub next_forward_id: u64,
 }
 
 /// What a tmux window target spec resolved to, the output of
@@ -3183,7 +3136,8 @@ impl AppState {
             prompt_request_seq: 0,
             prompt_waiters: Vec::new(),
             created_at: Local::now(),
-            ids: ServerIds::default(),
+            next_win_id: 1,
+            next_pane_id: 1,
             healed_pane_ids: std::collections::HashSet::new(),
             client_prefix_active: false,
             sync_input: false,
@@ -3312,6 +3266,7 @@ impl AppState {
             click_state: None,
             click_finish_at: None,
             forwarded_panes: HashMap::new(),
+            next_forward_id: 1,
         }
     }
 
@@ -5095,10 +5050,6 @@ mod tests_issue601_602_move_swap_window;
 #[cfg(test)]
 #[path = "../tests-rs/test_new_window_index_target.rs"]
 mod tests_new_window_index_target;
-
-#[cfg(test)]
-#[path = "../tests-rs/test_server_ids.rs"]
-mod tests_server_ids;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_preview_window_state.rs"]
