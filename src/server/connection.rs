@@ -3284,8 +3284,8 @@ match cmd {
         // (SPAWN_FULLSIZE). Both used to be parsed by nobody.
         let split_size = crate::pane::SplitPlacement {
             size: split_size,
-            before: false,
-            full: false,
+            before: crate::cli::has_short_flag(&args, 'b'),
+            full: crate::cli::has_short_flag(&args, 'f'),
         };
         // tmux parity (#582): same `--` argv handling as new-window above.
         let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
@@ -6813,8 +6813,8 @@ fn dispatch_control_command(
                 .collect();
             let split_size = crate::pane::SplitPlacement {
                 size: split_size,
-                before: false,
-                full: false,
+                before: crate::cli::has_short_flag(&args, 'b'),
+                full: crate::cli::has_short_flag(&args, 'f'),
             };
             let (rtx, rrx) = mpsc::channel::<String>();
             if print_info {

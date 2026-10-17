@@ -2831,6 +2831,8 @@ fn run_main() -> io::Result<()> {
                 let mut title_arg: Option<String> = None;
                 let mut env_args: Vec<String> = Vec::new();
                 let mut zoom_after_split = false;
+                let mut before = false;
+                let mut full = false;
                 let mut sw_positional: Vec<String> = Vec::new();
                 let mut sw_saw_ddash = false;
                 {
@@ -2853,7 +2855,22 @@ fn run_main() -> io::Result<()> {
                             "-d" => { detached = true; }
                             "-P" => { print_info = true; }
                             "-Z" => { zoom_after_split = true; }
-                            "-b" | "-f" | "-I" => { /* ignored for compatibility */ }
+                            // -b: new pane before (top/left); -f: full window
+                            // width/height (tmux SPAWN_BEFORE / SPAWN_FULLSIZE).
+                            "-b" => { before = true; }
+                            "-f" => { full = true; }
+                            "-I" => { /* ignored for compatibility */ }
+                            // A cluster of argument-less flags (`-hb`, `-fvd`).
+                            _ if a.len() > 2 && a[1..].chars().all(|c| "bdfhIPvZ".contains(c)) => {
+                                for c in a[1..].chars() {
+                                    match c {
+                                        'h' => flag = "-h", 'v' => flag = "-v",
+                                        'd' => detached = true, 'P' => print_info = true,
+                                        'Z' => zoom_after_split = true, 'b' => before = true,
+                                        'f' => full = true, _ => {}
+                                    }
+                                }
+                            }
                             _ if a.starts_with('-') => { /* unknown flag, skip */ }
                             _ => { sw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
                         }
@@ -2879,6 +2896,8 @@ fn run_main() -> io::Result<()> {
                 if detached { cmd_line.push_str(" -d"); }
                 if print_info { cmd_line.push_str(" -P"); }
                 if zoom_after_split { cmd_line.push_str(" -Z"); }
+                if before { cmd_line.push_str(" -b"); }
+                if full { cmd_line.push_str(" -f"); }
                 if let Some(ref fmt) = format_str {
                     cmd_line.push_str(&format!(" -F {}", crate::util::quote_arg(&fmt)));
                 }
