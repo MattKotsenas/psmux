@@ -87,10 +87,12 @@ $confBad = Join-Path $TMP "bad.conf"
 Write-Ascii $confBad "set -g prefix NoSuchKey`nset -g @after 1`n"
 $warnLog = Join-Path $dataDir "config-warnings.log"
 Remove-Item $warnLog -Force -EA SilentlyContinue
-P source-file $confBad | Out-Null
+# #842: a runtime source-file reports its errors to the caller, as tmux's
+# cmdq_error does; the startup load records them in config-warnings.log.
+$srcOut = P source-file $confBad
 $v = P show -gv prefix; $after = P show -gv '@after'
 $warn = if (Test-Path $warnLog) { Get-Content $warnLog -Raw } else { "" }
-if ($warn -match 'bad key: NoSuchKey') { Write-Pass "config-warnings.log records 'bad key: NoSuchKey'" } else { Write-Fail "config-warnings.log: '$warn'" }
+if ("$srcOut`n$warn" -match 'bad key: NoSuchKey') { Write-Pass "bad config line reported 'bad key: NoSuchKey'" } else { Write-Fail "bad key not reported; source-file said '$srcOut', config-warnings.log: '$warn'" }
 if ($v -eq "C-a" -and $after -eq "1") { Write-Pass "bad config line left prefix C-a and the next line still ran" } else { Write-Fail "after bad config: prefix='$v' @after='$after'" }
 $confNone = Join-Path $TMP "none.conf"
 Write-Ascii $confNone "set -g prefix None`n"
