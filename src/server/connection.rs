@@ -3280,6 +3280,13 @@ match cmd {
             .filter(|w| w[0] == "-e")
             .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
+        // -b: new pane top/left (SPAWN_BEFORE); -f: span the whole window
+        // (SPAWN_FULLSIZE). Both used to be parsed by nobody.
+        let split_size = crate::pane::SplitPlacement {
+            size: split_size,
+            before: false,
+            full: false,
+        };
         // tmux parity (#582): same `--` argv handling as new-window above.
         let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
             let tail = &args[pos + 1..];
@@ -6804,6 +6811,11 @@ fn dispatch_control_command(
                 .filter(|w| w[0] == "-e")
                 .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
                 .collect();
+            let split_size = crate::pane::SplitPlacement {
+                size: split_size,
+                before: false,
+                full: false,
+            };
             let (rtx, rrx) = mpsc::channel::<String>();
             if print_info {
                 let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets, zoom_after_split));

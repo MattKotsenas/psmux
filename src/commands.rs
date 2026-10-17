@@ -723,6 +723,7 @@ pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pa
             if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
         }
     }
+    crate::tree::normalize_window_sizes(&mut app.windows[src_idx]);
     let src_root = std::mem::replace(&mut app.windows[src_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
     let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);

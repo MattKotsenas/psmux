@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::types::{AppState, Pane, Node, LayoutKind, Window};
-use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
+use crate::tree::{active_pane_mut, kill_leaf};
 use crate::format::hostname_cached;
 
 /// Sentinel value for cursor_shape: means "no DECSCUSR received from child yet".
@@ -1862,9 +1862,42 @@ pub fn client_path_override(extra_env: &[(String, String)], inherited: Option<&s
         .collect()
 }
 
+/// Where a split puts its new pane: `-l` and `-b` of split-window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitPlacement {
+    /// `-l`: (cells, false) or (percent of the pane being split, true).
+    pub size: Option<(u16, bool)>,
+    /// `-b`: the new pane goes top/left of the pane it splits.
+    pub before: bool,
+    /// `-f`: the new pane spans the whole window (SPAWN_FULLSIZE).
+    pub full: bool,
+}
+
+/// Put `new_leaf` into the active window beside its active pane, with tmux's
+/// layout_split_pane geometry (`crate::tree::split_leaf_tmux`), and focus it.
+fn insert_split_leaf(app: &mut AppState, kind: LayoutKind, new_leaf: Node, placement: SplitPlacement) {
+    let fallback = app.last_window_area;
+    let win = &mut app.windows[app.active_idx];
+    let area = if win.area.width > 0 && win.area.height > 0 { win.area } else { fallback };
+    let path = win.active_path.clone();
+    let new_path = if placement.full {
+        Some(crate::tree::split_full_tmux(&mut win.root, area, kind, new_leaf, placement.size, placement.before))
+    } else {
+        crate::tree::split_leaf_tmux(&mut win.root, &path, area, kind, new_leaf, placement.size, placement.before)
+    };
+    if let Some(new_path) = new_path {
+        win.active_path = new_path;
+    }
+}
+
 /// `split_active_with_command` plus per-pane environment from
 /// `split-window -e KEY=VALUE` (tmux parity, issue #489).
 pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>, start_dir: Option<&str>, extra_env: &[(String, String)]) -> io::Result<()> {
+    split_active_placed(app, kind, command, pty_system_ref, start_dir, extra_env, SplitPlacement::default())
+}
+
+/// `split_active_with_env` with split-window's `-l` and `-b`.
+pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>, start_dir: Option<&str>, extra_env: &[(String, String)], placement: SplitPlacement) -> io::Result<()> {
     // A caller's PATH that the pane inherits anyway changes nothing (#829):
     // drop it so the warm pool below stays usable.
     let extra_env_kept = client_path_override(extra_env, inherited_path(app).as_deref());
@@ -2026,11 +2059,8 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
                 silent_rehome(&mut new_pane, dir, syntax);
             }
             let new_leaf = Node::Leaf(new_pane);
+            insert_split_leaf(app, kind, new_leaf, placement);
             let win = &mut app.windows[app.active_idx];
-            replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
-            let mut new_path = win.active_path.clone();
-            new_path.push(1);
-            win.active_path = new_path;
             // Add new pane to MRU (most recent)
             crate::tree::touch_mru(&mut win.pane_mru, new_pane_id);
             crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
@@ -2099,11 +2129,8 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     let split_pane_id = app.next_pane_id;
     let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None });
     app.next_pane_id += 1;
+    insert_split_leaf(app, kind, new_leaf, placement);
     let win = &mut app.windows[app.active_idx];
-    replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
-    let mut new_path = win.active_path.clone();
-    new_path.push(1);
-    win.active_path = new_path;
     // Add new pane to MRU (most recent)
     crate::tree::touch_mru(&mut win.pane_mru, split_pane_id);
     crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
@@ -2121,6 +2148,8 @@ fn kill_pane_at_path(win: &mut Window, path: &Vec<usize>) {
     if let Some(p) = active_pane_mut(&mut win.root, path) {
         crate::platform::process_kill::kill_process_tree(&mut p.child);
     }
+    // In cells, so the neighbour gets exactly the dead pane's cells.
+    crate::tree::normalize_window_sizes(win);
     kill_leaf(&mut win.root, path);
     // Remove killed pane from MRU
     if let Some(kid) = killed_id {

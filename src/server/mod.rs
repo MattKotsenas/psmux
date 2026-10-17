@@ -15,13 +15,15 @@ use std::net::TcpListener;
 use portable_pty::native_pty_system;
 use ratatui::prelude::Rect;
 
-use crate::types::{AppState, CtrlReq, Mode, FocusDir, LayoutKind, PipePaneState, VERSION,
+#[cfg(test)]
+use crate::types::LayoutKind;
+use crate::types::{AppState, CtrlReq, Mode, FocusDir, PipePaneState, VERSION,
     WaitChannel, WaitForOp, Node, Action, Bind};
 use crate::platform::install_console_ctrl_handler;
-use crate::pane::{create_window, create_window_with_env, create_window_raw, split_active_with_env, kill_active_pane, kill_pane_by_id, spawn_warm_pane};
+use crate::pane::{create_window, create_window_with_env, create_window_raw, kill_active_pane, kill_pane_by_id, spawn_warm_pane};
 use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all_children,
     find_window_index_by_id, focus_pane_by_id, focus_pane_by_index, get_active_pane_id,
-    get_split_mut, path_exists};
+    path_exists};
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
@@ -3381,8 +3383,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // No server chdir here: the pane's start directory is handed to the
                     // shell alone, never to the ConPTY host. See the #630 note on
                     // CtrlReq::NewWindow above.
-                    let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let split_succeeded = match split_active_with_env(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets) {
+                    let prev_pane_id = crate::tree::get_active_pane_id(&app.windows[app.active_idx].root, &app.windows[app.active_idx].active_path);
+                    let split_succeeded = match crate::pane::split_active_placed(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets, split_size) {
                         Err(e) => {
                             let msg = format!("split-window: {e}");
                             app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
@@ -3394,22 +3396,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             true
                         }
                     };
-                    // Apply size if specified: (value, true) = percentage, (value, false) = cell count
-                    if let Some((val, is_pct)) = split_size {
-                        let pct = if is_pct {
-                            val.clamp(1, 99)
-                        } else {
-                            // Convert cell count to percentage based on split direction
-                            let area = app.last_window_area;
-                            let total = if k == LayoutKind::Horizontal { area.width } else { area.height };
-                            if total > 0 { ((val as u32 * 100) / total as u32).clamp(1, 99) as u16 } else { 50 }
-                        };
-                        let win = &mut app.windows[app.active_idx];
-                        if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
-                            sizes[0] = 100 - pct;
-                            sizes[1] = pct;
-                        }
-                    }
+                    // `-l` is applied by the split itself, in cells (tmux
+                    // layout_split_sizes); it used to be rewritten here as a
+                    // percentage of the WINDOW after a 50/50 split.
                     // -T: the just-created pane is currently active in this
                     // window, so set its title before any detached revert.
                     if let Some(t) = title {
@@ -3425,12 +3414,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             &app.windows[app.active_idx].root,
                             &app.windows[app.active_idx].active_path,
                         );
-                        // Revert focus to the previously active pane.
-                        // After split, prev_path now points to a Split node;
-                        // the original pane is child [0] of that Split.
-                        let mut revert_path = prev_path;
-                        revert_path.push(0);
-                        app.windows[app.active_idx].active_path = revert_path;
+                        // Revert focus to the previously active pane, found
+                        // by id: with -b it is no longer child 0, and a split
+                        // into a same-kind parent did not nest it at all.
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = prev_pane_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
+                            win.active_path = p;
+                        }
                         // Detached splits never focus the new pane — remove
                         // from MRU entirely so directional nav tie-breaks by
                         // pane_index among equally-unvisited candidates (#70).
@@ -3463,8 +3453,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // No server chdir here: the pane's start directory is handed to the
                     // shell alone, never to the ConPTY host. See the #630 note on
                     // CtrlReq::NewWindow above.
-                    let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let split_succeeded = match split_active_with_env(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets) {
+                    let prev_pane_id = crate::tree::get_active_pane_id(&app.windows[app.active_idx].root, &app.windows[app.active_idx].active_path);
+                    let split_succeeded = match crate::pane::split_active_placed(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets, split_size) {
                         Err(e) => {
                             app.status_message = Some((format!("split-window: {e}"), std::time::Instant::now(), None));
                             eprintln!("psmux: split-window error: {e}");
@@ -3472,21 +3462,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         Ok(()) => true,
                     };
-                    // Apply size if specified: (value, true) = percentage, (value, false) = cell count
-                    if let Some((val, is_pct)) = split_size {
-                        let pct = if is_pct {
-                            val.clamp(1, 99)
-                        } else {
-                            let area = app.last_window_area;
-                            let total = if k == LayoutKind::Horizontal { area.width } else { area.height };
-                            if total > 0 { ((val as u32 * 100) / total as u32).clamp(1, 99) as u16 } else { 50 }
-                        };
-                        let win = &mut app.windows[app.active_idx];
-                        if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
-                            sizes[0] = 100 - pct;
-                            sizes[1] = pct;
-                        }
-                    }
                     // -T: set the new (currently active) pane's title.
                     if let Some(t) = title {
                         let win = &mut app.windows[app.active_idx];
@@ -3504,9 +3479,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             &app.windows[app.active_idx].root,
                             &app.windows[app.active_idx].active_path,
                         );
-                        let mut revert_path = prev_path;
-                        revert_path.push(0);
-                        app.windows[app.active_idx].active_path = revert_path;
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = prev_pane_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
+                            win.active_path = p;
+                        }
                         // Detached splits: remove from MRU (#70 pane_index tie-break)
                         if let Some(nid) = new_pane_id {
                             let win = &mut app.windows[app.active_idx];

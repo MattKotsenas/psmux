@@ -42,6 +42,7 @@ pub fn handle_pane_forward_extract(
         }
     }
     // Extract the pane node from the tree
+    tree::normalize_window_sizes(&mut app.windows[win_idx]);
     let src_root = std::mem::replace(
         &mut app.windows[win_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] },
