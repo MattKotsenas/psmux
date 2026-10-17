@@ -255,6 +255,13 @@ try {
 finally {
     & $PSMUX -L $NS kill-server 2>&1 | Out-Null
     $env:PSMUX_DATA_DIR = $savedDataDir
+    # The recorder logs, scripts and the private data dir all live under $root
+    # (%TEMP%\psmux_i845_<pid>); remove it so runs leave nothing behind. The
+    # node children die with the server, so a short retry covers a late unlock.
+    for ($i = 0; $i -lt 10 -and (Test-Path $root); $i++) {
+        Start-Sleep -Milliseconds 300
+        Remove-Item -Recurse -Force $root -EA SilentlyContinue
+    }
 }
 
 Write-Host ""
