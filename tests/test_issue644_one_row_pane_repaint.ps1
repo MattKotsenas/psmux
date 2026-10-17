@@ -222,7 +222,7 @@ Start-Sleep -Milliseconds 500
 $cases = @(
     @{ L = 9999; Rows = 1 },
     @{ L = 27;   Rows = 2 },
-    @{ L = 26;   Rows = 4 }
+    @{ L = 26;   Rows = 3 }   # tmux 3.4 on 120x30: 30 - 26 - 1 border = 3
 )
 $counts = @{}
 foreach ($c in $cases) {
