@@ -6528,6 +6528,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // #559: a spec that resolves to no window is an error the
                     // caller must see (tmux: "can't find window: N", exit 1).
                     let resolved = (|| -> Result<(usize, usize), String> {
+                        // A window of another session lives in another server.
+                        // The resolver drops the session part, so `xa:0` named
+                        // THIS session's window 0: the swap either exited 0 doing
+                        // nothing or swapped two windows of the wrong session.
+                        // Refuse it the way move-window does (#602 follow up).
+                        for spec in [src.as_deref(), Some(dst.as_str())].into_iter().flatten() {
+                            if let Some(s) = crate::commands::foreign_session_in_spec(&app, spec) {
+                                return Err(crate::commands::cross_session_refusal("swap-window", &s));
+                            }
+                        }
                         let spos = match src.as_deref() {
                             Some(s) => app.resolve_window_spec(s, false)?.pos()
                                 .ok_or_else(|| format!("can't find window: {}", s))?,
@@ -6539,7 +6549,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     })();
                     match resolved {
                         Err(msg) => {
-                            app.status_message = Some((format!("swap-window: {}", msg), Instant::now(), None));
+                            let shown = if msg.starts_with("swap-window:") { msg.clone() } else { format!("swap-window: {}", msg) };
+                            app.status_message = Some((shown, Instant::now(), None));
                             state_dirty = true;
                             let _ = resp.send(Err(msg));
                         }

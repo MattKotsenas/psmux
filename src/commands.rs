@@ -605,7 +605,7 @@ pub(crate) fn cross_session_refusal(cmd: &str, session: &str) -> String {
     let why = match cmd {
         "swap-pane" => "each session runs in its own psmux server; use join-pane to move a pane between sessions",
         "link-window" => "a window cannot be shared by two psmux servers",
-        "move-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
+        "move-window" | "swap-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
         _ => "each session runs in its own psmux server",
     };
     format!("{}: source is in session {} (cross-session {} is not supported: {})", cmd, session, cmd, why)
