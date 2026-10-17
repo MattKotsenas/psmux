@@ -1097,7 +1097,8 @@ pub(crate) fn select_window_requests(
         return (vec![CtrlReq::PrevWindow], None);
     }
     if args.iter().any(|a| *a == "-l") {
-        return (vec![CtrlReq::LastWindow], None);
+        let (s, r) = mpsc::channel();
+        return (vec![CtrlReq::LastWindow { resp: Some(s) }], Some(r));
     }
     // Issue #693 item 4: everything the `-t` can name goes through the ONE
     // resolver move-window and swap-window have used since #602, which is
@@ -4173,7 +4174,16 @@ match cmd {
         }
         if !persistent && pending_chain.is_empty() { break; }
     }
-    "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
+    "last-window" | "last" => {
+        let (resp_s, resp_r) = mpsc::channel();
+        let _ = tx.send(CtrlReq::LastWindow { resp: Some(resp_s) });
+        if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
+        }
+    }
     "last-pane" | "lastp" if last_pane_input_toggle(&args).is_some() => {
         // last-pane -d / -e: select-pane -l -d / -e, the -t naming the
         // window whose last pane it is; nothing is selected.
@@ -7662,8 +7672,12 @@ fn dispatch_control_command(
             true
         }
         "last-window" | "last" => {
-            let _ = tx.send(CtrlReq::LastWindow);
-            let _ = resp_tx.send(String::new());
+            let (resp_s, resp_r) = mpsc::channel();
+            let _ = tx.send(CtrlReq::LastWindow { resp: Some(resp_s) });
+            match resp_r.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
             true
         }
         "last-pane" | "lastp" if last_pane_input_toggle(args).is_some() => {

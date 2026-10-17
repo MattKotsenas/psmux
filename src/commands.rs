@@ -2180,12 +2180,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "last-window" | "last" => {
-            if app.last_window_idx < app.windows.len() {
+            if let Some(last) = app.last_window_pos() {
                 switch_with_copy_save(app, |app| {
                     let tmp = app.active_idx;
-                    app.active_idx = app.last_window_idx;
+                    app.active_idx = last;
                     app.last_window_idx = tmp;
                 });
+            } else {
+                app.status_message = Some(("no last window".to_string(), std::time::Instant::now(), None));
             }
         }
         "select-window" | "selectw" => {

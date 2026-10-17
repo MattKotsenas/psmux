@@ -24,6 +24,10 @@ pub const GIT_DIRTY: &str = env!("PSMUX_GIT_DIRTY");
 /// holds an ambiguous Escape (`ssh_input::escape_wait_ms`).
 pub const DEFAULT_ESCAPE_TIME_MS: u64 = 10;
 
+/// `AppState::last_window_idx` when the session has no last window (a fresh
+/// session, or after the last window was killed).
+pub const NO_LAST_WINDOW: usize = usize::MAX;
+
 /// Human-readable build provenance line, e.g.
 ///
 ///   `psmux 3.3.7 (a1b2c3d 2026-07-20)`
@@ -1791,7 +1795,10 @@ pub struct AppState {
     pub wait_channels: std::collections::HashMap<String, WaitChannel>,
     /// Pipe pane processes
     pub pipe_panes: Vec<PipePaneState>,
-    /// Last active window index (for last-window command)
+    /// Vec position of the last window (last-window, `!`, the `-` flag).
+    /// [`NO_LAST_WINDOW`] until a window has been left: a fresh session has
+    /// none, and tmux reports none (#601 follow up). Read it through
+    /// [`AppState::last_window_pos`], which also refuses the current window.
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
@@ -2860,8 +2867,7 @@ impl AppState {
         }
         match body {
             "!" => {
-                let p = self.last_window_idx;
-                if p < self.windows.len() { Ok(WindowTarget::Pos(p)) } else { Err(missing()) }
+                match self.last_window_pos() { Some(p) => Ok(WindowTarget::Pos(p)), None => Err(missing()) }
             }
             "^" => Ok(WindowTarget::Pos(0)),
             "$" => Ok(WindowTarget::Pos(last_pos)),
@@ -3020,9 +3026,31 @@ impl AppState {
         }
     }
 
+    /// The last window's Vec position, or None when the session has none.
+    ///
+    /// tmux keeps the current window off the session's last-window stack
+    /// (session.c:508-509 removes it before pushing the old current), so
+    /// `#{window_last_flag}` (format.c:3120) is never 1 on the current window
+    /// and `last-window` there is `no last window` (cmd-select-window.c:118).
+    /// `last_window_idx` is a single Vec slot, so it can equal the current
+    /// window (a kill that hands focus to it, for one); that reads as none.
+    pub fn last_window_pos(&self) -> Option<usize> {
+        let p = self.last_window_idx;
+        let current = self.temp_focus_saved_active.unwrap_or(self.active_idx);
+        (p < self.windows.len() && p != current).then_some(p)
+    }
+
     /// Call right after `windows.remove(pos)`. Drops the parallel index and,
     /// when `renumber-windows` is on, renumbers the survivors contiguously.
+    /// The last window slot follows its window down, or is cleared when the
+    /// removed window WAS the last window (tmux winlink_stack_remove in
+    /// session_detach), instead of naming whatever slid into the slot.
     pub fn on_window_removed(&mut self, pos: usize) {
+        if self.last_window_idx == pos {
+            self.last_window_idx = NO_LAST_WINDOW;
+        } else if self.last_window_idx != NO_LAST_WINDOW && self.last_window_idx > pos {
+            self.last_window_idx -= 1;
+        }
         if self.window_indices.len() == self.windows.len() + 1 && pos < self.window_indices.len() {
             self.window_indices.remove(pos);
             if self.renumber_windows {
@@ -3144,7 +3172,7 @@ impl AppState {
             hooks: std::collections::HashMap::new(),
             wait_channels: std::collections::HashMap::new(),
             pipe_panes: Vec::new(),
-            last_window_idx: 0,
+            last_window_idx: NO_LAST_WINDOW,
             last_pane_path: Vec::new(),
             history_limit: 2000,
             display_time_ms: 750,
@@ -3802,7 +3830,12 @@ pub enum CtrlReq {
     DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms, -c client, -l/-N
     /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
     DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, pane_id, set_status_bar, duration_override_ms, -c client, -l/-N
-    LastWindow,
+    /// `last-window` / `select-window -l`.  With no last window tmux fails
+    /// with `no last window` at exit 1 (cmd-select-window.c:118-120); the
+    /// reply carries that to a CLI or control caller (None: nobody waits).
+    LastWindow {
+        resp: Option<mpsc::Sender<Result<(), String>>>,
+    },
     /// `last-pane` / `select-pane -l`.
     ///
     /// tmux's cmd-select-pane.c:166-177 takes the window's last pane, falls

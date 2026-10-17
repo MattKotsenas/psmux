@@ -221,7 +221,7 @@ pub fn window_raw_flags(app: &AppState, win_idx: usize) -> String {
     let mut f = String::new();
     let Some(win) = app.windows.get(win_idx) else { return f };
     if win_idx == real_active_idx(app) { f.push('*'); }
-    else if win_idx == app.last_window_idx { f.push('-'); }
+    else if app.last_window_pos() == Some(win_idx) { f.push('-'); }
     if win.zoom_saved.is_some() { f.push('Z'); }
     if win.activity_flag { f.push('#'); }
     if win.bell_flag { f.push('!'); }
@@ -336,7 +336,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 b'F' => {
                     if no_session {}
                     else if win_idx == real_active_idx(app) { result.push('*'); }
-                    else if win_idx == app.last_window_idx { result.push('-'); }
+                    else if app.last_window_pos() == Some(win_idx) { result.push('-'); }
                     i += 2; continue;
                 }
                 b'H' | b'h' => {
@@ -1666,7 +1666,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_linked" => if win.linked_from.is_some() { "1".into() } else { "0".into() },
         "window_linked_sessions" => if win.linked_from.is_some() { "1".into() } else { "0".into() },
         "window_linked_sessions_list" => String::new(),
-        "window_last_flag" => if win_idx == app.last_window_idx { "1".into() } else { "0".into() },
+        "window_last_flag" => if app.last_window_pos() == Some(win_idx) { "1".into() } else { "0".into() },
         "window_start_flag" => if win_idx == 0 { "1".into() } else { "0".into() },
         "window_end_flag" => if win_idx == app.windows.len().saturating_sub(1) { "1".into() } else { "0".into() },
         "window_bigger" => {

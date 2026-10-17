@@ -489,10 +489,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 // --- last window (l) ---
                 KeyCode::Char('l') => {
-                    if app.last_window_idx < app.windows.len() {
+                    if let Some(last) = app.last_window_pos() {
                         switch_with_copy_save(app, |app| {
                             let tmp = app.active_idx;
-                            app.active_idx = app.last_window_idx;
+                            app.active_idx = last;
                             app.last_window_idx = tmp;
                         });
                     }

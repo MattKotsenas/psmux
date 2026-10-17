@@ -4282,7 +4282,13 @@ fn run_main() -> io::Result<()> {
             }
             // last-window - Select last used window
             "last-window" | "last" => {
-                send_control("last-window\n".to_string())?;
+                // tmux: `no last window` at exit 1 (cmd-select-window.c:118).
+                // Fire and forget here exited 0 with nothing to go back to.
+                let resp = send_control_with_response("last-window\n".to_string())?;
+                if resp.trim_start().starts_with("ERROR") {
+                    eprintln!("psmux: {}", resp.trim_start().trim_start_matches("ERROR:").trim());
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             // last-pane - Select last used pane

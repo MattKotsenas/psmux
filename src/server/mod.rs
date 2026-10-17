@@ -3244,7 +3244,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::FocusWindowByName(_) => "FocusWindowByName",
                         CtrlReq::ValidateTarget { .. } => "ValidateTarget",
                         CtrlReq::FocusWindowCmd(_) => "FocusWindowCmd",
-                        CtrlReq::LastWindow => "LastWindow",
+                        CtrlReq::LastWindow { .. } => "LastWindow",
                         CtrlReq::MouseDown(..) => "MouseDown",
                         CtrlReq::MouseDownRight(..) => "MouseDownRight",
                         CtrlReq::MouseDownMiddle(..) => "MouseDownMiddle",
@@ -5838,16 +5838,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let _ = resp.send(result);
                 }
-                CtrlReq::LastWindow => {
-                    if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
-                        switch_with_copy_save(&mut app, |app| {
-                            let tmp = app.active_idx;
-                            app.active_idx = app.last_window_idx;
-                            app.last_window_idx = tmp;
-                        });
+                CtrlReq::LastWindow { resp } => {
+                    match app.last_window_pos() {
+                        Some(last) => {
+                            switch_with_copy_save(&mut app, |app| {
+                                let tmp = app.active_idx;
+                                app.active_idx = last;
+                                app.last_window_idx = tmp;
+                            });
+                            meta_dirty = true;
+                            hook_event = Some("after-select-window");
+                            if let Some(r) = resp { let _ = r.send(Ok(())); }
+                        }
+                        // cmd-select-window.c:118-120.  psmux exited 0 in
+                        // silence here, with no window to go back to.
+                        None => {
+                            if let Some(r) = resp { let _ = r.send(Err("no last window".to_string())); }
+                        }
                     }
-                    meta_dirty = true;
-                    hook_event = Some("after-select-window");
                 }
                 CtrlReq::LastPane { resp } => {
                     match last_pane_path(&app) {
