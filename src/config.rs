@@ -3194,14 +3194,18 @@ pub(crate) fn source_spec_from_args<S: AsRef<str>>(args: &[S]) -> SourceSpec {
 ///
 /// One exception keeps configs that already work working. Before paths were
 /// split, the rest of the line was the one path, so `source-file C:\Users\Ann
-/// Lee\x.conf` read that file. When the paths are unquoted and the rest of the
-/// line, taken whole, names a file that exists, it is still that one path.
+/// Lee\x.conf` read that file. When the rest of the line, taken whole, names a
+/// file that exists, it is still that one path. That also covers an apostrophe
+/// in an unquoted path (`C:\Users\O'Brien\x.conf`), which the split reads as
+/// the start of a quote and drops.
 pub(crate) fn parse_source_spec(spec: &str) -> SourceSpec {
     let words = crate::commands::parse_command_line(spec);
     let mut out = source_spec_from_args(&words);
-    if out.paths.len() > 1 && !out.format {
-        if let Some(rest) = unquoted_path_rest(spec) {
-            if std::path::Path::new(&expand_source_path(&rest)).is_file() {
+    if !out.format && !out.paths.is_empty() {
+        if let Some(rest) = whole_path_rest(spec) {
+            if out.paths != [rest.as_str()]
+                && std::path::Path::new(&expand_source_path(&rest)).is_file()
+            {
                 out.paths = vec![rest];
             }
         }
@@ -3209,9 +3213,9 @@ pub(crate) fn parse_source_spec(spec: &str) -> SourceSpec {
     out
 }
 
-/// The text after the flags of a `source-file` spec, as one string, when it
-/// holds no quotes: what the whole line named before paths were split.
-fn unquoted_path_rest(spec: &str) -> Option<String> {
+/// The text after the flags of a `source-file` spec, as one string, verbatim:
+/// what the whole line named before paths were split.
+fn whole_path_rest(spec: &str) -> Option<String> {
     let mut rest = spec.trim();
     let mut skip_value = false;
     loop {
@@ -3236,7 +3240,7 @@ fn unquoted_path_rest(spec: &str) -> Option<String> {
         rest = rest[end..].trim_start();
     }
     let rest = rest.trim();
-    if rest.is_empty() || rest.contains('"') || rest.contains('\'') {
+    if rest.is_empty() {
         return None;
     }
     Some(rest.to_string())

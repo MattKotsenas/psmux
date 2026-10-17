@@ -122,6 +122,26 @@ fn an_unquoted_path_with_spaces_that_exists_is_still_one_path() {
 }
 
 #[test]
+fn an_unquoted_path_with_an_apostrophe_that_exists_is_still_one_path() {
+    // `C:\Users\O'Brien\x.conf` on a config line read that file before paths
+    // were split. The split takes the apostrophe for a quote and drops it, so
+    // the line named `C:\Users\OBrien\x.conf`, which does not exist.
+    let d = TempDir::new("apostrophe");
+    let p = d.file("O'Brien/o.conf", "set -g @ob on\n");
+    assert_eq!(parse_source_spec(&p).paths, [p.clone()]);
+    assert_eq!(parse_source_spec(&format!("-q {}", p)).paths, [p.clone()]);
+    let outer = d.file("outer.conf", &format!("source-file {}\n", p));
+    let mut app = app();
+    source_file(&mut app, &outer);
+    assert_eq!(opt(&app, "@ob").as_deref(), Some("on"));
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    // Quoted, it is read the usual way.
+    assert_eq!(parse_source_spec(&q(&p)).paths, [p.clone()]);
+    // A plain path is not looked up on disk to be kept as it is.
+    assert_eq!(parse_source_spec("a.conf").paths, ["a.conf"]);
+}
+
+#[test]
 fn unquoted_words_that_name_no_one_file_are_separate_paths() {
     let d = TempDir::new("split");
     let a = d.file("a.conf", "");
