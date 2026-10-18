@@ -131,6 +131,8 @@ pub(crate) fn run_source_job(
 /// server loop gets SourceJobDone, which reports the warnings and answers the
 /// client that ran `source-file` (if it waits). If the loop is gone, the
 /// waiter is dropped with the message, which unblocks that client too.
+/// Returns whether the thread started, so the loop counts only a job that
+/// will report.
 pub(crate) fn spawn_source_job(
     port: u16,
     key: String,
@@ -139,15 +141,17 @@ pub(crate) fn spawn_source_job(
     warnings: Vec<String>,
     errors: Vec<String>,
     waiter: Option<mpsc::Sender<SourceOutcome>>,
-) {
+) -> bool {
     let done_tx = tx.clone();
-    let _ = std::thread::Builder::new()
+    let new_from = warnings.len();
+    std::thread::Builder::new()
         .name("source-job".into())
         .spawn(move || {
             let mut io = ServerIo { port, key, tx };
             let (warnings, outcome) = run_source_job(&mut io, lines, warnings, errors);
-            let _ = done_tx.send(CtrlReq::SourceJobDone { warnings, outcome, waiter });
-        });
+            let _ = done_tx.send(CtrlReq::SourceJobDone { warnings, new_from, outcome, waiter });
+        })
+        .is_ok()
 }
 
 #[cfg(test)]

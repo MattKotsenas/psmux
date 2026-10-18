@@ -6468,15 +6468,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     match (parsed.lines.is_empty(), app.control_port, app.control_tx.clone()) {
                         (false, Some(port), Some(job_tx)) => {
                             // The job answers `done` once the last line ran.
-                            source_job::spawn_source_job(
+                            // It starts from this source's own warnings, not
+                            // the whole list, which may hold another job's.
+                            if source_job::spawn_source_job(
                                 port,
                                 app.session_key.clone(),
                                 job_tx,
                                 parsed.lines,
-                                app.config_warnings.clone(),
+                                parsed.errors.clone(),
                                 parsed.errors,
                                 done,
-                            );
+                            ) {
+                                app.source_jobs_running += 1;
+                            }
                         }
                         _ => {
                             // Nothing to run, or a file that sources itself,
@@ -6502,12 +6506,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     meta_dirty = true;
                     let _ = resp.send(result);
                 }
-                CtrlReq::SourceJobDone { warnings, outcome, waiter } => {
+                CtrlReq::SourceJobDone { warnings, new_from, outcome, waiter } => {
                     // The source's warnings, the parse's and the commands',
-                    // are reported now that the whole file has run.
-                    app.config_warnings = warnings;
+                    // are reported now that the whole file has run. The
+                    // commands' join the list, where the parse's already are:
+                    // replacing it dropped those of a source that had
+                    // finished while this one ran, from config-warnings.log
+                    // and the status line (#853).
+                    crate::config::finish_source_job_warnings(&mut app, &warnings, new_from);
                     write_config_warnings_log(&app.config_warnings);
-                    crate::config::summarize_config_warnings(&mut app);
                     state_dirty = true;
                     meta_dirty = true;
                     if let Some(waiter) = waiter {

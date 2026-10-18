@@ -1984,6 +1984,11 @@ pub struct AppState {
     /// args) collected during a config load or source-file, surfaced to the
     /// user instead of being silently ignored (issue #370 follow-up).
     pub config_warnings: Vec<String>,
+    /// Source jobs (issue #842) that have not reported yet. While one runs, a
+    /// new source adds its warnings to `config_warnings` instead of starting
+    /// the list over, and a job that finishes adds its own, so two sources
+    /// that overlap both stay in the list and in config-warnings.log.
+    pub source_jobs_running: usize,
     /// 1-based line number currently being parsed, used to prefix warnings as
     /// `file:line: message` (file comes from config::current_config_file()).
     /// None when parsing a single runtime command.
@@ -3271,6 +3276,7 @@ impl AppState {
             codepoint_widths: Vec::new(),
             terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
+            source_jobs_running: 0,
             config_warn_line: None,
             source_defer: None,
             set_clipboard: "external".to_string(),
@@ -4088,7 +4094,11 @@ pub enum CtrlReq {
     /// A source job has run its last line: its warnings, and the answer for
     /// the client that ran `source-file`, if that client waits.
     SourceJobDone {
+        /// Every warning of the source: the parse's, then the job's own.
         warnings: Vec<String>,
+        /// Where the job's own warnings start in `warnings`. The parse's are
+        /// in `config_warnings` already.
+        new_from: usize,
         outcome: SourceOutcome,
         waiter: Option<mpsc::Sender<SourceOutcome>>,
     },

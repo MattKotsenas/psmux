@@ -3476,8 +3476,9 @@ pub fn source_file(app: &mut AppState, spec: &str) {
         && !in_startup_load()
         && app.source_defer.is_none();
     if outermost_runtime {
-        app.config_warnings.clear();
+        begin_source_warnings(app);
     }
+    let first_warning = app.config_warnings.len();
 
     for path in &spec.paths {
         // tmux expands the format first and then globs the result
@@ -3491,7 +3492,29 @@ pub fn source_file(app: &mut AppState, spec: &str) {
     }
 
     if outermost_runtime {
-        summarize_config_warnings(app);
+        let own = app.config_warnings.get(first_warning..).map(<[String]>::to_vec).unwrap_or_default();
+        summarize_warnings(app, &own);
+    }
+}
+
+/// A source job has reported: `warnings` are all of its source's, the
+/// parse's first, and the job's own start at `new_from`. The parse's are in
+/// `config_warnings` already, so only the job's own are added, after those of
+/// any source that finished meanwhile, and the status line shows this
+/// source's. Replacing the list instead lost a source that finished while the
+/// job ran.
+pub(crate) fn finish_source_job_warnings(app: &mut AppState, warnings: &[String], new_from: usize) {
+    app.source_jobs_running = app.source_jobs_running.saturating_sub(1);
+    app.config_warnings.extend(warnings.iter().skip(new_from).cloned());
+    summarize_warnings(app, warnings);
+}
+
+/// Start the warning list of a runtime source. It starts over only when no
+/// source job is running: a job's warnings stay in the list until it has
+/// reported them, so a source that runs meanwhile adds its own after them.
+fn begin_source_warnings(app: &mut AppState) {
+    if app.source_jobs_running == 0 {
+        app.config_warnings.clear();
     }
 }
 
@@ -3581,14 +3604,21 @@ fn source_path(app: &mut AppState, path: &str, quiet: bool) {
 
 /// Show the warning batch of a runtime source in the status line.
 pub(crate) fn summarize_config_warnings(app: &mut AppState) {
-    if app.config_warnings.is_empty() {
+    let warnings = app.config_warnings.clone();
+    summarize_warnings(app, &warnings);
+}
+
+/// The status line message for one source's `warnings`, which may be fewer
+/// than `config_warnings` holds while another source job runs.
+pub(crate) fn summarize_warnings(app: &mut AppState, warnings: &[String]) {
+    if warnings.is_empty() {
         return;
     }
-    let n = app.config_warnings.len();
+    let n = warnings.len();
     let summary = if n == 1 {
-        format!("config warning: {}", app.config_warnings[0])
+        format!("config warning: {}", warnings[0])
     } else {
-        format!("{} config warnings (first: {})", n, app.config_warnings[0])
+        format!("{} config warnings (first: {})", n, warnings[0])
     };
     // Hold the message for 5s (vs the 750ms default) so a config problem is
     // actually noticed rather than flashing past.
@@ -3611,9 +3641,10 @@ pub(crate) fn summarize_config_warnings(app: &mut AppState) {
 /// and the error is the result.
 pub fn source_runtime(app: &mut AppState, spec: &str) -> crate::types::SourceParse {
     if let Some(msg) = find_source_cycle(spec) {
-        app.config_warnings = vec![msg.clone()];
+        begin_source_warnings(app);
+        app.config_warnings.push(msg.clone());
         app.config_warn_line = None;
-        summarize_config_warnings(app);
+        summarize_warnings(app, std::slice::from_ref(&msg));
         return crate::types::SourceParse { lines: Vec::new(), errors: vec![msg] };
     }
     // Every warning of a runtime source is an error for the client that ran
@@ -3623,15 +3654,19 @@ pub fn source_runtime(app: &mut AppState, spec: &str) -> crate::types::SourcePar
         source_file(app, spec);
         return crate::types::SourceParse::default();
     }
-    app.config_warnings.clear();
+    begin_source_warnings(app);
+    let first_warning = app.config_warnings.len();
     app.config_warn_line = None;
     let outer = app.source_defer.replace(crate::types::SourceDefer::default());
     source_file(app, spec);
     let kept = std::mem::replace(&mut app.source_defer, outer).unwrap_or_default();
+    // This source's warnings only: the list may also hold those of a source
+    // job that is still running, which are that job's client's errors.
+    let own = app.config_warnings.get(first_warning..).map(<[String]>::to_vec).unwrap_or_default();
     if kept.lines.is_empty() {
-        summarize_config_warnings(app);
+        summarize_warnings(app, &own);
     }
-    crate::types::SourceParse { lines: kept.lines, errors: app.config_warnings.clone() }
+    crate::types::SourceParse { lines: kept.lines, errors: own }
 }
 
 /// Parse one config line a source job kept, now that the commands before it
@@ -4299,6 +4334,10 @@ mod test_issue851_run_shell_wait;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue849_config_line_semicolon.rs"]
 mod test_issue849_config_line_semicolon;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue853_source_warnings_overlap.rs"]
+mod test_issue853_source_warnings_overlap;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue198_unbind_individual.rs"]
