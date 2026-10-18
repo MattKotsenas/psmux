@@ -4108,6 +4108,40 @@ fn parse_tmux_entry_script(app: &mut AppState, path: &std::path::Path) {
 }
 
 /// Execute an if-shell / if command from config.
+/// The text of a double quoted if-shell branch with `\\` read as `\` and
+/// `\"` as `"`, as tmux's lexer reads them inside double quotes
+/// (cmd-parse.y yylex_token_escape). Every other backslash is kept as it is,
+/// so a `\;` written in the branch still holds a binding's list of commands,
+/// as psmux has always read it, and a path such as `C:\Users` is left alone.
+pub(crate) fn unescape_double_quoted_branch(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                if n == '\\' || n == '"' {
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether `part`, a word inside an if-shell argument quoted with `quote`,
+/// ends that argument: it ends with the quote, and in double quotes that quote
+/// is not escaped (`\"`, after an even run of backslashes it is a real quote).
+fn closes_quote(part: &str, quote: char) -> bool {
+    let Some(body) = part.strip_suffix(quote) else { return false };
+    if quote != '"' {
+        return true;
+    }
+    body.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
+}
+
 /// Syntax: if-shell [-bF] <condition> <true-cmd> [<false-cmd>]
 /// Runs the condition command (or evaluates format with -F), then executes the
 /// appropriate branch command as a config line.
@@ -4118,6 +4152,9 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
     let mut format_mode = false;
     let mut _background = false;
     let mut positional: Vec<String> = Vec::new();
+    // Which positionals were written in double quotes, where tmux's lexer
+    // reads `\\` and `\"` as escapes (cmd-parse.y yylex_token_escape).
+    let mut double_quoted: Vec<bool> = Vec::new();
     let mut i = 1;
     while i < parts.len() {
         match parts[i] {
@@ -4126,10 +4163,11 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
             "-bF" | "-Fb" => { _background = true; format_mode = true; }
             "-t" => { i += 1; } // skip target
             s => {
+                double_quoted.push(s.starts_with('"'));
                 // Handle quoted strings that might span multiple parts
                 if s.starts_with('"') || s.starts_with('\'') {
                     let quote = s.chars().next().unwrap();
-                    if s.ends_with(quote) && s.len() > 1 {
+                    if closes_quote(&s[1..], quote) {
                         positional.push(s[1..s.len()-1].to_string());
                     } else {
                         let mut buf = s[1..].to_string();
@@ -4137,7 +4175,7 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
                         while i < parts.len() {
                             buf.push(' ');
                             buf.push_str(parts[i]);
-                            if parts[i].ends_with(quote) {
+                            if closes_quote(parts[i], quote) {
                                 buf.truncate(buf.len() - 1);
                                 break;
                             }
@@ -4188,8 +4226,19 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
         c.status().map(|s| s.success()).unwrap_or(false)
     };
 
-    let cmd_to_run = if success { Some(true_cmd) } else { false_cmd };
-    if let Some(cmd) = cmd_to_run {
+    let cmd_to_run = if success { Some((true_cmd, 1)) } else { false_cmd.map(|c| (c, 2)) };
+    if let Some((cmd, idx)) = cmd_to_run {
+        // A branch in double quotes holds its inner quotes and backslashes
+        // escaped: tmux reads `"set -g @a \"x;y\""` as `set -g @a "x;y"` and
+        // `"bind x a \\; b"` as `bind x a \; b`. Undo those two escapes so the
+        // split below sees the quotes and the `\;` the branch really has.
+        let unescaped;
+        let cmd: &str = if double_quoted.get(idx) == Some(&true) {
+            unescaped = unescape_double_quoted_branch(cmd);
+            &unescaped
+        } else {
+            cmd
+        };
         // Execute the branch as a config line (recursive — supports set, bind, source, etc.)
         // tmux parses the branch as a command string, so each command on it
         // runs (`if-shell true "set -g @a on ; set -g @b on"` sets both).

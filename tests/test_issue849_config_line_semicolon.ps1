@@ -135,6 +135,17 @@ try {
     $o = Opts @('@a1', '@a2')
     Check ($o -eq '@a1=on @a2=on') "a block runs both (tmux)" "options read [$o]"
 
+    Write-Head "H2. a double quoted branch with escaped quotes and backslashes"
+    Reset-Session
+    Source @('if-shell true "set -g @a1 \"x;y\" ; set -g @a2 on"') | Out-Null
+    $o = Opts @('@a1', '@a2')
+    Check ($o -eq '@a1=x;y @a2=on') "an escaped quote keeps its ; in the value (tmux)" "options read [$o]"
+    Reset-Session
+    Source @('if-shell true "bind x set -g @a1 on \\; set -g @a2 on"') | Out-Null
+    $kx = Key 'prefix' 'x'
+    Check ($kx -match 'set -g @a1 on \\; set -g @a2 on$') "a doubled backslash holds the binding's list (tmux)" "binding [$kx]"
+    Check (Unset @('@a1', '@a2')) "nothing ran (tmux)" "options read [$(Opts @('@a1', '@a2'))]"
+
     # ── commands ──
     Write-Head "I. options around a command on one line"
     Reset-Session

@@ -243,3 +243,45 @@ fn a_cycle_after_a_semicolon_is_found_before_anything_runs() {
     std::fs::write(&f.0, format!("set -g @a1 on ; source-file {}\n", crate::util::quote_arg(&f.path()))).unwrap();
     assert!(find_source_cycle(&f.path()).is_some());
 }
+
+// ── a double quoted if-shell branch ─────────────────────────────────────────
+//
+// Inside double quotes tmux's lexer reads `\"` as `"` and a doubled
+// backslash as one (cmd-parse.y yylex_token_escape), so the branch it parses
+// as a command string holds plain quotes and a `\;`. psmux kept the escapes
+// in the branch, and the split then read `\"` as an escaped character, not a
+// quote, and cut the branch inside its quoted value.
+
+#[test]
+fn an_escaped_quote_in_a_double_quoted_branch_still_quotes_its_semicolon() {
+    let mut app = app();
+    parse_config_content(&mut app, concat!(r#"if-shell true "set -g @a1 \"x;y\" ; set -g @a2 on""#, "\n"));
+    assert_eq!(opt(&app, "@a1").as_deref(), Some("x;y"));
+    assert_eq!(opt(&app, "@a2").as_deref(), Some("on"));
+    let mut other = AppState::new("semi".to_string());
+    parse_config_content(&mut other, concat!(r#"if-shell false "x" "set -g @a1 \"p;q\"""#, "\n"));
+    assert_eq!(opt(&other, "@a1").as_deref(), Some("p;q"), "the false branch too");
+}
+
+#[test]
+fn a_doubled_backslash_in_a_double_quoted_branch_is_an_escaped_semicolon() {
+    // tmux: the branch is `bind x set -g @a1 on \; set -g @a2 on`, a binding
+    // of both commands, and nothing runs at once.
+    let mut app = app();
+    parse_config_content(&mut app, concat!(r#"if-shell true "bind x set -g @a1 on \\; set -g @a2 on""#, "\n"));
+    assert_eq!(bound(&app, "prefix", "x").as_deref(), Some(r"set -g @a1 on \; set -g @a2 on"));
+    assert_eq!(opt(&app, "@a2"), None);
+}
+
+#[test]
+fn other_backslashes_in_a_branch_are_left_alone() {
+    assert_eq!(unescape_double_quoted_branch(r#"set -g @a1 \"x\" \\; b"#), r#"set -g @a1 "x" \; b"#);
+    assert_eq!(unescape_double_quoted_branch(r"set -g @a1 C:\Users\me \; b"), r"set -g @a1 C:\Users\me \; b");
+    let mut app = app();
+    parse_config_content(
+        &mut app,
+        concat!(r#"if-shell true "bind x set -g @a1 on \; set -g @a2 on""#, "\n", r"if-shell true 'set -g @a3 C:\Users\me'", "\n"),
+    );
+    assert_eq!(bound(&app, "prefix", "x").as_deref(), Some(r"set -g @a1 on \; set -g @a2 on"), "a single backslash still holds the list");
+    assert_eq!(opt(&app, "@a3").as_deref(), Some(r"C:\Users\me"), "single quotes keep every backslash");
+}
