@@ -25,7 +25,7 @@ Start-Sleep -Seconds 2
 
 # Step 2: Clear debug log
 Write-Host "[STEP 2] Clearing debug log..." -ForegroundColor Yellow
-ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
+ssh $SshHost 'cmd /c "echo. > %USERPROFILE%\.psmux\ssh_input.log"' 2>$null
 Start-Sleep -Milliseconds 500
 
 # Step 3: Start detached session
@@ -108,7 +108,7 @@ Write-Host "--- END ---" -ForegroundColor Cyan
 
 # Step 10: Read debug log
 Write-Host "[STEP 10] Reading SSH debug log..." -ForegroundColor Yellow
-$debugLog = ssh $SshHost "type %USERPROFILE%\.psmux\ssh_input.log"
+$debugLog = ssh $SshHost 'cmd /c "type %USERPROFILE%\.psmux\ssh_input.log"'
 Write-Host "--- DEBUG LOG (last 30 lines) ---" -ForegroundColor DarkGray
 $debugLog | Select-Object -Last 30 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 Write-Host "--- END ---" -ForegroundColor DarkGray
