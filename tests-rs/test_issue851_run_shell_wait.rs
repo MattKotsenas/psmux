@@ -132,6 +132,22 @@ fn d_with_no_command_only_waits() {
 }
 
 #[test]
+fn a_delay_too_long_for_a_duration_is_the_longest_one_not_a_panic() {
+    // Duration::from_secs_f64 panics at 2^64 seconds and up. On the server
+    // thread (a sourced file's run-shell line) that ended the server.
+    for v in ["1e20", "18446744073709551616", "1e308"] {
+        let a = args(&["-d", v]).unwrap();
+        assert_eq!(a.delay, Some(Duration::MAX), "-d {}", v);
+    }
+    assert_eq!(args(&["-bd", "1e20", "echo"]).unwrap().delay, Some(Duration::MAX));
+    // The runtime source check reads the same flags and must not panic either.
+    assert!(run_shell_waits("run-shell -d 1e20"));
+    assert!(!run_shell_waits("run-shell -b -d 1e20 'echo hi'"));
+    // A negative delay is no delay, as before.
+    assert_eq!(args(&["-d", "-1", "echo"]).unwrap().delay, Some(Duration::ZERO));
+}
+
+#[test]
 fn a_flag_psmux_does_not_read_starts_the_shell_command() {
     assert_eq!(args(&["-C", "display", "x"]).unwrap().command, words(&["-C", "display", "x"]));
     // Not a cluster of ours either: -b is not taken from `-bC`.

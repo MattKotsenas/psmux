@@ -260,7 +260,15 @@ pub(crate) fn parse_run_shell_args<S: AsRef<str>>(args: &[S]) -> Result<RunShell
                 .ok()
                 .filter(|s: &f64| s.is_finite())
                 .ok_or_else(|| format!("invalid delay time: {}", v))?;
-            out.delay = Some(std::time::Duration::from_secs_f64(secs.max(0.0)));
+            // A delay too long for a Duration (2^64 seconds and up, say
+            // `1e20`) is the longest one there is. from_secs_f64 panics on
+            // it, and this runs on the server thread for a config line, so
+            // `run-shell -d 1e20` in a sourced file used to end the server.
+            // tmux casts it to time_t (cmd-run-shell.c:181) and waits.
+            out.delay = Some(
+                std::time::Duration::try_from_secs_f64(secs.max(0.0))
+                    .unwrap_or(std::time::Duration::MAX),
+            );
         }
         i += 1;
     }
