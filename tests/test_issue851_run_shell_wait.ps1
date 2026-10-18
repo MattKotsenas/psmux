@@ -143,6 +143,17 @@ try {
     Check (($r.Code -eq 0) -and ($r.Ms -lt 900)) "run-shell -bd 1 returns at once ($($r.Ms) ms) (tmux)" "exit $($r.Code) after $($r.Ms) ms, stderr [$($r.Err)]"
     Start-Sleep -Milliseconds 3500
     Check ((Opt '@y') -eq 'late') "and the command ran after the delay (tmux)" "@y reads [$(Opt '@y')]"
+
+    # ── A delay too long for a Duration ──
+    # Duration::from_secs_f64 panicked at 2^64 seconds and up, and a sourced
+    # file's run-shell is read on the server thread, so this ended the server.
+    Write-Head "I. a delay of 1e20 seconds does not end the server"
+    Reset-Session
+    $r = Source @('run-shell -bd 1e20 "Write-Output never"', 'set -g @after on')
+    Check ($r.Code -eq 0) "source-file exits 0 (tmux)" "exit $($r.Code), stderr [$($r.Err)]"
+    Check ((Opt '@after') -eq 'on') "the server is up and the next line ran (tmux)" "@after reads [$(Opt '@after')]"
+    $r = Run @("run-shell", "-bd", "1e20", "Write-Output never")
+    Check (($r.Code -eq 0) -and ($r.Err -notmatch 'panicked')) "the CLI -bd 1e20 returns at once without a panic (tmux)" "exit $($r.Code), stderr [$($r.Err)]"
 } finally {
     P kill-server | Out-Null
     Start-Sleep -Milliseconds 500
