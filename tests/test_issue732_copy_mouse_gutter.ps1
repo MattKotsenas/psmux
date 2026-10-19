@@ -43,6 +43,10 @@ for ($i = 0; $i -lt 40; $i++) {
 }
 if (-not $up) { Write-Host "FATAL: no session" -ForegroundColor Red; exit 1 }
 P set -g mouse on | Out-Null
+# vi keys keep the cell under the pointer in the copy, so C to F yanks CDEF.
+# Emacs keys leave that cell out, as tmux does; this suite is about the
+# gutter, test_copy_selection_parity covers the emacs end cell.
+P set -g mode-keys vi | Out-Null
 
 # One row of known content. The gutter width is derived from the history the
 # session actually has, below, rather than assumed.

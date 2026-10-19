@@ -127,15 +127,16 @@ foreach ($scroll in @(0, 3, 10)) {
 Write-Host "`n[Part C] character mode after scrolling" -ForegroundColor Yellow
 Start-Ns
 Send-X "scroll-up" 4
-Send-Key "v"
+# vi begins a selection with Space; v is rectangle-toggle there, in tmux too.
+Send-Key "Space"
 Send-Key "j"
 Send-Key "Enter"
 $got = Get-Buffer
 # From column 0 of LINE192 to column 0 of LINE193: the first line entire, then
 # one cell of the second.
 $want = "LINE192,L"
-if ($got -eq $want) { Write-Pass "v, j, Enter copied [$got]" }
-else { Write-Fail "v, j, Enter copied [$got], want [$want]" }
+if ($got -eq $want) { Write-Pass "Space, j, Enter copied [$got]" }
+else { Write-Fail "Space, j, Enter copied [$got], want [$want]" }
 Stop-Ns
 
 Write-Host "`n[Part D] a second copy-mode session starts clean" -ForegroundColor Yellow

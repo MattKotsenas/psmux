@@ -190,9 +190,19 @@ function Run-Scenario($label, $ns) {
         # drew a phantom `* my__ry...: (current)` row and prefix ) did nothing.
         $D = "m__$tag"; $Y = "ry$tag"
         Write-Head "two renames through a name with __, $XZ to $D to $Y"
-        P rename-session -t $XZ $D | Out-Null
-        Check (Wait-Status $D) "the status line reads [$D]" "the status line never read [$D]"
-        P rename-session -t $D $Y | Out-Null
+        if ($ns) {
+            P rename-session -t $XZ $D | Out-Null
+            Check (Wait-Status $D) "the status line reads [$D]" "the status line never read [$D]"
+            $from = $D
+        } else {
+            # #844: outside -L a name with __ reads as NAMESPACE__session, so
+            # the default namespace refuses it and the session keeps its name.
+            $out = (P rename-session -t $XZ $D | Out-String)
+            Check ($LASTEXITCODE -ne 0 -and $out -match '__') "rename to [$D] is refused outside -L" "rename to [$D] was not refused: [$($out.Trim())]"
+            Check (Wait-Status $XZ) "the status line still reads [$XZ]" "the status line lost [$XZ]"
+            $from = $XZ
+        }
+        P rename-session -t $from $Y | Out-Null
         Check (Wait-Status $Y) "the status line reads [$Y]" "the status line never read [$Y]"
         Check-SessionStar $Y
         Check-Buffers "prefix =" "^b{SLEEP:500}="
