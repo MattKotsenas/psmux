@@ -25,6 +25,10 @@ fn non_default_value(name: &str) -> Option<&'static str> {
         // program-status flips the process wide PROGRAM_STATUS_ENABLED switch
         // that every pane parser thread reads; test_program_status covers it.
         "priority" | "bold-is-bright" | "codepoint-widths" | "program-status" => return None,
+        // server-mode (#798) is fixed when a server starts: a running server
+        // only accepts the mode it runs in, so there is no other value to
+        // sweep. tests-rs/test_issue798_server_mode_switch.rs covers it.
+        "server-mode" => return None,
         "escape-time" => "123",
         "focus-events" => "on",
         "history-limit" => "4321",
