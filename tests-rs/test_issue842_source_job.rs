@@ -245,3 +245,41 @@ fn a_replayed_lines_warnings_are_errors_for_the_client() {
     assert_eq!(outcome.errors, vec!["f:3: unknown option: no-such-option".to_string()]);
     assert_eq!(warnings, outcome.errors);
 }
+
+/// A stand-in whose first command panics, as a bug in the job would.
+struct PanickingServer;
+
+impl SourceJobIo for PanickingServer {
+    fn run_command(&mut self, _line: &str) -> std::io::Result<String> {
+        panic!("a bug in the job");
+    }
+
+    fn replay(&mut self, _item: DeferredConfigLine) -> Option<SourceReplayResult> {
+        None
+    }
+}
+
+#[test]
+fn a_job_that_panics_still_reports_so_the_server_counts_it_done() {
+    // #853: the server loop counts source jobs until each reports. A job that
+    // panicked never sent SourceJobDone, so the count stayed up and the
+    // warning list never started over again.
+    let mut io = PanickingServer;
+    let lines = vec![line("f", 2, cmd("split-window"))];
+    let (warnings, outcome) =
+        run_source_job_reporting(&mut io, lines, vec!["f:1: parse".to_string()], vec!["f:1: parse".to_string()]);
+    assert_eq!(warnings[0], "f:1: parse", "the parse's warnings come back first: {:?}", warnings);
+    assert_eq!(warnings.len(), 2, "{:?}", warnings);
+    assert!(outcome.errors.last().unwrap().contains("stopped unexpectedly"), "{:?}", outcome.errors);
+}
+
+#[test]
+fn a_job_that_does_not_panic_reports_as_before() {
+    let lines = vec![line("f", 2, dir("set -g no-such-option 1"))];
+    let mut io = FakeServer::default();
+    let (w1, o1) = run_source_job_reporting(&mut io, lines.clone(), Vec::new(), Vec::new());
+    let mut io = FakeServer::default();
+    let (w2, o2) = run_source_job(&mut io, lines, Vec::new(), Vec::new());
+    assert_eq!(w1, w2);
+    assert_eq!(o1.errors, o2.errors);
+}

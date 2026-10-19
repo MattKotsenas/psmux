@@ -148,10 +148,35 @@ pub(crate) fn spawn_source_job(
         .name("source-job".into())
         .spawn(move || {
             let mut io = ServerIo { port, key, tx };
-            let (warnings, outcome) = run_source_job(&mut io, lines, warnings, errors);
+            let (warnings, outcome) = run_source_job_reporting(&mut io, lines, warnings, errors);
             let _ = done_tx.send(CtrlReq::SourceJobDone { warnings, new_from, outcome, waiter });
         })
         .is_ok()
+}
+
+/// run_source_job, but a job that panics still comes back with the source's
+/// warnings and an error, so SourceJobDone is always sent. The server loop
+/// counts the jobs that have not reported (#853); one that never reported
+/// would keep the warning list from ever starting over, and its client would
+/// wait for an answer that never comes.
+pub(crate) fn run_source_job_reporting(
+    io: &mut dyn SourceJobIo,
+    lines: Vec<DeferredConfigLine>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+) -> (Vec<String>, SourceOutcome) {
+    let (start_warnings, start_errors) = (warnings.clone(), errors.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_source_job(io, lines, warnings, errors))) {
+        Ok(done) => done,
+        Err(_) => {
+            let msg = "source-file: the source job stopped unexpectedly".to_string();
+            let mut warnings = start_warnings;
+            warnings.push(msg.clone());
+            let mut errors = start_errors;
+            errors.push(msg);
+            (warnings, SourceOutcome { output: String::new(), errors })
+        }
+    }
 }
 
 #[cfg(test)]
