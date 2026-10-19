@@ -328,7 +328,7 @@ Write-Host "`n--- Part C: Edge Cases ---" -ForegroundColor Magenta
 
 Write-Host "`n[Test 6] Immediate window name after creation (before auto-rename runs)" -ForegroundColor Yellow
 # The initial name should be set by default_shell_name(), not wait for auto-rename
-$SESSION_EDGE = "issue229_edge_$$"
+$SESSION_EDGE = "issue229_edge_$PID"
 & $PSMUX new-session -d -s $SESSION_EDGE "timeout /T 300 > NUL"
 # Query IMMEDIATELY (as fast as possible after creation)
 $immediateNames = @()
@@ -352,7 +352,7 @@ if ($immediateNames.Count -gt 0) {
 Remove-Item "$psmuxDir\$SESSION_EDGE.*" -Force -EA SilentlyContinue
 
 Write-Host "`n[Test 7] Window name with 'automatic-rename off' (should keep initial name)" -ForegroundColor Yellow
-$SESSION_NOAUTO = "issue229_noauto_$$"
+$SESSION_NOAUTO = "issue229_noauto_$PID"
 & $PSMUX new-session -d -s $SESSION_NOAUTO "timeout /T 300 > NUL"
 Start-Sleep -Seconds 3
 if (Wait-Session $SESSION_NOAUTO) {
@@ -385,7 +385,7 @@ Remove-Item "$psmuxDir\$SESSION_NOAUTO.*" -Force -EA SilentlyContinue
 Write-Host "`n--- Part D: Timing Analysis ---" -ForegroundColor Magenta
 
 Write-Host "`n[Test 8] High-frequency name sampling to pinpoint flash timing" -ForegroundColor Yellow
-$SESSION_TIMING = "issue229_timing_$$"
+$SESSION_TIMING = "issue229_timing_$PID"
 # Kill any existing session cleanly
 & $PSMUX kill-session -t $SESSION_TIMING 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500

@@ -17,7 +17,7 @@ function Add-Result($name, $pass, $detail="") {
     else       { Write-Host "  [FAIL] $name" -ForegroundColor Red }
 }
 
-$SESSION = "test146_$$"
+$SESSION = "test146_$PID"
 
 try {
     # Clean up any leftover session

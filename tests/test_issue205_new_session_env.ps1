@@ -13,7 +13,7 @@ function Add-Result($name, $pass, $detail="") {
     }
 }
 
-$SESSION = "test205_$$"
+$SESSION = "test205_$PID"
 
 try {
     # Clean up any leftover session

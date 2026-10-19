@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = 'Stop'
 $pass = 0; $fail = 0; $skip = 0
-$sess = "dur_test_$$"
+$sess = "dur_test_$PID"
 
 function Report($name, $ok, $detail) {
     if ($ok) { $script:pass++; Write-Host "  PASS  $name" -ForegroundColor Green }

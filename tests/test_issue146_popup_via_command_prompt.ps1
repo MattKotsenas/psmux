@@ -29,7 +29,7 @@ function Add-Result($name, $pass, $detail="") {
     }
 }
 
-$SESSION = "test146popup_$$"
+$SESSION = "test146popup_$PID"
 $h = $env:USERPROFILE
 
 function Get-Port { (Get-Content "$h\.psmux\$SESSION.port").Trim() }

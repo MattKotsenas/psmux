@@ -16,7 +16,7 @@
 
 $ErrorActionPreference = "Continue"
 $psmux = "psmux"
-$session = "mouse_diag_$$"
+$session = "mouse_diag_$PID"
 $logDir = "$env:USERPROFILE\.psmux"
 $mouseLog = "$logDir\mouse_debug.log"
 

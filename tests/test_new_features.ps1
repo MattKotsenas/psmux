@@ -22,7 +22,7 @@ if (-not (Test-Path $PSMUX)) {
     exit 1
 }
 
-$SESSION_NAME = "test_new_feat_$$"
+$SESSION_NAME = "test_new_feat_$PID"
 Write-Info "Binary: $PSMUX"
 Write-Info "Starting test session: $SESSION_NAME"
 Write-Host ""
@@ -44,7 +44,7 @@ Write-Host ""
 # 1. RENAME-SESSION
 # ============================================================
 Write-Host "--- rename-session ---" -ForegroundColor Yellow
-$NEW_SESSION = "renamed_sess_$$"
+$NEW_SESSION = "renamed_sess_$PID"
 
 Write-Test "rename-session"
 & $PSMUX rename-session -t $SESSION_NAME $NEW_SESSION 2>&1

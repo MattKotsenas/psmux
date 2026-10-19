@@ -17,7 +17,7 @@ function Add-Result($name, $pass, $detail="") {
     }
 }
 
-$SESSION = "test154popup_$$"
+$SESSION = "test154popup_$PID"
 $h = $env:USERPROFILE
 $TERM_W = 160
 $TERM_H = 40

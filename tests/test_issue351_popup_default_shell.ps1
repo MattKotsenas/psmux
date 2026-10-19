@@ -19,7 +19,7 @@ if (-not $PSMUX) { $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\debug\psmux.e
 if (-not $PSMUX) { $PSMUX = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
 if (-not $PSMUX) { Write-Error "psmux binary not found"; exit 1 }
 
-$SESSION = "test351popup_$$"
+$SESSION = "test351popup_$PID"
 $homeDir = $env:USERPROFILE
 
 function Get-Port {
