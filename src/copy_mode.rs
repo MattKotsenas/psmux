@@ -933,6 +933,26 @@ pub fn move_word_forward(app: &mut AppState) {
     }
 }
 
+/// Move to the start of the word under the cursor, for select-word. tmux
+/// window_copy_cmd_select_word calls previous-word with `already` 0: on a
+/// word cell it stays in that word and goes to its first cell, so a double
+/// click on the first letter selects that word. Only from a blank does it
+/// move back to the word before, which is what the b motion always does.
+pub fn move_to_word_start(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, _) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = c as usize;
+    if col >= bytes.len() || bytes[col].is_whitespace() {
+        move_word_backward(app);
+        return;
+    }
+    let cls = char_class(bytes[col], &seps);
+    while col > 0 && char_class(bytes[col - 1], &seps) == cls { col -= 1; }
+    app.copy_pos = Some((r, col as u16));
+}
+
 /// Move cursor to start of previous word (b key in vi copy mode).
 pub fn move_word_backward(app: &mut AppState) {
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
@@ -969,13 +989,25 @@ pub fn move_word_backward(app: &mut AppState) {
     app.copy_pos = Some((r, col as u16));
 }
 
+/// Where an emacs word end lands, from the vi one. tmux's
+/// window_copy_cursor_next_word_end starts at the cursor itself and stops one
+/// cell PAST the word in emacs, and the emacs copy leaves the cursor cell out,
+/// so the whole word is copied; vi stops on the last letter and keeps it.
+fn emacs_word_end(app: &mut AppState, cols: u16) {
+    if let Some((r, c)) = app.copy_pos {
+        app.copy_pos = Some((r, (c + 1).min(cols.saturating_sub(1).max(c))));
+    }
+}
+
 /// Move cursor to end of current word (e key in vi copy mode).
 pub fn move_word_end(app: &mut AppState) {
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let seps = app.word_separators.clone();
     let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
     let bytes: Vec<char> = text.chars().collect();
-    let mut col = (c as usize) + 1; // start one past current position
+    let emacs = app.mode_keys == "emacs";
+    // vi starts one past the cursor, emacs at it (see emacs_word_end).
+    let mut col = if emacs { c as usize } else { (c as usize) + 1 };
     let rows = app.windows.get(app.active_idx)
         .and_then(|w| active_pane(&w.root, &w.active_path))
         .map(|p| p.last_rows).unwrap_or(24);
@@ -1005,6 +1037,7 @@ pub fn move_word_end(app: &mut AppState) {
             }
         }
     }
+    if emacs && (col < cols as usize || app.copy_pos != Some((r, c))) { emacs_word_end(app, cols); }
 }
 
 /// Scroll the active pane's scrollback buffer without entering copy mode.
@@ -1945,7 +1978,8 @@ pub fn move_word_end_big(app: &mut AppState) {
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
     let bytes: Vec<char> = text.chars().collect();
-    let mut col = (c as usize) + 1;
+    let emacs = app.mode_keys == "emacs";
+    let mut col = if emacs { c as usize } else { (c as usize) + 1 };
     let rows = app.windows.get(app.active_idx)
         .and_then(|w| active_pane(&w.root, &w.active_path))
         .map(|p| p.last_rows).unwrap_or(24);
@@ -1965,6 +1999,7 @@ pub fn move_word_end_big(app: &mut AppState) {
             } else { app.copy_pos = Some((nr, 0)); }
         }
     }
+    if emacs && (col < cols as usize || app.copy_pos != Some((r, c))) { emacs_word_end(app, cols); }
 }
 
 /// Move to top of visible screen — H key

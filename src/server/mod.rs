@@ -2048,7 +2048,7 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
         }
         "select-word" => {
             // Select the word under cursor
-            crate::copy_mode::move_word_backward(app);
+            crate::copy_mode::move_to_word_start(app);
             if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r,c));
                 app.copy_anchor_scroll_offset = app.copy_scroll_offset;
