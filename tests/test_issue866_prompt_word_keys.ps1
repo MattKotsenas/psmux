@@ -32,7 +32,7 @@
 # Set PSMUX_TEST_BIN to test a binary that is not on PATH.
 
 $ErrorActionPreference = "Continue"
-$PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } else { (Get-Command psmux -EA Stop).Source }
+$PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } elseif ($env:PSMUX_TEST_EXE) { $env:PSMUX_TEST_EXE } else { (Get-Command psmux -EA Stop).Source }
 $psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $script:TestsPassed = 0; $script:TestsFailed = 0
 $script:Opened = @()
@@ -130,11 +130,11 @@ function Screen {
 # What the prompt HOLDS: the row below the box title. The border comes back
 # from the screen reader as non ASCII, or as `+` and `-` through a code page
 # best fit, so it is dropped before the title is read.
-function Prompt-Value {
+function Prompt-Value($want = 'command') {
     $screen = Screen
     for ($i = 0; $i -lt $screen.Count; $i++) {
         $title = (([string]$screen[$i]) -replace '[^ -~]', '' -replace '[+-]', '').Trim()
-        if ($title -eq 'command' -and $i + 1 -lt $screen.Count) {
+        if ($title -eq $want -and $i + 1 -lt $screen.Count) {
             $line = (([string]$screen[$i + 1]) -replace '[^ -~]', '').TrimEnd()
             $at = $line.IndexOf(':')
             if ($at -ge 0) { return $line.Substring($at + 1).Trim() }
@@ -274,6 +274,51 @@ Inj "q"
 Start-Sleep -Milliseconds 300
 $inMode = ((P display-message -t $SESS -p '#{pane_in_mode}') -join '').Trim()
 if ($inMode -ne "0") { P send-keys -t $SESS -X cancel | Out-Null }
+
+# -- 6. a command-prompt -p opened from the command line --
+
+# Measured in tmux 3.8 with `command-prompt -b -t <client> -p say` and
+# send-keys -K, word-separators "-./": `a-b.c`, M-b, X gives `a-b.Xc`, and a
+# C-w after that cuts only the X again.
+Write-Head "6. command-prompt -p from the command line"
+P command-prompt -t $SESS -p "say" "set -g @said '%%'" | Out-Null
+Start-Sleep -Milliseconds 600
+Inj "a-b.c"
+Inj "{ALT:b}X"
+$v = Prompt-Value 'say'
+Check ($v -ceq "a-b.Xc") "M-b, X: [$v]" "M-b, X: the say prompt reads [$v]"
+Inj "^w"
+$v = Prompt-Value 'say'
+Check ($v -ceq "a-b.c") "C-w cuts only the X: [$v]" "C-w: the say prompt reads [$v]"
+Inj "{ENTER}"
+Start-Sleep -Milliseconds 500
+$said = ((P show -gv '@said') -join '').Trim()
+Check ($said -ceq "a-b.c") "the command ran with [a-b.c]" "the command ran with [$said]"
+
+# -- 7. AltGr is still text --
+
+# Windows reports AltGr as Ctrl+Alt. `@` on a German layout is AltGr+Q, so it
+# arrives as Ctrl+Alt with the character `@`, and must still be typed, not
+# taken for an Alt key the prompt drops.
+Write-Head "7. an AltGr character is still typed"
+$ALTGR_AT = "{RAW:51:40:0009}"
+$v = Prompt-After "ab" "$ALTGR_AT"
+Check ($v -ceq "ab@") "AltGr+Q types @: [$v]" "AltGr+Q: the prompt reads [$v]"
+
+# -- 8. a change to word-separators reaches the attached client --
+
+# The client learns the option with each frame, so a `set` made while it is
+# attached applies at its very next prompt. With no separators only spaces
+# split words, as in tmux.
+Write-Head "8. word-separators set while attached"
+P set -g word-separators "" | Out-Null
+Start-Sleep -Milliseconds 600
+$v = Prompt-After "ls /usr/local" "^w"
+Check ($v -ceq "ls") "with no separators C-w cuts the whole path: [$v]" "with no separators: the prompt reads [$v]"
+P set -g word-separators "-./" | Out-Null
+Start-Sleep -Milliseconds 600
+$v = Prompt-After "ls /usr/local" "^w"
+Check ($v -ceq "ls /usr/") "set back, C-w cuts one component: [$v]" "set back: the prompt reads [$v]"
 
 # -- Done --
 
