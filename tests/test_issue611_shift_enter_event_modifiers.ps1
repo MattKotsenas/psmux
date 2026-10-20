@@ -57,7 +57,8 @@ foreach ($pair in @(
     @{ s='reclog610.cs';      o=$reclog },
     @{ s='entinject611.cs';   o=$inject },
     @{ s='conptyfeed610.cs';  o=$feeder })) {
-    if (-not (Test-Path $pair.o)) {
+    # Rebuild when the source is newer, or a cached old harness keeps running.
+    if (-not (Test-Path $pair.o) -or (Get-Item "$PSScriptRoot\$($pair.s)").LastWriteTime -gt (Get-Item $pair.o).LastWriteTime) {
         & $csc /nologo /platform:x64 /out:$($pair.o) "$PSScriptRoot\$($pair.s)" 2>&1 | Out-Null
     }
 }

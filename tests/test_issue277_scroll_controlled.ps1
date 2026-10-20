@@ -297,7 +297,10 @@ if (-not $opencodeCmd) {
     Start-Sleep -Seconds 8
 
     # Give it a prompt to generate scrollable content
-    & $PSMUX send-keys -t $SESSION "say hello and list 50 numbers" Enter 2>&1 | Out-Null
+    # One number per line: a model that answers "1, 2, 3, ..." on one line
+    # fits the screen and leaves nothing to scroll (run 2026-10-20_15-41-23).
+    $ocPrompt = "print the numbers 1 to 80, each on its own line, nothing else"
+    & $PSMUX send-keys -t $SESSION $ocPrompt Enter 2>&1 | Out-Null
     Start-Sleep -Seconds 20
 
     # Now capture state before and after scroll
@@ -310,7 +313,12 @@ if (-not $opencodeCmd) {
     # there is nothing to scroll, and the capture diff oracle would
     # misreport that as "scroll broken". Require a filled viewport first.
     $ocLines = @($capBefore -split "`n" | Where-Object { $_.Trim().Length -gt 0 }).Count
-    if ($ocLines -lt 15) {
+    # And the reply must overflow the screen: while the prompt line is still
+    # on screen nothing has scrolled away, so a wheel up has nothing to show.
+    $ocOverflow = -not $capBefore.Contains($ocPrompt)
+    if (-not $ocOverflow) {
+        Write-Host "  [SKIP] the opencode reply fits the screen (prompt still visible); nothing to scroll. Scroll checks skipped." -ForegroundColor DarkYellow
+    } elseif ($ocLines -lt 15) {
         Write-Host "  [SKIP] opencode produced no scrollable content ($ocLines non-empty lines); model backend likely unreachable. Scroll checks skipped." -ForegroundColor DarkYellow
     } else {
         # Test 3a: Scroll up in opencode

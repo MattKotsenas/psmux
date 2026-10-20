@@ -43,6 +43,8 @@ class EntInject611
         IntPtr sec, uint disp, uint flags, IntPtr tmpl);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool WriteConsoleInput(IntPtr h, INPUT_RECORD[] buf, uint len, out uint written);
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint period);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint period);
     [DllImport("user32.dll")] static extern uint MapVirtualKeyW(uint code, uint mapType);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern short VkKeyScanW(char ch);
 
@@ -192,7 +194,16 @@ class EntInject611
             {
                 int ms = int.Parse(s.Substring(7));
                 One("esc", buf); Flush(buf, "esc");
-                Thread.Sleep(ms);
+                // Thread.Sleep(5) is one timer tick, 15.6 ms, unless some other
+                // process happens to have raised the resolution: that turned a
+                // 5 ms gap into one longer than escape-time (10 ms) on a quiet
+                // machine. Ask for 1 ms and wait out the rest on a Stopwatch.
+                timeBeginPeriod(1);
+                var gap = System.Diagnostics.Stopwatch.StartNew();
+                if (ms > 1) Thread.Sleep(ms - 1);
+                while (gap.Elapsed.TotalMilliseconds < ms) Thread.SpinWait(50);
+                timeEndPeriod(1);
+                log.Add("  gap " + gap.Elapsed.TotalMilliseconds.ToString("F2") + " ms");
                 One("ent", buf); Flush(buf, "cr after " + ms + "ms");
             }
             else if (s.StartsWith("text:"))
