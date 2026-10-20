@@ -276,3 +276,46 @@ fn the_server_sends_the_option_to_the_client() {
     let back: crate::render_state::ClientRenderOptions = serde_json::from_str(&json).unwrap();
     assert_eq!(back.word_separators.as_deref(), Some("-/"));
 }
+
+#[test]
+fn a_space_in_the_separators_still_ends_a_word_as_a_space() {
+    // psmux's default word-separators " -_@" holds a space. tmux 3.8 with
+    // `set -g word-separators ' -_@'`, measured with command-prompt -b and
+    // send-keys -K: M-f from the start of `ls foo-bar_baz` stops at
+    // 2 6 7 10 11 14, M-b from the end at 11 10 7 6 3 0, and C-w twice leaves
+    // `ls foo-bar_` then `ls foo-bar`.
+    const SEPS: &str = " -_@";
+    const TEXT: &str = "ls foo-bar_baz";
+    let steps = |key: &str, from_start: bool| {
+        let mut input = TEXT.to_string();
+        let len = TEXT.chars().count();
+        let mut back = if from_start { len } else { 0 };
+        (0..6)
+            .map(|_| {
+                prompt_edit(&mut input, &mut back, &mut None, SEPS, key, || None);
+                len - back
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(steps("M-f", true), vec![2, 6, 7, 10, 11, 14]);
+    assert_eq!(steps("C-Right", true), vec![2, 6, 7, 10, 11, 14]);
+    assert_eq!(steps("M-b", false), vec![11, 10, 7, 6, 3, 0]);
+    assert_eq!(steps("C-Left", false), vec![11, 10, 7, 6, 3, 0]);
+    assert_eq!(cut_twice(TEXT, SEPS), ("ls foo-bar_".to_string(), "ls foo-bar".to_string()));
+}
+
+#[test]
+fn only_a_printable_ascii_separator_splits_a_word() {
+    // tmux tests only a one byte, one cell character against the list
+    // (prompt_in_list), so a wide character or a tab listed in
+    // word-separators never splits a word.
+    for (text, seps) in [("ab\u{65e5}cd", "\u{65e5}"), ("ab\tcd", "\t")] {
+        let mut input = text.to_string();
+        let len = text.chars().count();
+        let mut back = len;
+        prompt_edit(&mut input, &mut back, &mut None, seps, "M-f", || None);
+        assert_eq!(len - back, len, "M-f over [{text:?}] with [{seps:?}]");
+        let (first, _) = cut_twice(text, seps);
+        assert_eq!(first, "", "C-w over [{text:?}] with [{seps:?}]");
+    }
+}
