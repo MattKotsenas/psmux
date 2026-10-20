@@ -260,7 +260,7 @@ if ($trims.Count -eq 0) {
 # its refill landing legitimately reads one short. What must never happen is the
 # depth falling back once the run has been going for seconds, which is the
 # trajectory in the report (depth 7 from split 4 to 28, depth 1 by split 31).
-Write-Test "sampled depth holds at or above the configured target once the run is going"
+Write-Test "sampled depth holds within one of the configured target once the run is going"
 $depths = @()
 foreach ($l in $during) {
     $m = [regex]::Match($l, 'pool: sample depth=(\d+) ready=(\d+) inflight=(\d+) target=(\d+)')
@@ -273,8 +273,12 @@ if ($depths.Count -lt 8) {
     $half = @($depths[[int]($depths.Count / 2)..($depths.Count - 1)])
     $minDepth = ($half | Measure-Object -Property depth -Minimum).Minimum
     Write-Info ("depth samples={0} (second half {1}) min={2} max={3} target={4}" -f $depths.Count, $half.Count, $minDepth, ($half | Measure-Object -Property depth -Maximum).Maximum, $target)
-    if ($minDepth -ge $target) {
-        Write-Pass "minimum sampled depth $minDepth in the second half of the run is at or above target $target"
+    # One short is a claim whose refill is still booting (500 to 900 ms): when
+    # every claim finds a ready spare no surge opens and the pool sits AT its
+    # target, so a sample between a claim and its refill reads target - 1. The
+    # defect fell further, to one ready spare and then none.
+    if ($minDepth -ge ($target - 1)) {
+        Write-Pass "minimum sampled depth $minDepth in the second half of the run is within one of target $target"
     } else {
         Write-Fail "the pool fell to depth $minDepth (target $target) while the user was still splitting"
     }
