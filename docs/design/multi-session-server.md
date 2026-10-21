@@ -1,7 +1,9 @@
 # Design: a shared multi session server (issue #798)
 
-Status: proposal. Only the switch is implemented (stage 1, step 1: `PSMUX_SERVER_MODE`
-and `server-mode`, with `shared` refusing cleanly); the shared server itself is not.
+Status: stage 1, steps 1 and 2 implemented. Step 1 is the switch (`PSMUX_SERVER_MODE`
+and `server-mode`); step 2 is a minimal shared server behind it (one process per
+namespace holding its sessions, see "Step 2 (implemented)" below). Everything else
+here is still a proposal.
 
 > **Owner ruling, 2026-10-17. This overrides anything below that disagrees with it.**
 >
@@ -427,11 +429,129 @@ The switch exists and nothing behind it is built yet. The contract:
   one identical signature, equal to a master build's when `PSMUX_BASELINE_EXE` is
   given. `tests-rs/test_issue798_server_mode_switch.rs` covers the parser.
 
-Step 2, the first working slice, replaces the refusal in `shared/mod.rs` with a
-server that hosts one session and accepts a second `new-session` in the same
-namespace, writing the per session registry files described below.
+#### Step 2 (implemented): a minimal shared server
 
-What changes in shared mode:
+`shared` now runs one server process per namespace that holds every session of
+the namespace. Everything is in `src/server/shared/`; **no line of code a default
+build runs was changed** (the step 1 gates already live in `shared/mod.rs`, and
+only their `shared` branches changed). `tests/test_issue798_shared_server.ps1`
+Part 0 checks that per commit.
+
+**Shape.** Not run_server on a thread per session: run_server is written for a
+process that is one session (it exits the process on kill-session, pushes frames
+to every client of the process, sets the process environment and directory for
+its session, owns the one wake channel), and making it reentrant would change the
+default path. The shared server has its own loop (`server.rs`) and calls the per
+session building blocks unchanged:
+
+* `cli.rs`: the CLI side, entered from `gate_server_start`. `new-session` reads the
+  namespace marker, starts the server if there is none (`psmux server
+  --shared-server [-L ns]`, entered through `gate_server_process`), sends the
+  request to the server's control listener, and without `-d` attaches by running
+  the ordinary `attach-session -t <name>`. `start-server` starts the server.
+  `-C`/`-CC` is refused (deferred).
+* `server.rs`: the process. Each session is a full `AppState` with its own
+  loopback listener; each accepted connection goes to the existing
+  `connection::handle_connection` with that session's channel; one forwarding
+  thread per session tags requests with the session and hands them to the one
+  loop thread. Before a request the loop *enters* the session: it lends the
+  server wide id counters to the session (`ids.rs`), and points what a pane child
+  inherits (PSMUX_TARGET_SESSION, the job environment's `$TMUX`, the working
+  directory) at that session. Every request runs inside `catch_unwind`; a panic
+  ends that one session (files, clients, panes) and the others keep running.
+* `dispatch.rs`, `frame.rs`: copies of run_server's arms for the requests step 2
+  serves, each naming its source line at 0145958f, and the frame builder. A
+  frame is pushed only to the session's own attached clients (through their
+  directive channel; `types::push_frame` would reach every client of the
+  process).
+* `router.rs`, `reply.rs`: before a one shot connection reaches the protocol
+  handler, its opening (`AUTH`, optional `TARGET`, command line) is peeked; a
+  command the shared server does not run is answered by the ONE reply helper as
+  `ERROR: unknown command: <name>`, byte for byte the per session server's
+  unknown command reply (owner instruction on #865: the future error flag change
+  only touches `reply.rs`).
+
+**Registry layout (settles #844 for shared mode).** Session files keep today's
+names and contents, per session: `<base>.port` (the session's own listener),
+`<base>.key` (its own key), `<base>.sid`, `<base>.pid` (the shared server's pid,
+the same for all its sessions), with `<base>` = `<ns>__<session>` or `<session>`.
+Because each session keeps its own port, `ls`, `attach`, `has-session`,
+`kill-session`, `kill-server` (the first of its per `.port` targets ends the
+process), `$TMUX` and older CLIs work unchanged, and `$TMUX` never needs a port
+tie break. New: one namespace marker per shared server in a directory of its own,
+`<data>/shared/default.server` or `<data>/shared/L-<ns>.server` (the `L-` prefix
+keeps `-L default` apart from the default namespace), holding `mode`, `pid`,
+`creation` (so a recycled pid is never taken for the server) and the `port`/`key`
+of the server's control listener. A server writes the data dir's reaper ownership
+marker only once a `.port` names it, so the orphan reaper cannot take it during
+start up, and removes it before its last `.port`.
+
+**What step 2 serves.** new-session (`-d -s -n -c -x -y -e -P -F -A`, a shell
+command or `--` argv), new-window, split-window, kill-pane, kill-window,
+select-window, select-pane, next/previous/last-window, last-pane, rename-window,
+send-keys, capture-pane, display-message, list-windows, list-panes, ls,
+has-session, kill-session, kill-server, set/show-options, set/show-environment,
+set-hook/show-hooks, bind/unbind-key, list-keys, switch-client (`-t <session>`,
+`-n`, `-p`, `-l`, `-T`: the attached client follows today's `SWITCH` directive to
+the other session's own listener; a window or pane in another session is refused
+as deferred), and a real attached client (dump-state, keys, paste, resize, focus,
+detach). Ids `@N`/`%N` are unique and
+dense across the server. Scoping as in tmux: `set -g`, `set -s`, `setw -g`,
+`setenv -g`, `set-hook -g` and key bindings are server wide (delivered to every
+session through its own listener and replayed on sessions created later; a
+delivery the server makes itself is an echo and is not propagated again); session
+options stay in their session. `show -s server-mode` answers `shared`.
+kill-session ends one session; the server exits when its last session ends
+(tmux with `exit-empty`). The per session `__warm__` standby is never claimed and
+the shared server keeps no spare panes, so the first pane of every session is a
+cold spawn. Pane shells inherit the server's environment as the launching shell
+had it: the switch is never planted in it.
+
+**Deferred to step 3 and later.** Control mode (`-C`/`-CC`); `switch-client` to a
+window or pane of another session, `choose-tree` and the session chooser;
+`rename-session`;
+cross session move-window/join-pane/swap-pane/link-window and session groups
+(`new-session -t` is refused); `new-session` from a hook, binding or prompt;
+run-shell, if-shell, source-file, buffers, popups, menus and the rest of the
+command set (refused with the unknown command reply); `update-environment` from a
+later session's client (panes inherit the server's start environment); warm
+spares inside the process; and per session status-interval hooks. A command run
+from inside the loop (a hook, the config) that targets ANOTHER session of the
+same server goes over TCP to that session's listener, which this same loop
+serves, so it waits for its reply timeout; the server wide writes are delivered
+from connection threads for exactly that reason. The config is loaded once per
+session (as each per session server loads it), so a config's `run-shell` runs per
+session.
+
+**Known differences from the per session model that are visible.** A single
+unsupported command answers `ERROR: unknown command: <name>`; whether the CLI then
+exits 1 depends on that command's CLI path, exactly as for any `ERROR` reply
+today. A crash that `catch_unwind` cannot catch (stack overflow, abort, a native
+fault) ends every session of the namespace (section 8).
+
+**Measured** (`tests/perf_issue798_shared_vs_per_session.ps1`, 5 rounds of three
+`new-session -d` in a fresh namespace, Windows 11 26200, metrics JSON in
+`~/.psmux-test-data/metrics/`):
+
+| | per session | shared |
+|---|---|---|
+| first `new-session -d` (starts the server) | p50 232 ms | p50 93 ms |
+| second and third `new-session -d` | p50 237 ms | p50 35 ms |
+| server processes for 3 sessions | 3, plus the `__warm__` standby | 1 |
+| server working set / private bytes | 48.1 MB / 12.7 MB, plus 15.1 MB standby | 9.9 MB / 3.3 MB |
+
+Pane shells are separate processes in both modes and are not counted. The
+shared server's later sessions are close to the cost of `new-window`, which is
+what section 3.3 projected.
+
+**Tests.** `tests/test_issue798_shared_server.ps1` (end to end, 102 checks),
+`tests/test_issue798_server_mode_switch.ps1` (step 1's default path proof,
+unchanged Part 1, against a master build), `tests-rs/test_issue798_shared_server.rs`
+(allocator, router, reply helper, marker) and
+`tests-rs/test_issue798_shared_server_requests.rs` (a panicking request ends only
+its session and keeps the ids; each request runs with its own session entered).
+
+What the later steps add in shared mode (the original stage 1 list):
 
 * `new-session` in a namespace with a live shared server sends `new-session` to it.
   The server creates an `AppState` (session) with a spare pane from its in process
@@ -622,10 +742,26 @@ default build runs, and nothing else:
 With the switch unset each gate reads one environment variable and the config file
 and returns; every other line of the default path is the old code.
 
-The next contributor sized PR is step 2: a minimal shared server inside
-`src/server/shared/` that holds one session, answers the existing protocol on its
-port, and takes a second `new-session` in its namespace, with its own id allocator
-(stage 0a rebuilt inside the shared code, not in `AppState`).
+Step 2, the minimal shared server inside `src/server/shared/`, is done too (see
+"Step 2 (implemented)" in section 6), again with no hunk outside
+`src/server/shared/` but the tests and this document.
+
+Step 3, the next one, each item its own PR and still entirely behind the switch:
+
+1. In process routing between the sessions of one shared server, so nothing run
+   from inside the loop (a hook, a binding, the config, switch-client with a
+   window or pane) has to reach a sibling session over TCP, which today waits on
+   the loop serving it. With it: `new-session` from a hook, binding or prompt,
+   `switch-client -t s:w.p`, `choose-tree` and the session chooser.
+2. Control mode (`-C`/`-CC`) on the shared server, with `%sessions-changed` to
+   every control client on create and destroy (section 6, stage 1 list).
+3. The rest of the command set, each a copied arm with its test: buffers (server
+   wide, as in tmux), run-shell, if-shell, source-file, popups, menus,
+   rename-session (the registry rename), respawn, resize, layouts.
+4. Spare panes inside the shared process, so a new session's first pane is not a
+   cold spawn.
+5. Then stage 2 of the plan: cross session move-window/join-pane/swap-pane as in
+   process moves.
 
 The original stage 0a text, for the record:
 
