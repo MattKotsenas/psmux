@@ -24,10 +24,22 @@
 //! ones, exit 1, and no server is started: a typo must never quietly run the
 //! other mode.
 //!
-//! In this step `shared` starts nothing. It reports that the shared server is
-//! not in this build yet and exits 1. It never falls back to per session.
+//! Step 2 (the child modules): `shared` runs one server process per namespace
+//! that holds every session of the namespace (`server.rs`), reached by the CLI
+//! through `cli.rs`. It never falls back to per session, and the per session
+//! code (run_server, the warm standby) is never entered for it. See
+//! docs/design/multi-session-server.md, "Step 2".
 
 use std::io::Write;
+
+pub(crate) mod ids;
+pub(crate) mod registry;
+pub(crate) mod reply;
+pub(crate) mod router;
+mod cli;
+mod dispatch;
+mod frame;
+mod server;
 
 /// The name of the environment switch.
 pub const ENV_VAR: &str = "PSMUX_SERVER_MODE";
@@ -171,11 +183,29 @@ pub fn resolve_for_this_process() -> Result<ServerMode, String> {
     )
 }
 
-/// The message `shared` gives while the shared server is not built yet.
+/// The message a start a running server makes on the user's behalf gives when
+/// the switch says `shared`: a per session server cannot hand the request to
+/// the shared server in step 2, and the shared server does not yet run
+/// `new-session` from a hook, key binding or prompt.
 pub fn not_available_message() -> String {
-    "shared server mode is not available in this build yet (step 1 of #798); \
-     unset PSMUX_SERVER_MODE or set server-mode per-session to use one server per session"
-        .to_string()
+    if server::in_shared_server() {
+        "shared server mode: new-session from a hook, key binding or prompt is not supported yet \
+         (step 2 of #798); run psmux new-session from a shell"
+            .to_string()
+    } else {
+        "shared server mode cannot start a session from inside a per-session server (#798); \
+         run psmux new-session from a shell, or unset PSMUX_SERVER_MODE"
+            .to_string()
+    }
+}
+
+/// The argument the shared CLI passes to `psmux server` to start the shared
+/// server. The switch itself is never planted in the server's environment, so
+/// pane shells inherit exactly the environment the user had.
+pub const SHARED_SERVER_ARG: &str = "--shared-server";
+
+fn this_process_is_shared_server() -> bool {
+    std::env::args().any(|a| a == SHARED_SERVER_ARG)
 }
 
 fn die(msg: &str) -> ! {
@@ -191,17 +221,12 @@ fn die(msg: &str) -> ! {
 /// `shared` is entered here and never comes back: it must not be served by a
 /// per session server, the warm standby included. In step 1 it reports that
 /// the mode is not built yet.
-pub fn gate_server_start(_ns: Option<&str>) {
+pub fn gate_server_start(ns: Option<&str>) {
     match resolve_for_this_process() {
         Ok(ServerMode::PerSession) => {}
-        Ok(ServerMode::Shared) => run_shared_cli(),
+        Ok(ServerMode::Shared) => cli::run(ns),
         Err(e) => die(&e),
     }
-}
-
-/// The entry of shared mode on the CLI side. Step 1: not built yet.
-fn run_shared_cli() -> ! {
-    die(&not_available_message())
 }
 
 /// The same decision for a start a running server makes on a user's behalf
@@ -223,9 +248,17 @@ pub fn check_server_start() -> Result<(), String> {
 /// says anything but `per-session` must not go on to run the per session
 /// server, so it exits 1 before it writes a registry file.
 pub fn gate_server_process() {
+    // The shared server is started by the shared CLI with its own argument,
+    // whatever the environment says (the switch may come from the config).
+    if this_process_is_shared_server() {
+        server::run_from_args();
+    }
     match resolve_for_this_process() {
         Ok(ServerMode::PerSession) => {}
-        Ok(ServerMode::Shared) => die(&not_available_message()),
+        Ok(ServerMode::Shared) => die(
+            "a per-session server cannot start while server-mode is shared (#798); \
+             psmux new-session starts the shared server",
+        ),
         Err(e) => die(&e),
     }
 }
