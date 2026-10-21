@@ -3611,6 +3611,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut paste_head_key: Option<char> = None;
     #[cfg(windows)]
     let mut paste_head_released = false;
+    // Whether this client's input has ever carried a key release. The VT
+    // input route (PSMUX_VT_INPUT, ssh) has no release events at all, so a
+    // missing release proves nothing there and the head is judged as before.
+    #[cfg(windows)]
+    let mut key_releases_seen = false;
+    // And only the console record route reads a host's press and release
+    // pair from one buffer in one drain. The VT route parses them on a reader
+    // thread, so a pasted character's release can trail its press past the
+    // drain (measured: the 19045 drip under PSMUX_VT_INPUT=1 split 43 of 43
+    // characters out of the bracket), so there the head is judged as before.
+    #[cfg(windows)]
+    let release_shape_is_evidence = matches!(input, crate::ssh_input::InputSource::Crossterm { .. });
 
     // Track whether a modified Enter Press was already handled this keypress
     // cycle.  WezTerm sends Shift+Enter as Release-only (no Press), so we
@@ -4602,6 +4614,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // lets go tens of milliseconds later.
                 #[cfg(windows)]
                 if let Event::Key(k) = &_cur_evt {
+                    if k.kind == KeyEventKind::Release {
+                        key_releases_seen = true;
+                    }
                     if k.kind == KeyEventKind::Release && !paste_pend.is_empty() {
                         if let (KeyCode::Char(c), Some(h)) = (k.code, paste_head_key) {
                             if c.to_lowercase().eq(h.to_lowercase()) {
@@ -7992,7 +8007,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     clip_head: paste_clip_head.get(),
                     held_for: paste_pend_start.map(|s| s.elapsed()).unwrap_or_default(),
                     shifted_head: paste_head_shifted,
-                    head_released: paste_head_released,
+                    head_released: paste_head_released || !key_releases_seen || !release_shape_is_evidence,
                 }
             } else {
                 PasteHeadEvidence::default()

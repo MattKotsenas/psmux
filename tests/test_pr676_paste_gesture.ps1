@@ -44,6 +44,9 @@ if (-not (Test-Path $inj)) { Write-Fail "could not compile paste_host_injector.c
 
 Write-Host "`n=== PR #676: clipboard paste lands once ($PSMUX) ===" -ForegroundColor Cyan
 $client = $null
+# The cells below put their own text on the clipboard; the user's goes back in
+# the finally block, verified.
+$savedClip = try { Get-Clipboard -Raw -EA Stop } catch { $null }
 try {
     P kill-server | Out-Null
     Start-Sleep -Milliseconds 400
@@ -139,6 +142,15 @@ finally {
     P kill-server | Out-Null
     Start-Sleep -Milliseconds 300
     Get-ChildItem "$env:USERPROFILE\.psmux" -Filter "${NS}__*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
+    if ($null -ne $savedClip) {
+        $back = $false
+        for ($i = 0; $i -lt 50 -and -not $back; $i++) {
+            try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
+            $back = ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip)
+            if (-not $back) { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $back) { Write-Host "  [WARN] the clipboard could not be restored" -ForegroundColor Yellow }
+    }
 }
 
 Write-Host "`n=== Results ===" -ForegroundColor Cyan

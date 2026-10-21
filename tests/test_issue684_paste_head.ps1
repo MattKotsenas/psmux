@@ -48,6 +48,9 @@ $savedNoWarm  = $env:PSMUX_NO_WARM
 $savedDebug   = $env:PSMUX_INPUT_DEBUG
 $savedGap     = $env:PSMUX_INJECT_GAP_MS
 $savedClip    = try { Get-Clipboard -Raw -EA SilentlyContinue } catch { $null }
+# Everything below runs inside try/finally so the user's clipboard comes back
+# even when the run dies or is stopped halfway (it sets several test texts).
+try {
 
 $root = Join-Path $env:TEMP "psmux_i684_head"
 Remove-Item -Recurse -Force $root -EA SilentlyContinue
@@ -285,12 +288,24 @@ if (-not $catt -or $rc2 -eq 2) {
     else { Write-Fail "the paste after the contention was split: '$second' (whole record: '$ctext')" }
 }
 
+} finally {
 & $PSMUX -L $NS kill-server 2>&1 | Out-Null
 $env:PSMUX_DATA_DIR = $savedDataDir
 $env:PSMUX_NO_WARM = $savedNoWarm
 $env:PSMUX_INPUT_DEBUG = $savedDebug
 if ($null -eq $savedGap) { Remove-Item env:PSMUX_INJECT_GAP_MS -EA SilentlyContinue } else { $env:PSMUX_INJECT_GAP_MS = $savedGap }
-if ($savedClip) { try { Set-Clipboard -Value $savedClip } catch {} }
+if ($savedClip) {
+    # Retried and verified: a clipboard another window holds open refuses
+    # the write silently.
+    $back = $false
+    for ($i = 0; $i -lt 50 -and -not $back; $i++) {
+        try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
+        $back = ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip)
+        if (-not $back) { Start-Sleep -Milliseconds 100 }
+    }
+    if ($back) { Write-Info "the clipboard was restored" } else { Write-Host "  [WARN] the clipboard could not be restored" -ForegroundColor Yellow }
+}
+}
 
 Write-Host "`n================ SUMMARY ================" -ForegroundColor Yellow
 Write-Host "  Passed: $script:Pass" -ForegroundColor Green

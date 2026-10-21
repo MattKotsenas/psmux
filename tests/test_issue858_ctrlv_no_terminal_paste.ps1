@@ -223,7 +223,16 @@ catch { if ($_.Exception.Message -notin 'noclient', 'noclip') { Write-Fail "unex
 finally {
     if ($client) { Stop-Process -Id $client.Id -Force -EA SilentlyContinue }
     P kill-server | Out-Null
-    if ($clipSaved) { try { Set-Clipboard -Value $savedClip } catch {} }
+    if ($clipSaved) {
+        # Verified, retried: a clipboard another window holds refuses silently.
+        $back = $false
+        for ($i = 0; $i -lt 50 -and -not $back; $i++) {
+            try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
+            $back = ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip)
+            if (-not $back) { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $back) { Write-Host "  [WARN] the clipboard could not be restored" -ForegroundColor Yellow }
+    }
     $env:PSMUX_DATA_DIR = $savedDataDir
     $env:PSMUX_NO_WARM = $savedNoWarm
     $env:PSMUX_INPUT_DEBUG = $savedDebug
