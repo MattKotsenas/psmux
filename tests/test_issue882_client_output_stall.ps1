@@ -28,8 +28,8 @@ Remove-Item Env:\TMUX_PANE -ErrorAction SilentlyContinue
 
 $pass = 0; $fail = 0
 function Check($name, $ok, $detail) {
-    if ($ok) { $script:pass++; Write-Host "  PASS  $name  $detail" -ForegroundColor Green }
-    else { $script:fail++; Write-Host "  FAIL  $name  $detail" -ForegroundColor Red }
+    if ($ok) { $script:pass++; Write-Host "  [PASS] $name  $detail" -ForegroundColor Green }
+    else { $script:fail++; Write-Host "  [FAIL] $name  $detail" -ForegroundColor Red }
 }
 function P { & $exe -L $ns @args 2>$null }
 function ClientCount { @(P list-clients | Where-Object { $_ }).Count }
