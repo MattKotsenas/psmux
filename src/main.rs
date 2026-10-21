@@ -576,6 +576,22 @@ fn probe_session_alive_strict(session_name: &str) -> bool {
     probe_session_alive_inner(session_name, false)
 }
 
+/// A handle on the server behind `port_path`, from its `.pid` anchor, opened
+/// only when the recorded creation time proves the pid is still that server
+/// (a recycled pid must never be waited on in its place).
+fn kill_session_exit_waiter(port_path: &str) -> Option<crate::platform::ExitWaiter> {
+    let pid_path = std::path::Path::new(port_path).with_extension("pid");
+    let (pid, recorded) = crate::session::parse_pid_file_contents(&std::fs::read_to_string(pid_path).ok()?)?;
+    let recorded = recorded?;
+    let waiter = crate::platform::ExitWaiter::open(pid)?;
+    // Checked after the open, so the handle is known to be the process whose
+    // creation time matched.
+    if crate::platform::process_kill::process_creation_time(pid)? != recorded {
+        return None;
+    }
+    Some(waiter)
+}
+
 fn probe_session_alive_inner(session_name: &str, connect_failure_means_alive: bool) -> bool {
     let path = crate::paths::port_file(session_name);
     let port = match std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()) {
@@ -3771,13 +3787,27 @@ fn run_main() -> io::Result<()> {
                 }
                 let mut gone = !was_alive;
                 let mut refused = false;
+                // The server's own process, pinned by a handle opened while the
+                // `.pid` anchor still names it, so the wait below ends the moment
+                // it exits. It used to be a fixed 150 ms sleep before the first
+                // look, which was most of what kill-session cost: 300 ms from the
+                // command to the server gone, of which the server's own teardown
+                // is about 60 (measured 2026-10-21, tests/test_creation_latency_gate
+                // kill-session row 248 ms flat across every run on record).
+                let server_exit = if was_alive { kill_session_exit_waiter(&port_path) } else { None };
                 while !gone {
                     match send_control("kill-session\n".to_string()) {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => { refused = true; break; }
                         Err(_) => {} // busy/timeout — keep trying until the deadline
                     }
-                    std::thread::sleep(Duration::from_millis(150));
+                    match server_exit {
+                        // A session that hands its joined panes to another
+                        // session keeps its server; that times out here and the
+                        // probe below sees the registry gone, as before.
+                        Some(ref w) => { w.wait(150); }
+                        None => std::thread::sleep(Duration::from_millis(150)),
+                    }
                     if !probe_session_alive(&session_name) { gone = true; break; }
                     if std::time::Instant::now() >= deadline { break; }
                 }

@@ -282,6 +282,61 @@ pub fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+/// A SYNCHRONIZE handle on one process, so its exit can be waited on as an
+/// event instead of on a timer. Open it while the pid is known to be the
+/// process meant (a pid is only a name until a handle pins it).
+#[cfg(windows)]
+pub struct ExitWaiter(isize);
+
+#[cfg(windows)]
+impl ExitWaiter {
+    pub fn open(pid: u32) -> Option<Self> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        }
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        // SAFETY: plain FFI call; a zero return is a failure and is not kept.
+        let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if h == 0 { None } else { Some(ExitWaiter(h)) }
+    }
+
+    /// Wait up to `ms` for the process to exit. True when it has.
+    pub fn wait(&self, ms: u32) -> bool {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+        }
+        // SAFETY: the handle is owned by self and open until Drop.
+        unsafe { WaitForSingleObject(self.0 as *mut std::ffi::c_void, ms) == 0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ExitWaiter {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        // SAFETY: closes the handle this value owns, once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(not(windows))]
+pub struct ExitWaiter;
+
+#[cfg(not(windows))]
+impl ExitWaiter {
+    pub fn open(_pid: u32) -> Option<Self> {
+        None
+    }
+    pub fn wait(&self, _ms: u32) -> bool {
+        false
+    }
+}
+
 #[cfg(not(windows))]
 pub fn process_is_alive(_pid: u32) -> bool {
     // Non-Windows builds do not plumb the server PID into the readiness gate;
