@@ -2,8 +2,10 @@
 #
 # PSMUX_SERVER_MODE (or `set -s server-mode` in the config) picks the kind of
 # server a namespace start creates. `per-session`, unset and empty run exactly
-# the code psmux always ran; `shared` enters src/server/shared, which in this
-# step starts nothing and says so at exit 1; anything else is an error at exit 1.
+# the code psmux always ran; `shared` enters src/server/shared, which since
+# step 2 runs the shared server (tests\test_issue798_shared_server.ps1) and
+# never a per session server or the warm standby; anything else is an error at
+# exit 1.
 #
 # Part 1 proves the default path is untouched: the same scenario (new-session,
 # new-window, ls, list-windows, kill-session, registry files, server processes
@@ -138,21 +140,20 @@ try {
         Check ($b -eq $sigs['<unset>']) "the signature equals the baseline binary's" ("`nbaseline:`n$b")
     }
 
-    Head "Part 2: shared starts no server and says why"
+    Head "Part 2: shared never runs the per session server (step 2: it runs the shared one)"
     $ctx = New-Ns "sh"
     $r = Run $PSMUX $ctx 'shared' @('new-session', '-d', '-s', 'A')
-    Check ($r.Code -eq 1) "new-session under shared exits 1" "(got $($r.Code))"
-    Check ($r.Out -match 'shared server mode is not available in this build yet \(step 1 of #798\)') "new-session under shared names the reason" $r.Out
-    $r = Run $PSMUX $ctx ' SHARED ' @('new-session', '-d', '-s', 'A')
-    Check ($r.Code -eq 1 -and $r.Out -match 'not available') "case and spaces are ignored (' SHARED ')" $r.Out
+    Check ($r.Code -eq 0) "new-session under shared exits 0 (step 2)" "($($r.Code)) $($r.Out)"
+    $r = Run $PSMUX $ctx ' SHARED ' @('new-session', '-d', '-s', 'A2')
+    Check ($r.Code -eq 0) "case and spaces are ignored (' SHARED ')" $r.Out
     $r = Run $PSMUX $ctx 'shared' @('new', '-d')
-    Check ($r.Code -eq 1) "the new alias is gated too"
+    Check ($r.Code -eq 0) "the new alias is gated too"
     $r = Run $PSMUX $ctx 'shared' @('start-server')
-    Check ($r.Code -eq 1 -and $r.Out -match 'not available') "start-server under shared exits 1" $r.Out
+    Check ($r.Code -eq 0) "start-server under shared finds the shared server" $r.Out
     $env:PSMUX_DATA_DIR = $ctx.Dir; $env:PSMUX_SERVER_MODE = 'shared'
     $cc = ('' | & $PSMUX -L $ctx.Ns -CC 2>&1 | Out-String).Trim(); $ccCode = $LASTEXITCODE
     Remove-Item Env:PSMUX_SERVER_MODE
-    Check ($ccCode -eq 1 -and $cc -match 'not available') "bare -CC (control mode start) under shared exits 1" "($ccCode) $cc"
+    Check ($ccCode -eq 1 -and $cc -match 'not supported by the shared server yet') "bare -CC (control mode start) under shared exits 1" "($ccCode) $cc"
     $env:PSMUX_SERVER_MODE = 'shared'
     $srv = Start-Process -FilePath $PSMUX -ArgumentList @('server', '-s', 'X', '-L', $ctx.Ns) -WindowStyle Hidden -PassThru
     Remove-Item Env:PSMUX_SERVER_MODE
@@ -160,13 +161,15 @@ try {
     # stop only the process this step started.
     $exited = $srv.WaitForExit(10000)
     if (-not $exited) { Stop-Process -Id $srv.Id -Force -EA SilentlyContinue; $srv.WaitForExit(3000) | Out-Null }
-    Check ($exited -and $srv.ExitCode -eq 1) "the internal server process refuses shared too" "(exited=$exited code=$($srv.ExitCode))"
+    Check ($exited -and $srv.ExitCode -eq 1) "the internal per session server process refuses shared" "(exited=$exited code=$($srv.ExitCode))"
     Start-Sleep -Milliseconds 300
-    Check ((Proc-Summary $PSMUX $ctx.Ns) -eq '') "no server process exists in the namespace" (Proc-Summary $PSMUX $ctx.Ns)
+    $procs = @(Server-Procs $PSMUX $ctx.Ns)
+    Check ($procs.Count -eq 1 -and $procs[0].CommandLine -match '--shared-server') "the namespace has exactly one server, the shared one, and no standby" (($procs | ForEach-Object { $_.CommandLine }) -join ' | ')
     $reg = Registry $ctx
-    Check ($reg -notmatch '\.port|\.key|\.pid|\.sid') "no registry file was written" $reg
-    $r = Run $PSMUX $ctx '<unset>' @('ls')
-    Check ($r.Code -eq 1 -and $r.Out -match 'no server running') "ls afterwards: no server running" $r.Out
+    Check ($reg -notmatch '<ns>__X\.' -and $reg -notmatch '__warm__') "no registry file for the refused X or a standby" $reg
+    $r = Run $PSMUX $ctx '<unset>' @('ls', '-F', '#{session_name}')
+    Check ($r.Code -eq 0 -and (($r.Out -split "`n" | Sort-Object) -join ',') -eq '0,A,A2') "ls lists the shared server's sessions" $r.Out
+    Stop-Ns $PSMUX $ctx
 
     Head "Part 3: an unknown value is an error, never a fallback"
     $ctx = New-Ns "bg"
@@ -185,8 +188,9 @@ try {
     $cfgPer = Join-Path $ROOT "per.conf"; Set-Content $cfgPer "set -g default-shell $POWERSHELL`nset -s server-mode per-session" -Encoding ASCII
     $ctx = New-Ns "cf"
     $env:PSMUX_CONFIG_FILE = $cfgShared
-    $r = Run $PSMUX $ctx '<unset>' @('new-session', '-d', '-s', 'A')
-    Check ($r.Code -eq 1 -and $r.Out -match 'not available') "config server-mode shared: new-session exits 1" $r.Out
+    $r = Run $PSMUX $ctx '<unset>' @('new-session', '-d', '-s', 'S')
+    $sharedProcs = @(Server-Procs $PSMUX $ctx.Ns | Where-Object { $_.CommandLine -match '--shared-server' })
+    Check ($r.Code -eq 0 -and $sharedProcs.Count -eq 1) "config server-mode shared: new-session starts the shared server" "($($r.Code)) $($r.Out)"
     $r = Run $PSMUX $ctx 'per-session' @('new-session', '-d', '-s', 'A')
     Check ($r.Code -eq 0) "PSMUX_SERVER_MODE=per-session outranks the config" "($($r.Code)) $($r.Out)"
     Stop-Ns $PSMUX $ctx
@@ -231,12 +235,13 @@ try {
     Check (($tcpOut -join '|') -match 'per-session') "TCP show-options -sv server-mode answers per-session" ($tcpOut -join '|')
     # A warm standby exists here (Part 1). A shared request must not claim it.
     $warmBefore = Wait-Warm $PSMUX $ctx
-    $before = Proc-Summary $PSMUX $ctx.Ns
+    $perSession = { @(Server-Procs $PSMUX $ctx.Ns | Where-Object { $_.CommandLine -notmatch '--shared-server' } | ForEach-Object { "$($_.ProcessId):$($_.CommandLine)" } | Sort-Object) -join ' | ' }
+    $before = & $perSession
     $r = Run $PSMUX $ctx 'shared' @('new-session', '-d', '-s', 'C')
     Start-Sleep -Milliseconds 300
-    $after = Proc-Summary $PSMUX $ctx.Ns
-    Check ($r.Code -eq 1 -and $before -eq $after) "shared new-session leaves the warm standby and sessions alone (warm=$warmBefore)" "before=$before after=$after"
-    $r = Run $PSMUX $ctx '<unset>' @('ls', '-F', '#{session_name}'); Check ($r.Out -eq 'A') "session list unchanged" $r.Out
+    $after = & $perSession
+    Check ($r.Code -eq 0 -and $before -eq $after) "shared new-session leaves the warm standby and the per session servers alone (warm=$warmBefore)" "before=$before after=$after"
+    $r = Run $PSMUX $ctx '<unset>' @('ls', '-F', '#{session_name}'); Check ((($r.Out -split "`n" | Sort-Object) -join ',') -eq 'A,C') "A is still per session; C was made by the shared server" $r.Out
     $r = Run $PSMUX $ctx 'shared' @('kill-session', '-t', 'A'); Check ($r.Code -eq 0) "commands that start no server still work under shared (kill-session)"
 
     Head "Part 6: starts a running server makes for the user honour the switch"
@@ -265,12 +270,18 @@ try {
         $t.Close(); return ($o -join '|')
     }
     $o = Tcp-Cmd $ctx "new-session -s T1"
-    Check ($o -match 'ERROR: shared server mode is not available') "TCP new-session (server spawn route) answers the error" $o
+    Check ($o -match 'ERROR: shared server mode cannot start a session from inside a per-session server') "TCP new-session (server spawn route) answers the error" $o
+    # The -d route hands the request to a `psmux new-session -d` CLI, which
+    # reads the switch itself: since step 2 it makes T2 in the namespace's
+    # SHARED server, never in a per session server or the standby.
     $o = Tcp-Cmd $ctx "new-session -d -s T2"
-    Check ($o -match 'ERROR: shared server mode is not available') "TCP new-session -d (CLI route) answers the error" $o
     Start-Sleep -Milliseconds 500
+    $t2pid = [int](((Get-Content (Join-Path $ctx.Dir "$($ctx.Ns)__T2.pid") -Raw -EA SilentlyContinue) -split ':')[0])
+    $t2proc = Server-Procs $PSMUX $ctx.Ns | Where-Object { $_.ProcessId -eq $t2pid }
+    Check ($t2proc -and $t2proc.CommandLine -match '--shared-server') "TCP new-session -d (CLI route) makes T2 in the shared server" "($o) pid=$t2pid"
     $r = Run $PSMUX $ctx '<unset>' @('ls', '-F', '#{session_name}')
-    Check ($r.Out -eq 'A') "no session was made by the TCP routes" $r.Out
+    Check ((($r.Out -split "`n" | Sort-Object) -join ',') -eq 'A,T2') "no per session server was made by the TCP routes (A, and T2 in the shared server)" $r.Out
+    Run $PSMUX $ctx '<unset>' @('kill-session', '-t', 'T2') | Out-Null
     Set-Content $cfgLive "set -g default-shell $POWERSHELL" -Encoding ASCII
     Run $PSMUX $ctx '<unset>' @('new-window', '-t', 'A') | Out-Null
     $ok = $false; for ($i = 0; $i -lt 50 -and -not $ok; $i++) { Start-Sleep -Milliseconds 100; $ok = ((Run $PSMUX $ctx '<unset>' @('ls', '-F', '#{session_name}')).Out -match 'K') }
