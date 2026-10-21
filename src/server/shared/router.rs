@@ -44,6 +44,14 @@ pub const SUPPORTED: &[&str] = &[
     "has-session",
     "kill-session", "kill-ses",
     "kill-server",
+    // options, environment, hooks and key bindings (see `is_global_write`)
+    "set-option", "set", "set-window-option", "setw",
+    "show-options", "show", "show-window-options", "showw",
+    "set-environment", "setenv",
+    "show-environment", "showenv",
+    "set-hook", "show-hooks",
+    "bind-key", "bind", "unbind-key", "unbind",
+    "list-keys", "lsk",
     // the attach handshake
     "client-attach", "client-detach", "client-size", "client-flags",
     "client-environ", "client-last-session", "host-colors",
@@ -68,6 +76,117 @@ pub fn first_unsupported(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The flag letters of a command's leading options, values skipped.
+fn flag_letters(words: &[String], value_flags: &[char]) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        if w == "--" || !w.starts_with('-') || w.len() < 2 {
+            break;
+        }
+        let chars: Vec<char> = w[1..].chars().collect();
+        for (j, c) in chars.iter().enumerate() {
+            out.push(*c);
+            if value_flags.contains(c) {
+                if j + 1 == chars.len() {
+                    i += 1; // the value is the next word
+                }
+                break; // or the rest of this word
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// True when one command (no `;` list) writes tmux's SERVER WIDE state: a
+/// global or server option (`set -g`, `set -s`, `setw -g`), a global hook
+/// (`set-hook -g`), the global environment (`setenv -g`), or a key binding
+/// (key tables are server wide in tmux, key-bindings.c). tmux keeps one copy
+/// of each for the whole server; the step 2 shared server keeps one per
+/// session (each session is a full per session `AppState`), so it applies such
+/// a write to every session it holds and replays it on sessions created later.
+pub fn is_global_write(command: &str) -> bool {
+    let words = crate::commands::parse_command_line(command);
+    let Some((name, rest)) = words.split_first() else { return false };
+    match name.as_str() {
+        "set-option" | "set" => {
+            let f = flag_letters(rest, &['t']);
+            f.contains(&'g') || f.contains(&'s')
+        }
+        "set-window-option" | "setw" => flag_letters(rest, &['t']).contains(&'g'),
+        "set-hook" => flag_letters(rest, &['t']).contains(&'g'),
+        "set-environment" | "setenv" => flag_letters(rest, &['t']).contains(&'g'),
+        "bind-key" | "bind" | "unbind-key" | "unbind" => true,
+        _ => false,
+    }
+}
+
+/// The commands of a line that write server wide state (see
+/// `is_global_write`), in order, as they are applied to the OTHER sessions:
+/// without a `-t` target (a global write needs none, and a target naming a
+/// sibling session would make `execute_command_string` forward the command
+/// over TCP to that session's listener, which is served by the very loop
+/// thread waiting for the reply).
+pub fn global_writes(line: &str) -> Vec<String> {
+    crate::config::split_chained_commands_pub(line.trim())
+        .into_iter()
+        .filter(|p| is_global_write(p))
+        .map(|p| without_target(&p))
+        .collect()
+}
+
+/// A set-option / set-hook / set-environment command with its `-t TARGET`
+/// removed from the leading flags. Other commands come back unchanged.
+pub fn without_target(command: &str) -> String {
+    let words = crate::commands::parse_command_line(command);
+    let Some(name) = words.first() else { return command.to_string() };
+    if !matches!(
+        name.as_str(),
+        "set-option" | "set" | "set-window-option" | "setw" | "set-hook" | "set-environment" | "setenv"
+    ) {
+        return command.to_string();
+    }
+    let mut out: Vec<String> = vec![name.clone()];
+    let mut operands: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < words.len() {
+        let w = &words[i];
+        if w == "--" || !w.starts_with('-') || w.len() < 2 {
+            operands.extend(words[i..].iter().cloned());
+            break;
+        }
+        let chars: Vec<char> = w[1..].chars().collect();
+        let mut kept = String::from("-");
+        let mut skip_next = false;
+        for (j, c) in chars.iter().enumerate() {
+            if *c == 't' {
+                // The value is the rest of this word, or the next word.
+                skip_next = j + 1 == chars.len();
+                break;
+            }
+            kept.push(*c);
+        }
+        if kept.len() > 1 {
+            out.push(kept);
+        }
+        i += if skip_next { 2 } else { 1 };
+    }
+    // The command name and its flags as they were; every operand quoted, so
+    // spaces and quotes inside a value survive the second parse.
+    let mut text = out.join(" ");
+    for w in &operands {
+        text.push(' ');
+        if w == "--" {
+            text.push_str(w);
+        } else {
+            text.push_str(&crate::util::quote_arg(w));
+        }
+    }
+    text
 }
 
 /// How a connection opens: the second line after `AUTH`.

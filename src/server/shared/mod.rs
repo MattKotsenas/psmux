@@ -263,9 +263,39 @@ pub fn gate_server_process() {
     }
 }
 
-/// What `show -s server-mode` answers on a per session server: the mode it
-/// runs in, which is fixed for its life.
-pub const RUNNING_PER_SESSION: &str = "per-session";
+/// What `show -s server-mode` answers: the mode the running server is in,
+/// which is fixed for its life. The option code reads it as
+/// `RUNNING_PER_SESSION.into()`; on every per session server that is
+/// `per-session`, exactly as in step 1, and in the shared server (step 2),
+/// which reuses the same option code, it is `shared`.
+#[derive(Clone, Copy, Debug)]
+pub struct RunningMode;
+
+/// See [`RunningMode`]. The name is kept from step 1, where only per session
+/// servers existed, so the option code reading it is unchanged.
+pub const RUNNING_PER_SESSION: RunningMode = RunningMode;
+
+impl RunningMode {
+    pub fn as_str(self) -> &'static str {
+        if server::in_shared_server() {
+            ServerMode::Shared.as_str()
+        } else {
+            ServerMode::PerSession.as_str()
+        }
+    }
+}
+
+impl From<RunningMode> for String {
+    fn from(m: RunningMode) -> String {
+        m.as_str().to_string()
+    }
+}
+
+impl PartialEq<&str> for RunningMode {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 /// `set server-mode VALUE` on a running per session server. The mode is
 /// chosen when a server starts and a running server cannot change it, but the
@@ -277,6 +307,19 @@ pub const RUNNING_PER_SESSION: &str = "per-session";
 /// never reaches here (the option has no catalog default,
 /// so `set -u` has nothing to apply) and leaves the mode as it is.
 pub fn set_on_running_per_session_server(value: &str) -> Result<(), String> {
+    if server::in_shared_server() {
+        // The same rule on the shared server, which reuses this option code:
+        // naming the mode it runs in is a no op, the other mode is refused.
+        return match parse_value(value) {
+            Ok(Some(ServerMode::Shared)) => Ok(()),
+            Ok(Some(ServerMode::PerSession)) => Err(format!(
+                "{} cannot change on a running server: this server runs shared; \
+                 set {} or {} before the server starts",
+                OPTION, ENV_VAR, OPTION
+            )),
+            _ => Err(format!("unknown value: {}", value.trim())),
+        };
+    }
     match parse_value(value) {
         Ok(Some(ServerMode::PerSession)) => Ok(()),
         Ok(None) => Err(format!("unknown value: {}", value.trim())),
@@ -292,3 +335,7 @@ pub fn set_on_running_per_session_server(value: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "../../../tests-rs/test_issue798_server_mode_switch.rs"]
 mod tests_issue798_server_mode_switch;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue798_shared_server.rs"]
+mod tests_issue798_shared_server;

@@ -69,15 +69,22 @@ pub(crate) struct SessionLoop {
     /// its pushed frames.
     pub clients: HashSet<u64>,
     pub last_push: Instant,
+    /// The session's command aliases, shared with its connection threads
+    /// (run_server's `shared_aliases_main`).
+    pub aliases: Aliases,
     last_alert_check: Instant,
     last_reap: Instant,
     last_registry_check: Instant,
 }
 
+type Aliases = Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>;
+
+
 impl SessionLoop {
-    fn new() -> Self {
+    fn new(aliases: Aliases) -> Self {
         let now = Instant::now();
         SessionLoop {
+            aliases,
             state_dirty: true,
             meta_dirty: true,
             echo_pending_until: None,
@@ -115,6 +122,51 @@ enum Msg {
     Req(usize, CtrlReq),
     Wake,
     Control(ControlCmd, mpsc::Sender<Outcome>),
+}
+
+/// How a connection thread reaches another session of the server: for
+/// applying a server wide write (`router::is_global_write`) to every session.
+#[derive(Clone)]
+struct Peer {
+    sid: usize,
+    port: u16,
+    key: String,
+}
+
+/// What every session's connection threads share about the server.
+#[derive(Default)]
+struct Globals {
+    peers: std::sync::RwLock<Vec<Peer>>,
+    /// Server wide writes so far, replayed on every session created later.
+    replay: std::sync::Mutex<Vec<String>>,
+    /// Writes this server itself is delivering to a session (a propagation,
+    /// a replay, or `execute_command_string` handing a `set` to its own
+    /// listener): that session must run them, not propagate them again.
+    /// Entries older than ECHO_TTL are dropped.
+    echoes: std::sync::Mutex<Vec<(usize, String, Instant)>>,
+}
+
+const ECHO_TTL: Duration = Duration::from_secs(10);
+
+impl Globals {
+    fn expect_echo(&self, sid: usize, line: &str) {
+        if let Ok(mut e) = self.echoes.lock() {
+            e.retain(|(_, _, at)| at.elapsed() < ECHO_TTL);
+            e.push((sid, line.trim().to_string(), Instant::now()));
+        }
+    }
+
+    fn take_echo(&self, sid: usize, line: &str) -> bool {
+        let Ok(mut e) = self.echoes.lock() else { return false };
+        e.retain(|(_, _, at)| at.elapsed() < ECHO_TTL);
+        match e.iter().position(|(s, l, _)| *s == sid && l == line.trim()) {
+            Some(i) => {
+                e.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// `psmux server --shared-server [-L ns]`. Never returns.
@@ -247,6 +299,7 @@ fn run(ns: Option<String>) -> ! {
     }
 
     let pty_system = native_pty_system();
+    let globals: Arc<Globals> = Arc::new(Globals::default());
     let mut ids = ServerIds::new();
     let mut sessions: BTreeMap<usize, Session> = BTreeMap::new();
     let mut had_session = false;
@@ -320,7 +373,7 @@ fn run(ns: Option<String>) -> ! {
                     let outcome = match cmd {
                         ControlCmd::Ping => Outcome::Done(String::new()),
                         ControlCmd::NewSession(args) => {
-                            match create_session(&args, &mut ids, &ns, &msg_tx, &*pty_system) {
+                            match create_session(&args, &mut ids, &ns, &msg_tx, &*pty_system, &globals) {
                                 Ok(s) => {
                                     let sid = s.app.session_id;
                                     let text = new_session_output(&s.app, &args);
@@ -351,6 +404,9 @@ fn run(ns: Option<String>) -> ! {
         }
         for (sid, _why) in ended {
             if let Some(s) = sessions.remove(&sid) {
+                if let Ok(mut p) = globals.peers.write() {
+                    p.retain(|p| p.sid != sid);
+                }
                 end_session(s, sessions.is_empty(), pid);
             }
         }
@@ -577,6 +633,7 @@ fn create_session(
     ns: &Option<String>,
     msg_tx: &mpsc::Sender<Msg>,
     pty_system: &dyn portable_pty::PtySystem,
+    globals: &Arc<Globals>,
 ) -> Result<Session, String> {
     let name = match args.name.as_deref().filter(|n| !n.is_empty()) {
         Some(n) => n.to_string(),
@@ -655,14 +712,14 @@ fn create_session(
             }
         });
     }
-    let aliases: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> =
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let aliases: Aliases = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
         let tx = tx.clone();
         let key = session_key.clone();
         let aliases = aliases.clone();
+        let globals = globals.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 if stop.load(Ordering::Acquire) {
@@ -673,7 +730,10 @@ fn create_session(
                 let tx = tx.clone();
                 let key = key.clone();
                 let aliases = aliases.clone();
-                thread::spawn(move || serve_session_connection(stream, tx, &key, aliases));
+                let globals = globals.clone();
+                thread::spawn(move || {
+                    serve_session_connection(stream, tx, &key, aliases, sid, &globals)
+                });
             }
         });
     }
@@ -694,6 +754,15 @@ fn create_session(
         {
             let patterns = app.update_environment.clone();
             crate::environ::seed_session_from_start_env(&mut app.environment, &mut app.env_scopes, &patterns);
+        }
+        // The server wide writes made so far (set -g, setenv -g, set-hook -g,
+        // bind): tmux keeps them once per server, so a new session sees them.
+        let replay: Vec<String> = globals.replay.lock().map(|r| r.clone()).unwrap_or_default();
+        for w in &replay {
+            // execute_command_string applies it and also hands it to this
+            // session's own listener: that delivery is not a new write.
+            globals.expect_echo(sid, w);
+            let _ = execute_command_string(&mut app, w);
         }
         // No spare panes in step 2 (the refill channel is never set).
         app.warm_pane.target = 0;
@@ -721,7 +790,10 @@ fn create_session(
         tree::kill_all_children_batch(&mut app.windows);
         return Err(msg);
     }
-    Ok(Session { app, lp: SessionLoop::new(), cwd, port, stop, _guard: guard })
+    if let Ok(mut p) = globals.peers.write() {
+        p.push(Peer { sid, port, key: session_key });
+    }
+    Ok(Session { app, lp: SessionLoop::new(aliases), cwd, port, stop, _guard: guard })
 }
 
 /// End one session: its registry files first (so nothing new reaches it),
@@ -789,7 +861,9 @@ fn serve_session_connection(
     stream: std::net::TcpStream,
     tx: mpsc::Sender<CtrlReq>,
     key: &str,
-    aliases: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    aliases: Aliases,
+    sid: usize,
+    globals: &Globals,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let mut buf = vec![0u8; 16 * 1024];
@@ -813,7 +887,11 @@ fn serve_session_connection(
     }
     let refusal = match router::parse_opening(&buf[..n]) {
         router::Opening::Command { key: k, line, lines } if k == key => {
-            router::first_unsupported(&line).map(|name| (Outcome::Unsupported(name), lines))
+            let refused = router::first_unsupported(&line).map(|name| (Outcome::Unsupported(name), lines));
+            if refused.is_none() {
+                apply_global_writes(&line, sid, globals);
+            }
+            refused
         }
         router::Opening::Control { key: k } if k == key => {
             Some((Outcome::Unsupported("control-mode".to_string()), 2))
@@ -823,6 +901,51 @@ fn serve_session_connection(
     match refusal {
         Some((outcome, lines)) => refuse(stream, &outcome, lines),
         None => connection::handle_connection(stream, tx, key, aliases),
+    }
+}
+
+/// A server wide write (`router::is_global_write`) arriving on one session's
+/// listener is delivered first to every OTHER session of the server, through
+/// their own listeners exactly as a client would send it (so each runs the
+/// per session handler), and remembered for sessions created later; then the
+/// connection goes on to run it on its own session as usual, so its reply is
+/// the per session one. Runs on the connection thread, never on the loop, so
+/// the loop is free to serve the deliveries. A delivery this server makes is
+/// registered as an echo and is not propagated again.
+fn apply_global_writes(line: &str, sid: usize, globals: &Globals) {
+    if globals.take_echo(sid, line) {
+        return;
+    }
+    let writes = router::global_writes(line);
+    if writes.is_empty() {
+        return;
+    }
+    if let Ok(mut r) = globals.replay.lock() {
+        r.extend(writes.iter().cloned());
+    }
+    let others: Vec<Peer> = globals
+        .peers
+        .read()
+        .map(|p| p.iter().filter(|p| p.sid != sid).cloned().collect())
+        .unwrap_or_default();
+    for p in others {
+        for w in &writes {
+            globals.expect_echo(p.sid, w);
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p.port));
+            let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+                continue;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = write!(s, "AUTH {}\n{}\n", p.key, w);
+            let _ = s.flush();
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let mut sink = [0u8; 4096];
+            while let Ok(k) = io::Read::read(&mut s, &mut sink) {
+                if k == 0 {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -916,3 +1039,7 @@ fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>) 
     let _ = w.flush();
     let _ = w.shutdown(std::net::Shutdown::Write);
 }
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue798_shared_server_requests.rs"]
+mod tests_issue798_shared_server_requests;

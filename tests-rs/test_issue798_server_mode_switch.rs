@@ -89,7 +89,9 @@ fn running_per_session_server_only_accepts_its_own_mode() {
     assert!(err.contains("cannot change on a running server"), "{err}");
     assert!(set_on_running_per_session_server("bogus").unwrap_err().contains("unknown value"));
     assert!(set_on_running_per_session_server("").is_err());
+    // Not the shared server process, so the running mode reads per-session.
     assert_eq!(RUNNING_PER_SESSION, ServerMode::PerSession.as_str());
+    assert_eq!(String::from(RUNNING_PER_SESSION), "per-session");
 }
 
 #[test]

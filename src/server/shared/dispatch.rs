@@ -33,6 +33,7 @@ pub(crate) fn dispatch(
     let mut meta_dirty = lp.meta_dirty;
     let mut echo_pending_until = lp.echo_pending_until;
     let mut temp_focus_restore = lp.temp_focus_restore.take();
+    let shared_aliases_main = lp.aliases.clone();
     #[allow(clippy::never_loop)]
     for req in std::iter::once(req) {
         temp_target::restore_temp_focus(app, &mut temp_focus_restore);
@@ -1627,6 +1628,538 @@ pub(crate) fn dispatch(
                     }
                     meta_dirty = true;
                     hook_event = Some("after-select-window");
+                }
+                // copied from server/mod.rs run_server (line 7997 at 0145958f)
+                CtrlReq::ScopeSessionListing(resp, text, global, mark_inherited) => {
+                    let _ = resp.send(crate::server::options::scope_session_listing(&app, &text, global, mark_inherited));
+                }
+                // copied from server/mod.rs run_server (line 7994 at 0145958f)
+                CtrlReq::SessionOptionQuery(resp, name, global) => {
+                    let _ = resp.send(crate::server::options::session_option_query(&app, &name, global));
+                }
+                // copied from server/mod.rs run_server (line 6109 at 0145958f)
+                CtrlReq::SetOption(option, value) => {
+                    if apply_set_option(&mut app, &option, &value, false).is_ok() {
+                        app.user_set_options.insert(option.clone());
+                        // Reconcile the warm pane with the new option value.
+                        // All option-driven warm-pane lifecycle decisions
+                        // route through this single module, see #271.
+                        let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                        crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                        // Update shared aliases if command-alias changed
+                        if option == "command-alias" {
+                            if let Ok(mut map) = shared_aliases_main.write() {
+                                *map = app.command_aliases.clone();
+                            }
+                        }
+                        // pane-border-status changes the effective content height (#288)
+                        if option == "pane-border-status" {
+                            resize_all_panes(&mut app);
+                        }
+                        if option == "window-size" && crate::resize_window::refresh_dynamic_window_sizes(&mut app) {
+                            resize_all_panes(&mut app);
+                        }
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
+                }
+                // copied from server/mod.rs run_server (line 6199 at 0145958f)
+                CtrlReq::SetOptionAppend(option, value) => {
+                    // Append to existing option value
+                    if option.starts_with('@') {
+                        let existing = app.user_options.get(&option).cloned().unwrap_or_default();
+                        app.user_options.insert(option, format!("{}{}", existing, value));
+                    } else {
+                        match option.as_str() {
+                            // ARRAY option: `-a` appends an item (see the
+                            // sibling arm in the main request loop).
+                            "codepoint-widths" => {
+                                crate::server::options::append_codepoint_widths(&mut app, &value);
+                            }
+                            "terminal-overrides" => {
+                                app.terminal_overrides
+                                    .extend(crate::terminal_overrides::split_array(&value));
+                            }
+                            "status-left" => { app.status_left.push_str(&value); }
+                            "status-right" => { app.status_right.push_str(&value); }
+                            "status-style" => { app.status_style.push_str(&value); }
+                            "pane-border-style" => { app.pane_border_style.push_str(&value); }
+                            "pane-active-border-style" => { app.pane_active_border_style.push_str(&value); }
+                            "pane-border-hover-style" => { app.pane_border_hover_style.push_str(&value); }
+                            "window-style" | "window-active-style" => {
+                                app.user_options
+                                    .entry(option.clone())
+                                    .or_default()
+                                    .push_str(&value);
+                                app.user_set_options.insert(option.clone());
+                                state_dirty = true;
+                            }
+                            "window-status-format" => { app.window_status_format.push_str(&value); }
+                            "window-status-current-format" => { app.window_status_current_format.push_str(&value); }
+                            _ => {}
+                        }
+                    }
+                }
+                // copied from server/mod.rs run_server (line 6247 at 0145958f)
+                CtrlReq::SetOptionOnlyIfUnset(option, value, resp) => {
+                    let already_set = if option.starts_with('@') {
+                        app.user_options.contains_key(&option)
+                    } else {
+                        app.user_set_options.contains(&option)
+                    };
+                    if already_set {
+                        // tmux does not merely skip the write, it FAILS:
+                        // cmd-set-option.c prints `already set: <name>` through
+                        // cmdq_error and returns CMD_RETURN_ERROR unless -q.
+                        // psmux swallowed the refusal on every route, so `-o`
+                        // could not answer the only question it exists to ask
+                        // (#619 follow up). A -q caller passes no channel and
+                        // still gets the silent exit 0 tmux gives it.
+                        if let Some(r) = resp {
+                            let _ = r.send(format!("ERROR: already set: {}", option));
+                        }
+                    } else {
+                        if apply_set_option(&mut app, &option, &value, false).is_ok() {
+                            app.user_set_options.insert(option.clone());
+                            if option == "command-alias" {
+                                if let Ok(mut map) = shared_aliases_main.write() {
+                                    *map = app.command_aliases.clone();
+                                }
+                            }
+                            meta_dirty = true;
+                            state_dirty = true;
+                            if let Some(r) = resp {
+                                let _ = r.send(String::new());
+                            }
+                        }
+                    }
+                }
+                // copied from server/mod.rs run_server (line 6145 at 0145958f)
+                CtrlReq::SetOptionQuiet(option, value, quiet) => {
+                    if apply_set_option(&mut app, &option, &value, quiet).is_ok() {
+                        app.user_set_options.insert(option.clone());
+                        // Reconcile the warm pane with the new option value.
+                        // Replaces the prior inline default-shell-only kill
+                        // (#99) with a uniform table-driven policy that
+                        // also covers history-limit (#271), allow-predictions,
+                        // default-terminal, and claude-code-* options.
+                        let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                        crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                        // Update shared aliases if command-alias changed
+                        if option == "command-alias" {
+                            if let Ok(mut map) = shared_aliases_main.write() {
+                                *map = app.command_aliases.clone();
+                            }
+                        }
+                        // pane-border-status changes the effective content height (#288)
+                        if option == "pane-border-status" {
+                            resize_all_panes(&mut app);
+                        }
+                        if option == "window-size" && crate::resize_window::refresh_dynamic_window_sizes(&mut app) {
+                            resize_all_panes(&mut app);
+                        }
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
+                }
+                // copied from server/mod.rs run_server (line 6235 at 0145958f)
+                CtrlReq::SetOptionToggle(option) => {
+                    // `set -g <bool-option>` with no value flips it (#535).
+                    // Only the server knows the current value, so the flip has
+                    // to happen here rather than client-side.
+                    if crate::server::options::toggle_option(&mut app, &option) {
+                        app.user_set_options.insert(option.clone());
+                        let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                        crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
+                }
+                // copied from server/mod.rs run_server (line 6172 at 0145958f)
+                CtrlReq::SetOptionUnset(option) => {
+                    // Restore the table default, or remove an @user-option.
+                    //
+                    // This arm used to carry a hand written restore table of
+                    // about thirty options with a `_ => {}` catch all, so an
+                    // option it had never heard of kept its value: `set -s
+                    // default-terminal xterm-256color` then `set -su
+                    // default-terminal` still read xterm-256color, and every
+                    // -u on status-left restored `psmux:#I` where a fresh
+                    // server reports `[#S] `. The one restore table now lives
+                    // in OPTION_CATALOG, which
+                    // tests-rs/test_option_default_parity.rs already pins to a
+                    // freshly constructed AppState (#619 follow up).
+                    crate::server::options::reset_option_to_default(&mut app, &option);
+                    // The value moved, so reconcile the warm pane the same way
+                    // a plain set does (default-shell, history-limit and the
+                    // claude-code-* options all matter here).
+                    let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    if option == "command-alias" {
+                        if let Ok(mut map) = shared_aliases_main.write() {
+                            *map = app.command_aliases.clone();
+                        }
+                    }
+                    meta_dirty = true;
+                    state_dirty = true;
+                }
+                // copied from server/mod.rs run_server (line 5979 at 0145958f)
+                CtrlReq::SetPaneOption {
+                    target,
+                    option,
+                    value,
+                    unset,
+                    append,
+                    only_if_unset,
+                    quiet,
+                    resp,
+                } => {
+                    // #613 `@mouse-force`, #580 `remain-on-exit` and every
+                    // `@name` user option (#728) share one writer with the
+                    // command prompt and config routes.
+                    let reply = crate::server::options::apply_set_pane_option(
+                        &mut app, &target, &option, &value, unset, append, only_if_unset, quiet,
+                    );
+                    if reply.is_empty() {
+                        // A user option can feed the status line or a border
+                        // format, so a write must reach attached clients.
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(reply);
+                }
+                // copied from server/mod.rs run_server (line 7982 at 0145958f)
+                CtrlReq::SetSessionOption { option, value, unset, append, only_if_unset, quiet, resp } => {
+                    let reply = crate::server::options::apply_set_session_option(
+                        &mut app, &option, &value, unset, append, only_if_unset, quiet,
+                    );
+                    // The value the session uses may have moved, so reconcile
+                    // the warm pane and redraw, as the global setter does.
+                    let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    meta_dirty = true;
+                    state_dirty = true;
+                    let _ = resp.send(reply);
+                }
+                // copied from server/mod.rs run_server (line 8000 at 0145958f)
+                CtrlReq::SetWindowOption { target, option, value, unset, append, only_if_unset, quiet, resp } => {
+                    let reply = crate::server::options::apply_set_window_option(
+                        &mut app, &target, &option, &value, unset, append, only_if_unset, quiet,
+                    );
+                    // A window option can change what the status bar and the
+                    // layout draw (window-status-*, main-pane-*), so the frame
+                    // has to be rebuilt, not just the value stored.
+                    meta_dirty = true;
+                    state_dirty = true;
+                    let _ = resp.send(reply);
+                }
+                // copied from server/mod.rs run_server (line 7971 at 0145958f)
+                CtrlReq::ShowOptionValue(resp, name) => {
+                    let val = get_option_value(&app, &name);
+                    let _ = resp.send(val);
+                }
+                // copied from server/mod.rs run_server (line 6280 at 0145958f)
+                CtrlReq::ShowOptions(resp) => {
+                    let mut output = String::new();
+                    output.push_str(&format!("prefix {}\n", crate::config::format_option_key(&app.prefix_key)));
+                    if let Some(ref p2) = app.prefix2_key {
+                        output.push_str(&format!("prefix2 {}\n", format_key_binding(p2)));
+                    }
+                    output.push_str(&format!("base-index {}\n", app.window_base_index));
+                    output.push_str(&format!("pane-base-index {}\n", app.pane_base_index));
+                    output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
+                    output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
+                    output.push_str(&format!("scroll-enter-copy-mode {}\n", if app.scroll_enter_copy_mode { "on" } else { "off" }));
+                    output.push_str(&format!("mouse-drag-enter-copy-mode {}\n", if app.mouse_drag_enter_copy_mode { "on" } else { "off" }));
+                    output.push_str(&format!("ctrl-wheel-zoom {}\n", if app.ctrl_wheel_zoom { "on" } else { "off" }));
+                    output.push_str(&format!("pwsh-mouse-selection {}\n", if app.pwsh_mouse_selection { "on" } else { "off" }));
+                    output.push_str(&format!("mouse-selection {}\n", if app.mouse_selection { "on" } else { "off" }));
+                    output.push_str(&format!("mouse-selection-force {}\n", if app.mouse_selection_force { "on" } else { "off" }));
+                    output.push_str(&format!("paste-detection {}\n", if app.paste_detection { "on" } else { "off" }));
+                    output.push_str(&format!("choose-tree-preview {}\n", if app.choose_tree_preview { "on" } else { "off" }));
+                    output.push_str(&format!("status {}\n", if app.status_visible { "on" } else { "off" }));
+                    output.push_str(&format!("status-position {}\n", app.status_position));
+                    output.push_str(&format!("status-left \"{}\"\n", app.status_left));
+                    output.push_str(&format!("status-right \"{}\"\n", app.status_right));
+                    output.push_str(&format!("history-limit {}\n", app.history_limit));
+                    output.push_str(&format!("display-time {}\n", app.display_time_ms));
+                    output.push_str(&format!("display-panes-time {}\n", app.display_panes_time_ms));
+                    // #606: repeat-time answered `show-options -g repeat-time`
+                    // but was missing from this full dump, so the obvious way
+                    // to check it (`show-options -g | findstr repeat`) said the
+                    // option did not exist. Same shape as #559 for
+                    // monitor-silence.
+                    output.push_str(&format!("repeat-time {}\n", app.repeat_time_ms));
+                    // #608: this dump is hand written, so a new option is
+                    // invisible to a bare `show-options -g` unless it is listed
+                    // here as well as in get_option_value. Same trap as #606.
+                    output.push_str(&format!("priority {}\n", app.priority));
+                    output.push_str(&format!("mode-keys {}\n", app.mode_keys));
+                    output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
+                    output.push_str(&format!("program-status {}\n", if app.program_status { "on" } else { "off" }));
+                    output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
+                    output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
+                    output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
+                    // #559: monitor-silence was queryable one-by-one but absent
+                    // from this full dump, so `show-options -g | grep monitor`
+                    // looked like the option had been silently dropped.
+                    output.push_str(&format!("monitor-silence {}\n", app.monitor_silence));
+                    output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
+                    output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
+                    output.push_str(&format!("destroy-unattached {}\n", if app.destroy_unattached { "on" } else { "off" }));
+                    output.push_str(&format!("exit-empty {}\n", if app.exit_empty { "on" } else { "off" }));
+                    output.push_str(&format!("set-titles {}\n", if app.set_titles { "on" } else { "off" }));
+                    if !app.set_titles_string.is_empty() {
+                        output.push_str(&format!("set-titles-string \"{}\"\n", app.set_titles_string));
+                    }
+                    output.push_str(&format!(
+                        "prediction-dimming {}\n",
+                        if app.prediction_dimming { "on" } else { "off" }
+                    ));
+                    output.push_str(&format!("allow-predictions {}\n", if app.allow_predictions { "on" } else { "off" }));
+                    output.push_str(&format!("cursor-style {}\n", std::env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "default".to_string())));
+                    output.push_str(&format!("cursor-blink {}\n", if crate::rendering::cursor_blink_option()
+                        .unwrap_or(crate::rendering::CURSOR_BLINK_DEFAULT_BLINKS) { "on" } else { "off" }));
+                    {
+                        let shell_val = if app.default_shell.is_empty() {
+                            crate::pane::cached_shell().unwrap_or("pwsh.exe").to_string()
+                        } else {
+                            app.default_shell.clone()
+                        };
+                        output.push_str(&format!("default-shell {}\n", shell_val));
+                    }
+                    // Quoted the way tmux shows it: the default holds `"` and
+                    // `\`, which go escaped inside the quotes (#862).
+                    output.push_str(&format!("word-separators {}\n",
+                        crate::util::quote_arg_if_needed(&app.word_separators)));
+                    // tmux lists key-table with its root default; the value
+                    // itself lives in user_options, skipped in the loop below.
+                    output.push_str(&format!("key-table {}\n",
+                        crate::util::quote_arg_if_needed(helpers::default_key_table(&app))));
+                    if !app.pane_border_style.is_empty() {
+                        output.push_str(&format!("pane-border-style \"{}\"\n", app.pane_border_style));
+                    }
+                    if !app.pane_active_border_style.is_empty() {
+                        output.push_str(&format!("pane-active-border-style \"{}\"\n", app.pane_active_border_style));
+                    }
+                    if !app.pane_border_hover_style.is_empty() {
+                        output.push_str(&format!("pane-border-hover-style \"{}\"\n", app.pane_border_hover_style));
+                    }
+                    if !app.status_style.is_empty() {
+                        output.push_str(&format!("status-style \"{}\"\n", app.status_style));
+                    }
+                    if !app.status_left_style.is_empty() {
+                        output.push_str(&format!("status-left-style \"{}\"\n", app.status_left_style));
+                    }
+                    if !app.status_right_style.is_empty() {
+                        output.push_str(&format!("status-right-style \"{}\"\n", app.status_right_style));
+                    }
+                    output.push_str(&format!("status-interval {}\n", app.status_interval));
+                    output.push_str(&format!("status-justify {}\n", app.status_justify));
+                    output.push_str(&format!("window-status-format \"{}\"\n", app.window_status_format));
+                    output.push_str(&format!("window-status-current-format \"{}\"\n", app.window_status_current_format));
+                    if !app.window_status_style.is_empty() {
+                        output.push_str(&format!("window-status-style \"{}\"\n", app.window_status_style));
+                    }
+                    if !app.window_status_current_style.is_empty() {
+                        output.push_str(&format!("window-status-current-style \"{}\"\n", app.window_status_current_style));
+                    }
+                    if !app.window_status_activity_style.is_empty() {
+                        output.push_str(&format!("window-status-activity-style \"{}\"\n", app.window_status_activity_style));
+                    }
+                    if !app.message_style.is_empty() {
+                        output.push_str(&format!("message-style \"{}\"\n", app.message_style));
+                    }
+                    if !app.message_command_style.is_empty() {
+                        output.push_str(&format!("message-command-style \"{}\"\n", app.message_command_style));
+                    }
+                    if !app.mode_style.is_empty() {
+                        output.push_str(&format!("mode-style \"{}\"\n", app.mode_style));
+                    }
+                    // Include @user-options (used by plugins)
+                    for (key, val) in &app.user_options {
+                        if key == "key-table" { continue; }
+                        output.push_str(&format!("{} \"{}\"\n", key, val));
+                    }
+                    // New options
+                    output.push_str(&format!("main-pane-width {}\n", app.main_pane_width));
+                    output.push_str(&format!("main-pane-height {}\n", app.main_pane_height));
+                    output.push_str(&format!("status-left-length {}\n", app.status_left_length));
+                    output.push_str(&format!("status-right-length {}\n", app.status_right_length));
+                    output.push_str(&format!("window-size {}\n", app.window_size));
+                    output.push_str(&format!("allow-passthrough {}\n", app.allow_passthrough));
+                    output.push_str(&format!("set-clipboard {}\n", app.set_clipboard));
+                    if !app.copy_command.is_empty() {
+                        output.push_str(&format!("copy-command \"{}\"\n", app.copy_command));
+                    }
+                    output.push_str(&format!("allow-rename {}\n", if app.allow_rename { "on" } else { "off" }));
+                    output.push_str(&format!("allow-set-title {}\n", if app.allow_set_title { "on" } else { "off" }));
+                    output.push_str(&format!("bell-action {}\n", app.bell_action));
+                    output.push_str(&format!("activity-action {}\n", app.activity_action));
+                    output.push_str(&format!("silence-action {}\n", app.silence_action));
+                    output.push_str(&format!("update-environment \"{}\"\n", app.update_environment.join(" ")));
+                    if let Some(ref group) = app.session_group {
+                        output.push_str(&format!("session-group \"{}\"\n", group));
+                    }
+                    for (alias, expansion) in &app.command_aliases {
+                        output.push_str(&format!("command-alias \"{}={}\"\n", alias, expansion));
+                    }
+                    let _ = resp.send(output);
+                }
+                // copied from server/mod.rs run_server (line 6003 at 0145958f)
+                CtrlReq::ShowPaneOptions(raw, resp) => {
+                    let pane = crate::server::options::resolve_option_target_pane(&mut app, &raw);
+                    let reply = match pane {
+                        None => format!("ERROR: can't find pane: {}", raw),
+                        Some(p) => {
+                            let mut keys: Vec<&String> = p.pane_options.keys().collect();
+                            keys.sort();
+                            keys.iter()
+                                .map(|k| format!("{} {}", k, p.pane_options[*k]))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    };
+                    let _ = resp.send(reply);
+                }
+                // copied from server/mod.rs run_server (line 7975 at 0145958f)
+                CtrlReq::ShowWindowOptionValue(resp, name, target) => {
+                    let val = crate::server::options::window_option_value_for_target(&app, &name, &target);
+                    let _ = resp.send(val);
+                }
+                // copied from server/mod.rs run_server (line 8014 at 0145958f)
+                CtrlReq::ShowWindowOptionsFor(resp, target, listing) => {
+                    let index = crate::server::options::resolve_option_target_window(&app, &target).ok();
+                    let _ = resp.send(crate::server::options::render_window_options_for(
+                        &app, index, listing,
+                    ));
+                }
+                // copied from server/mod.rs run_server (line 7979 at 0145958f)
+                CtrlReq::UserOptionLookup(resp, name, target, table) => {
+                    let _ = resp.send(crate::server::options::lookup_user_option(&app, &name, &target, table));
+                }
+                // copied from server/mod.rs run_server (line 7692 at 0145958f)
+                CtrlReq::SetEnvironment(args) => {
+                    // tmux global vs session scopes, removal markers and
+                    // hidden entries (#775); the process environment stays
+                    // equal to what a new child inherits.
+                    crate::environ::apply_set(&mut app.environment, &mut app.env_scopes, &args);
+                    // Env vars affect the child shell's process state,
+                    // which can't be patched in place — must respawn.
+                    // Centralised through warm_pane_sync (#137 / #271).
+                    let sync = crate::warm_pane_sync::for_env_change();
+                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                }
+                // copied from server/mod.rs run_server (line 7706 at 0145958f)
+                CtrlReq::ShowEnvironment(args, resp) => {
+                    let _ = resp.send(crate::environ::show(&app.environment, &app.env_scopes, &args));
+                }
+                // copied from server/mod.rs run_server (line 7729 at 0145958f)
+                CtrlReq::ShowHooks(resp) => {
+                    let mut output = String::new();
+                    for (name, commands) in &app.hooks {
+                        if commands.len() == 1 {
+                            output.push_str(&format!("{} -> {}\n", name, commands[0]));
+                        } else {
+                            for (i, cmd) in commands.iter().enumerate() {
+                                output.push_str(&format!("{}[{}] -> {}\n", name, i, cmd));
+                            }
+                        }
+                    }
+                    if output.is_empty() {
+                        output.push_str("(no hooks)\n");
+                    }
+                    let _ = resp.send(output);
+                }
+                // copied from server/mod.rs run_server (line 7709 at 0145958f)
+                CtrlReq::SetHook(hook, cmd) => {
+                    // Replace (not append) to match tmux semantics – prevents
+                    // duplicate hooks on config reload (issue #133).
+                    app.hooks.insert(hook, vec![cmd]);
+                }
+                // copied from server/mod.rs run_server (line 7714 at 0145958f)
+                CtrlReq::AppendHook(hook, cmd) => {
+                    // -a/-ga: append to existing hook list so multiple
+                    // plugins can register separate handlers (tmux semantics).
+                    // Skip an identical command that is already registered: a
+                    // config re-sourced N times (e.g. a plugin panel firing
+                    // "Configuration reloaded" repeatedly) would otherwise
+                    // accumulate N copies of the same handler and fire all of
+                    // them every tick, spawning a runaway of processes for a
+                    // status-interval run-shell hook (issue #459). This mirrors
+                    // the replace path's dedup guard for issue #133.
+                    let entry = app.hooks.entry(hook).or_insert_with(Vec::new);
+                    if !entry.contains(&cmd) {
+                        entry.push(cmd);
+                    }
+                }
+                // copied from server/mod.rs run_server (line 7745 at 0145958f)
+                CtrlReq::RemoveHook(hook) => {
+                    app.hooks.remove(&hook);
+                }
+                // copied from server/mod.rs run_server (line 6056 at 0145958f)
+                CtrlReq::BindKey(table_name, key, command, repeat, note) => {
+                    if let Some(kc) = parse_key_string(&key) {
+                        let kc = normalize_key_for_binding(kc);
+                        // Support `\;` chaining in server-side bind-key
+                        let sub_cmds = crate::config::bind_command_list(&command);
+                        let action = if sub_cmds.len() > 1 {
+                            Some(Action::CommandChain(sub_cmds))
+                        } else {
+                            sub_cmds.first().and_then(|c| parse_command_to_action(c))
+                        };
+                        if let Some(act) = action {
+                            let table = app.key_tables.entry(table_name).or_default();
+                            table.retain(|b| b.key != kc);
+                            table.push(Bind { key: kc, action: act, repeat, note });
+                        }
+                    }
+                    meta_dirty = true;
+                    state_dirty = true;
+                }
+                // copied from server/mod.rs run_server (line 6080 at 0145958f)
+                CtrlReq::UnbindKey(key, table) => {
+                    if let Some(kc) = parse_key_string(&key) {
+                        let target = table.unwrap_or_else(|| "prefix".to_string());
+                        crate::config::unbind_key_in_table(&mut app, &target, kc);
+                    }
+                    meta_dirty = true;
+                    state_dirty = true;
+                }
+                // copied from server/mod.rs run_server (line 6088 at 0145958f)
+                CtrlReq::UnbindAll => {
+                    // `unbind-key -a` with no table: the prefix table only,
+                    // as tmux cmd-unbind-key.c.
+                    crate::config::unbind_all_in_table(&mut app, "prefix");
+                    app.defaults_suppressed = true;
+                    meta_dirty = true;
+                    state_dirty = true;
+                }
+                // copied from server/mod.rs run_server (line 6096 at 0145958f)
+                CtrlReq::UnbindAllInTable(table) => {
+                    crate::config::unbind_all_in_table(&mut app, &table);
+                    meta_dirty = true;
+                    state_dirty = true;
+                }
+                // copied from server/mod.rs run_server (line 6101 at 0145958f)
+                CtrlReq::ListKeys(resp) => {
+                    // Key tables plus the built-in copy-mode keys (tmux lists
+                    // its copy-mode defaults, key-bindings.c).
+                    let entries = crate::config::list_keys_entries(&app);
+                    let user_iter = entries.iter().map(|(t, k, c, r)| (t.as_str(), k.clone(), c.clone(), *r));
+                    let output = help::build_list_keys_output(user_iter, app.defaults_suppressed);
+                    let _ = resp.send(output);
+                }
+                // copied from server/mod.rs run_server (line 6075 at 0145958f)
+                CtrlReq::ListKeyNotes(resp, table, all, key) => {
+                    let _ = resp.send(crate::config::list_key_notes(
+                        &app, table.as_deref(), all, key.as_deref(),
+                    ));
+                }
+                // copied from server/mod.rs run_server (line 8288 at 0145958f)
+                CtrlReq::StatusMessage(msg) => {
+                    app.status_message = Some((msg, std::time::Instant::now(), None));
+                    state_dirty = true;
                 }
                 // shared: everything step 2 does not handle (see the module
                 // comment). Its reply channel, if any, closes here.
