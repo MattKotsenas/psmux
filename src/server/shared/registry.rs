@@ -110,7 +110,7 @@ pub fn remove_marker_if_ours(path: &Path, pid: u32) {
     let ours = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| parse_marker(&t))
-        .map_or(false, |m| m.pid == pid);
+        .is_some_and(|m| m.pid == pid);
     if ours {
         let _ = std::fs::remove_file(path);
     }

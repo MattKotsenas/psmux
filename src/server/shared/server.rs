@@ -114,7 +114,7 @@ struct Session {
 use super::router::NewSessionArgs;
 
 enum ControlCmd {
-    NewSession(NewSessionArgs),
+    NewSession(Box<NewSessionArgs>),
     Ping,
 }
 
@@ -324,7 +324,7 @@ fn run(ns: Option<String>) -> ! {
         }
         let echo_active = sessions
             .values()
-            .any(|s| s.lp.echo_pending_until.map_or(false, |t| t.elapsed().as_millis() < 50));
+            .any(|s| s.lp.echo_pending_until.is_some_and(|t| t.elapsed().as_millis() < 50));
         crate::timer_res::set_high(crate::types::has_frame_receivers());
         let timeout_ms: u64 = if echo_active || data_ready {
             1
@@ -1018,7 +1018,7 @@ fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>) 
                     fields.push((k.to_string(), router::decode_field(v)));
                 }
             }
-            ControlCmd::NewSession(router::new_session_args_from_fields(&fields))
+            ControlCmd::NewSession(Box::new(router::new_session_args_from_fields(&fields)))
         }
         other => {
             let _ = w.write_all(reply::reply_text(&Outcome::Unsupported(other.to_string())).as_bytes());

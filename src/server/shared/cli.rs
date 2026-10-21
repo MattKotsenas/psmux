@@ -128,7 +128,7 @@ fn parse_new_session(words: &[String]) -> Result<NewSessionCli, String> {
 }
 
 fn ping(m: &Marker) -> bool {
-    matches!(control_request(m, &["ping".to_string()]), Ok(_))
+    control_request(m, &["ping".to_string()]).is_ok()
 }
 
 /// One request on the server's control listener. `Ok` is the reply text

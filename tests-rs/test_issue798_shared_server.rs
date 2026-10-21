@@ -6,7 +6,7 @@ use super::registry::{self, Marker};
 use super::reply::{reply_text, Outcome};
 use super::router::{self, NewSessionArgs, Opening};
 
-// ── the id allocator ─────────────────────────────────────────────────────
+// the id allocator
 
 #[test]
 fn a_fresh_server_starts_where_a_per_session_server_does() {
@@ -74,7 +74,7 @@ fn direct_allocation_interleaves_with_lending() {
     assert_eq!(ids.alloc_pane(), 4);
 }
 
-// ── the router ───────────────────────────────────────────────────────────
+// the router
 
 #[test]
 fn opening_needs_whole_lines() {
@@ -189,7 +189,7 @@ fn control_fields_round_trip() {
     assert_eq!(router::new_session_args_from_fields(&fields), a);
 }
 
-// ── the reply helper ─────────────────────────────────────────────────────
+// the reply helper
 
 #[test]
 fn the_one_reply_helper() {
@@ -201,7 +201,7 @@ fn the_one_reply_helper() {
     assert_eq!(reply_text(&Outcome::Done("x\n".into())), "x\n");
 }
 
-// ── the registry layout ──────────────────────────────────────────────────
+// the registry layout
 
 #[test]
 fn marker_names_never_collide() {

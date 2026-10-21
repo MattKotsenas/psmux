@@ -73,7 +73,7 @@ pub(crate) fn dispatch(
         let _req_tag: &str = "";
         crate::format::set_sessionless(false);
         match req {
-                // ── shared: session and server lifetime ──
+                // shared: session and server lifetime
                 CtrlReq::KillSession => {
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
                     flow = Flow::EndSession;
@@ -137,7 +137,7 @@ pub(crate) fn dispatch(
                     match result {
                         Ok(created) => {
                             // Replenish warm pane pool for next new-window
-                            // Warm-pane replenish is deferred OFF the command path — it
+                            // Warm-pane replenish is deferred OFF the command path: it
                             // runs at the loop top during an idle gap (Tier 3), so a burst
                             // of window-creates never chains blocking spawns that stall
                             // other clients' commands.
@@ -264,7 +264,7 @@ pub(crate) fn dispatch(
                         if let Some(p) = prev_pane_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
                             win.active_path = p;
                         }
-                        // Detached splits never focus the new pane — remove
+                        // Detached splits never focus the new pane: remove
                         // from MRU entirely so directional nav tie-breaks by
                         // pane_index among equally-unvisited candidates (#70).
                         if let Some(nid) = new_pane_id {
@@ -286,7 +286,7 @@ pub(crate) fn dispatch(
                         toggle_zoom(&mut app);
                     }
                     // Replenish warm pane for the next new-window/split
-                    // Warm-pane replenish is deferred OFF the command path — it
+                    // Warm-pane replenish is deferred OFF the command path: it
                     // runs at the loop top during an idle gap (Tier 3), so a burst
                     // of window-creates never chains blocking spawns that stall
                     // other clients' commands.
@@ -349,7 +349,7 @@ pub(crate) fn dispatch(
                     }
                     let _ = resp.send(pane_info);
                     // Replenish warm pane
-                    // Warm-pane replenish is deferred OFF the command path — it
+                    // Warm-pane replenish is deferred OFF the command path: it
                     // runs at the loop top during an idle gap (Tier 3), so a burst
                     // of window-creates never chains blocking spawns that stall
                     // other clients' commands.
@@ -661,7 +661,7 @@ pub(crate) fn dispatch(
                 // copied from server/mod.rs run_server (line 4314 at 0145958f)
                 CtrlReq::HostColors(spec) => {
                     // Issue #473: a client reported its host terminal's colors.
-                    // Keep the most recent report — the newest attached client
+                    // Keep the most recent report: the newest attached client
                     // is what the user is actually looking at.
                     let hc = crate::types::HostColors::from_spec(&spec);
                     if hc.has_any() || hc.dark.is_some() {
@@ -721,13 +721,13 @@ pub(crate) fn dispatch(
                     };
                     let in_copy = app.mode.in_copy();
                     if in_copy {
-                        // In copy/search mode — route through mode-aware handlers
+                        // In copy/search mode: route through mode-aware handlers
                         if literal {
                             send_text_to_active(&mut app, &keys.join(""))?;
                         } else {
                             // #490: `keys` holds the send-keys arguments as
                             // separate tokens. Match each WHOLE token as a
-                            // named key or send it verbatim — never split a
+                            // named key or send it verbatim: never split a
                             // token on whitespace, which destroyed spacing
                             // inside quoted arguments.
                             let parts: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -757,7 +757,7 @@ pub(crate) fn dispatch(
                                 } else if key_upper.starts_with("C-") || key_upper.starts_with("M-") || (key_upper.starts_with("F") && key_upper.len() >= 2 && key_upper[1..].chars().all(|c| c.is_ascii_digit())) {
                                     send_key_to_active(&mut app, &key.to_lowercase())?;
                                 } else {
-                                    // Plain text char — route through send_text_to_active (handles copy mode chars)
+                                    // Plain text char: route through send_text_to_active (handles copy mode chars)
                                     send_text_to_active(&mut app, key)?;
                                 }
                             }
@@ -962,7 +962,7 @@ pub(crate) fn dispatch(
                                     }
                                 }
                                 _ => {
-                                    // Plain token: typed VERBATIM (#490 — the
+                                    // Plain token: typed VERBATIM (#490: the
                                     // token's own whitespace is untouched).
                                     // Keep the historical single separator
                                     // space between two adjacent plain tokens
@@ -1068,7 +1068,7 @@ pub(crate) fn dispatch(
                                         });
                                         app.last_pane_path = old_path;
                                     } else {
-                                        // No reachable pane (single-pane window) — re-zoom
+                                        // No reachable pane (single-pane window): re-zoom
                                         toggle_zoom(&mut app);
                                     }
                                 } else {
@@ -1195,7 +1195,7 @@ pub(crate) fn dispatch(
                                         (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), screen.alternate_screen(), screen.scrollback_filled(), screen.history_bytes())
                                     }
                                     Err(_) => {
-                                        // Mutex poisoned — reader thread panicked.  Use safe defaults.
+                                        // Mutex poisoned: reader thread panicked.  Use safe defaults.
                                         (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default, false, 0, 0)
                                     }
                                 };
@@ -1313,7 +1313,7 @@ pub(crate) fn dispatch(
                 }
                 // copied from server/mod.rs run_server (line 5801 at 0145958f)
                 CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms, client_sel, flags) => {
-                    // Bare %N pane targeting (#332) — resolve the pane ID
+                    // Bare %N pane targeting (#332): resolve the pane ID
                     // globally across all windows and expand the format with
                     // PANE_POS_OVERRIDE pointing at it.
                     helpers::propagate_osc_titles(&mut app);
@@ -1504,7 +1504,7 @@ pub(crate) fn dispatch(
                     // against the target window (cmd-rename-window.c runs it
                     // through format_single_from_target). The temporary -t
                     // focus has already made the target the active window
-                    // here, so #{window_name} etc. resolve against it —
+                    // here, so #{window_name} etc. resolve against it :
                     // enabling idioms like `rename-window '#{b:pane_current_path}'`.
                     let name = expand_format(&name, &app);
                     let name = crate::util::clean_name(&name);
@@ -2045,7 +2045,7 @@ pub(crate) fn dispatch(
                     // equal to what a new child inherits.
                     crate::environ::apply_set(&mut app.environment, &mut app.env_scopes, &args);
                     // Env vars affect the child shell's process state,
-                    // which can't be patched in place — must respawn.
+                    // which can't be patched in place: must respawn.
                     // Centralised through warm_pane_sync (#137 / #271).
                     let sync = crate::warm_pane_sync::for_env_change();
                     crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
@@ -2073,7 +2073,7 @@ pub(crate) fn dispatch(
                 }
                 // copied from server/mod.rs run_server (line 7709 at 0145958f)
                 CtrlReq::SetHook(hook, cmd) => {
-                    // Replace (not append) to match tmux semantics – prevents
+                    // Replace (not append) to match tmux semantics, prevents
                     // duplicate hooks on config reload (issue #133).
                     app.hooks.insert(hook, vec![cmd]);
                 }
@@ -2285,7 +2285,7 @@ pub(crate) fn dispatch(
                                 // a miss) and emitted SWITCH unconditionally, so
                                 // an unresolvable cross-session component exited
                                 // 0 and switched anyway, while the identical
-                                // same-session target correctly errored — a
+                                // same-session target correctly errored: a
                                 // driver's exit code was right exactly half the
                                 // time. resolve_session also replaces the
                                 // hand-rolled port-file/key reads.
