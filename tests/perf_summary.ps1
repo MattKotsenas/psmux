@@ -183,7 +183,7 @@ function Show-B {
     $runs = Get-Runs "keystroke-latency-*.json" @("keystroke-latency-pwsh-*")
     if ($runs.Count -eq 0) { Note "no test_keystroke_latency_gate runs recorded" }
     else {
-        Write-Host ("  {0,-17} {1,-11} {2,6} {3,7} {4,7} {5,7} {6,7} {7,7}  {8}" -f "when", "sha", "n", "p50", "p90", "p99", "gateP50", "gateP99", "binary") -ForegroundColor DarkCyan
+        Write-Host ("  {0,-17} {1,-11} {2,6} {3,7} {4,7} {5,7} {6,7} {7,7} {8,-6}  {9}" -f "when", "sha", "n", "p50", "p90", "p99", "gateP50", "gateP99", "keys", "binary") -ForegroundColor DarkCyan
         foreach ($r in $runs) {
             $j = $r.Json; $p = Prop $j "pooled"
             $row = [pscustomobject]@{
@@ -191,12 +191,16 @@ function Show-B {
                 n = (Prop $p "n"); p50 = (Prop $p "median"); p90 = (Prop $p "p90"); p99 = (Prop $p "p99")
                 gate_p50 = (Prop $j "medianMaxMs"); gate_p99 = (Prop $j "p99MaxMs")
                 binary = (Prop $j "binary" "")
+                # "pair" for every run before 2026-10-21: press and release in
+                # one write, which the paste head check could hold. See the
+                # gate's -KeyShape.
+                key_shape = (Prop $j "key_shape" "pair")
             }
             $over = ($null -ne $row.p50 -and $null -ne $row.gate_p50 -and [double]$row.p50 -ge [double]$row.gate_p50) -or
                     ($null -ne $row.p99 -and $null -ne $row.gate_p99 -and [double]$row.p99 -ge [double]$row.gate_p99)
-            Write-Host ("  {0,-17} {1,-11} {2,6} {3,7} {4,7} {5,7} {6,7} {7,7}  {8}" -f `
+            Write-Host ("  {0,-17} {1,-11} {2,6} {3,7} {4,7} {5,7} {6,7} {7,7} {8,-6}  {9}" -f `
                 $row.when, $row.sha, $row.n, (Num $row.p50 2), (Num $row.p90 2), (Num $row.p99 2),
-                (Num $row.gate_p50 1), (Num $row.gate_p99 1), (Split-Path -Leaf $row.binary)) `
+                (Num $row.gate_p50 1), (Num $row.gate_p99 1), $row.key_shape, (Split-Path -Leaf $row.binary)) `
                 -ForegroundColor $(if ($over) { "Red" } else { "Gray" })
             Emit "B_echo_cell" $row
         }
@@ -566,6 +570,10 @@ function Show-T {
     Show-TrendRow "keystroke echo p50" "ms" 2 (Get-TrendSeries "keystroke-latency-*.json" $kExcl { param($j) Prop (Prop $j "pooled") "median" })
     Show-TrendRow "keystroke echo p99" "ms" 2 (Get-TrendSeries "keystroke-latency-*.json" $kExcl { param($j) Prop (Prop $j "pooled") "p99" })
     Show-TrendRow "keystroke pwsh over ConPTY floor" "ms" 2 (Get-TrendSeries "keystroke-latency-pwsh-*.json" @() { param($j) Prop (Prop $j "pwsh") "medianDelta" })
+    # psmux's own hops per shell keystroke, the numbers the gate asserts on
+    # (Get-PerfShellSplit). The p99 is where a timer inside psmux shows up.
+    Show-TrendRow "keystroke pwsh psmux hops p50" "ms" 2 (Get-TrendSeries "keystroke-latency-pwsh-*.json" @() { param($j) Prop (Prop (Prop $j "pwsh") "split") "psmuxMedian" })
+    Show-TrendRow "keystroke pwsh psmux hops p99" "ms" 2 (Get-TrendSeries "keystroke-latency-pwsh-*.json" @() { param($j) Prop (Prop (Prop $j "pwsh") "split") "psmuxP99" })
 
     # C: creation and teardown, every cell the gate records
     $cell = {
@@ -594,6 +602,16 @@ function Show-T {
         Show-TrendRow $label "ms" 0 (Get-TrendSeries "creation_latency_gate-*.json" @() { param($j) & $cell $j $key "p50" }.GetNewClosure())
     }
     Show-TrendRow "creation new-window p90" "ms" 0 (Get-TrendSeries "creation_latency_gate-*.json" @() { param($j) & $cell $j "new-window" "p90" })
+    # The burst tail: ten creations back to back outrun the spare pool, and the
+    # worst of them is where a pool or claim regression shows first.
+    Show-TrendRow "creation split -v p90" "ms" 0 (Get-TrendSeries "creation_latency_gate-*.json" @() { param($j) & $cell $j "split-window -v" "p90" })
+    Show-TrendRow "creation split -h p90" "ms" 0 (Get-TrendSeries "creation_latency_gate-*.json" @() { param($j) & $cell $j "split-window -h" "p90" })
+    Show-TrendRow "creation burst max, 3 cells" "ms" 0 (Get-TrendSeries "creation_latency_gate-*.json" @() {
+        param($j)
+        $m = @("new-window", "split-window -v", "split-window -h") | ForEach-Object { & $cell $j $_ "max" } | Where-Object { $null -ne $_ }
+        if (@($m).Count -eq 0) { return $null }
+        return (@($m) | Measure-Object -Maximum).Maximum
+    })
 
     # D: what it costs to hold a session open
     Show-TrendRow "server working set at prompt" "MB" 1 (Get-TrendSeries "launch-to-prompt-*.json" @() { param($j) Prop (Prop (Prop (Prop $j "resources") "at_prompt") "server") "ws_mb" })

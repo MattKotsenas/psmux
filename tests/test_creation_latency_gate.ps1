@@ -136,14 +136,24 @@ param(
     # new-session spawns a server process as well as a shell. The warm row is
     # the claim path, the no-warm row is the cold spawn; the gap between them is
     # the pool's value.
-    [int]$WarmSessionP50LimitMs = 2000,
+    #
+    # The warm row claims a settled standby: 77 to 149 ms measured on
+    # 2026-10-21 against 720 to 900 ms cold, so 400 ms fails a build whose
+    # claim falls back to a cold spawn and leaves room for a loaded machine.
+    [int]$WarmSessionP50LimitMs = 400,
     [int]$ColdSessionP50LimitMs = 3000,
     # Teardown. kill-pane and kill-window only have to unhook a pane from a
     # live server; kill-session has to wait for the whole process tree to go,
     # which is the 3 s that issue #22 argued about.
+    #
+    # kill-session read 244 to 257 ms in every run on record until 2026-10-21,
+    # almost all of it a fixed 150 ms sleep in the CLI and a 50 ms client
+    # flush wait with no client attached. Without them it measures 65 to
+    # 105 ms (CLI start included), so 200 ms fails either of those coming
+    # back and leaves room for a loaded machine.
     [int]$KillPaneP50LimitMs = 400,
     [int]$KillWindowP50LimitMs = 400,
-    [int]$KillSessionP50LimitMs = 3000,
+    [int]$KillSessionP50LimitMs = 200,
     # At or under this percentage of TOTAL cpu the machine counts as quiet and
     # the tail assertions are hard failures. Above it they are warnings. 25 on
     # this 32 core box is eight cores busy, which one sibling cargo build
@@ -654,9 +664,29 @@ function Test-Sessions {
         $prev = $env:PSMUX_NO_WARM
         if ($mode -eq "nowarm") { $env:PSMUX_NO_WARM = "1" } else { Remove-Item Env:\PSMUX_NO_WARM -ErrorAction SilentlyContinue }
         $t = @()
+        $standbyMissing = 0
+        $standbyPort = "$DataDir\$($Ns)____warm__.port"
         try {
+            # The warm row has to measure a CLAIM. A standby server is spawned
+            # by a live session about 1.7 s after it starts (after its boot hold
+            # and its first spares), and until 2026-10-21 this row killed every
+            # sample about 0.7 s after creating it, before its standby existed,
+            # with no other session alive to own one. Every "warm" sample was a
+            # cold spawn: warm 808 ms against no warm 844 ms, while the same
+            # binary claims a standby in 77 to 94 ms. So a priming session stays
+            # up for the whole row and each sample waits for a settled standby,
+            # which is the state a user's second new-session meets.
+            if ($mode -eq "warm") {
+                Start-Process -FilePath $Binary -ArgumentList "-L", $Ns, "new-session", "-d", "-s", "sprime" -WindowStyle Hidden | Out-Null
+                $null = Wait-Registered -Session "sprime"
+            }
             for ($i = 0; $i -lt $SessionCount; $i++) {
                 $name = "s$mode$i"
+                if ($mode -eq "warm") {
+                    $ws = [Diagnostics.Stopwatch]::StartNew()
+                    while (-not (Test-Path $standbyPort) -and $ws.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 50 }
+                    if (Test-Path $standbyPort) { Start-Sleep -Milliseconds 1500 } else { $standbyMissing++ }
+                }
                 $sw = [Diagnostics.Stopwatch]::StartNew()
                 Start-Process -FilePath $Binary -ArgumentList "-L", $Ns, "new-session", "-d", "-s", $name -WindowStyle Hidden | Out-Null
                 $si = Wait-Registered -Session $name
@@ -682,6 +712,12 @@ function Test-Sessions {
             Remove-Namespace
         }
         $allSamples[$label] = @($t | ForEach-Object { [math]::Round($_, 1) })
+        if ($mode -eq "warm") {
+            $script:StandbyMissing = $standbyMissing
+            if ($standbyMissing -gt 0) {
+                Write-Fail "$label - no warm standby registered within 10 s before $standbyMissing of $SessionCount samples, so those were cold spawns"
+            }
+        }
         if ($t.Count -eq 0) { Write-Fail "$label - no session reached a prompt"; continue }
         $srt = @($t | Sort-Object)
         $median = $srt[[int][Math]::Floor(($srt.Count - 1) / 2)]
@@ -942,6 +978,7 @@ $outFile = Write-PerfMetrics -Suite "test_creation_latency_gate" -Binary $Binary
     count = $Count
     variant_count = $VariantCount
     session_count = $SessionCount
+    warm_session_standby_missing = $script:StandbyMissing
     kill_count = $KillCount
     settle_ms = $SettleMs
     slow_ms = $SlowMs

@@ -1269,7 +1269,13 @@ function Invoke-KeyLat {
     param([int]$TargetPid, [string]$Label, [int]$Count)
     $out = Join-Path $RunDir "kl_$Label.txt"
     Remove-Item $out -Force -ErrorAction SilentlyContinue
-    & $KeyLat --pid $TargetPid --label $Label --out $out --mode single --n $Count --warmup 5 --gap 120 2>&1 | Out-Null
+    # --keyshape human: press now, release after the echo, the way a keyboard
+    # types. The old pair shape (press and release in one write) is what a host
+    # writing pasted text looks like, and psmux's paste head check held such a
+    # key for a few ms whenever it matched the clipboard's first character, so
+    # the psmux rows' p99 depended on what was on the clipboard (see
+    # test_keystroke_latency_gate.ps1 -KeyShape).
+    & $KeyLat --pid $TargetPid --label $Label --out $out --mode single --n $Count --warmup 5 --gap 120 --keyshape human 2>&1 | Out-Null
     if (-not (Test-Path $out)) { Warn "  $Label : keylat produced no output"; return $false }
     $txt = Get-Content $out -Raw
     $m = [regex]::Match($txt, 'SUMMARY \S+ n=(\d+) min=([\d.]+) p25=([\d.]+) median=([\d.]+) mean=([\d.]+) p90=([\d.]+) p99=([\d.]+) max=([\d.]+)')
