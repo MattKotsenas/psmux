@@ -137,8 +137,10 @@ fn shutdown_this_server(app: &mut AppState) -> ! {
         // process exits.
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
-    crate::types::send_directive_to_all_clients("DETACH");
-    std::thread::sleep(Duration::from_millis(50));
+    // Nobody attached: nothing to flush, so no wait.
+    if crate::types::send_directive_to_all_clients("DETACH") > 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     crate::types::shutdown_persistent_streams();
     // A last sweep: a spare whose CreateProcessW returned while the reap above
     // was already past it registers its pid on the way out and kills its own
@@ -5191,8 +5193,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             crate::types::ControlNotification::Exit { reason: None },
                         );
                     }
-                    crate::types::send_directive_to_all_clients("DETACH");
-                    std::thread::sleep(Duration::from_millis(if app.control_clients.is_empty() { 50 } else { 80 }));
+                    // The wait is for writer threads to flush DETACH and
+                    // `%exit`; with no client to flush to it was 50 ms of
+                    // nothing on every scripted kill-session.
+                    let told = crate::types::send_directive_to_all_clients("DETACH");
+                    if !app.control_clients.is_empty() {
+                        std::thread::sleep(Duration::from_millis(80));
+                    } else if told > 0 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -9202,8 +9211,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::session::remove_session_registry_files(std::path::Path::new(
                     &crate::paths::port_file(&app.port_file_base()),
                 ));
-                crate::types::send_directive_to_all_clients("DETACH");
-                std::thread::sleep(Duration::from_millis(50));
+                if crate::types::send_directive_to_all_clients("DETACH") > 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 crate::types::shutdown_persistent_streams();
                 // Kill warm pane's child (process::exit skips Drop)
                 app.warm_pane.kill_all();

@@ -1172,17 +1172,19 @@ impl WarmPool {
     /// server is going away" site; leaving a spare behind here is how orphan
     /// shells get created.
     pub fn kill_all(&mut self) {
-        let mut n = 0;
-        for mut wp in self.spares.drain(..) {
-            // The tree, not just the direct child: a spare's shell can already
-            // have children of its own, and TerminateProcess on the parent
-            // alone leaves those running (#686).
-            if let Some(pid) = wp.child_pid {
-                crate::platform::process_kill::kill_pid_tree(pid);
-            }
-            wp.child.kill().ok();
-            n += 1;
+        let n = self.spares.len();
+        // The tree, not just the direct child: a spare's shell can already
+        // have children of its own, and TerminateProcess on the parent alone
+        // leaves those running (#686). One process snapshot for every spare:
+        // a tree kill per spare walked the whole process table each time, 9
+        // to 11 ms a walk, three walks on every kill-session with the default
+        // pool.
+        if n > 0 {
+            let mut children: Vec<&mut Box<dyn portable_pty::Child>> =
+                self.spares.iter_mut().map(|wp| &mut wp.child).collect();
+            crate::platform::process_kill::kill_process_trees_batch(&mut children);
         }
+        self.spares.clear();
         if n > 0 {
             crate::warm_trace!("pool: killed {n} pooled spare(s)");
         }
@@ -5151,12 +5153,16 @@ pub fn send_directive_to_client(client_id: u64, directive: &str) -> bool {
 }
 
 /// Send a directive to ALL persistent clients.
-pub fn send_directive_to_all_clients(directive: &str) {
+/// Returns how many clients the directive was queued for, so a teardown can
+/// skip waiting for writers to flush it when nobody is attached.
+pub fn send_directive_to_all_clients(directive: &str) -> usize {
     if let Ok(channels) = DIRECTIVE_CHANNELS.lock() {
         for (_, tx) in channels.iter() {
             let _ = tx.send(directive.to_string());
         }
+        return channels.len();
     }
+    0
 }
 
 /// Remove a client's directive channel (called on disconnect).
