@@ -179,24 +179,12 @@ fn build_frame(app: &mut AppState, c: &mut FrameCache, meta_dirty: &mut bool) ->
     // OSC 52 from pane children, then the one-shot fields that ride on this
     // frame only (never on the cached copy).
     crate::server::helpers::drain_osc52(app);
-    if let Some(clip_text) = app.clipboard_osc52.take() {
-        let clip_b64 = base64_encode(&clip_text);
-        let buf = &mut c.combined_buf;
-        if buf.ends_with('}') {
-            buf.pop();
-            buf.push_str(",\"clipboard_osc52\":\"");
-            buf.push_str(&clip_b64);
-            buf.push_str("\"}");
-        }
-    }
-    if app.bell_forward {
-        app.bell_forward = false;
-        let buf = &mut c.combined_buf;
-        if buf.ends_with('}') {
-            buf.pop();
-            buf.push_str(",\"bell\":true}");
-        }
-    }
+    // They go last in the frame, where a frame that supersedes this one
+    // unread picks them up (frame_oneshot::supersede), as in run_server.
+    crate::frame_oneshot::append(
+        &mut c.combined_buf,
+        &crate::server::helpers::take_frame_oneshots(app),
+    );
     c.cached_data_version = combined_data_version(app);
     Ok(())
 }
