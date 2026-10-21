@@ -3605,6 +3605,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // typed with Shift alone (issue #766, see PasteHeadEvidence::shifted_head).
     #[cfg(windows)]
     let mut paste_head_shifted = false;
+    // The key that opened the current pending group, and whether its release
+    // has been read yet (see PasteHeadEvidence::head_released).
+    #[cfg(windows)]
+    let mut paste_head_key: Option<char> = None;
+    #[cfg(windows)]
+    let mut paste_head_released = false;
 
     // Track whether a modified Enter Press was already handled this keypress
     // cycle.  WezTerm sends Shift+Enter as Release-only (no Press), so we
@@ -4589,6 +4595,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         crate::session::touch_session_activity_throttled(sess);
                     }
                 }
+                // The release of the key that opened a pending group, read in
+                // the same drain as its press, is what a host writing text
+                // into the console input buffer looks like (it writes each
+                // character as a press and release pair). A hand on a keyboard
+                // lets go tens of milliseconds later.
+                #[cfg(windows)]
+                if let Event::Key(k) = &_cur_evt {
+                    if k.kind == KeyEventKind::Release && !paste_pend.is_empty() {
+                        if let (KeyCode::Char(c), Some(h)) = (k.code, paste_head_key) {
+                            if c.to_lowercase().eq(h.to_lowercase()) {
+                                paste_head_released = true;
+                            }
+                        }
+                    }
+                }
                 match _cur_evt {
                     // ── Windows Ctrl+V paste interception ────────────────
                     // ── Suppress phantom modified-Enter Release (Windows Terminal) ──
@@ -4794,6 +4815,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             if paste_pend.is_empty() {
                                 paste_head_shifted = key.modifiers == KeyModifiers::SHIFT
                                     && matches!(key.code, KeyCode::Char(c) if c != ' ');
+                                paste_head_key = match key.code {
+                                    KeyCode::Char(c) => Some(c),
+                                    _ => None,
+                                };
+                                paste_head_released = false;
                             }
                         }
                         // Flush pending paste buffer before processing any non-bufferable key.
@@ -7966,6 +7992,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     clip_head: paste_clip_head.get(),
                     held_for: paste_pend_start.map(|s| s.elapsed()).unwrap_or_default(),
                     shifted_head: paste_head_shifted,
+                    head_released: paste_head_released,
                 }
             } else {
                 PasteHeadEvidence::default()
@@ -10476,6 +10503,20 @@ struct PasteHeadEvidence<'a> {
     /// `Y` reached the pane in front of `ESC[200~`, 6 of 6 runs for a shifted
     /// first character, 0 of 6 for an unshifted one).
     shifted_head: bool,
+    /// The release of the lone pending character was read in the same drain
+    /// as its press.
+    ///
+    /// A host that writes text into the console input buffer (a paste on every
+    /// host measured, the 19045 drip, tests/paste_host_injector.cs) writes each
+    /// character as a press and release pair in one write, so the pair is read
+    /// together. A key typed on a keyboard arrives as a press alone and its
+    /// release follows when the finger lifts, tens of milliseconds later. So a
+    /// lone character whose release has not been read is a keystroke, and the
+    /// short holds below (clipboard prefix, shifted head) only cost it latency:
+    /// before this, typing the clipboard's first character waited out
+    /// PASTE_HEAD_PREFIX_HOLD on top of the 1 ms poll that ends it, 3.4 to
+    /// 12 ms in the keystroke gate, and was its whole p99 tail.
+    head_released: bool,
 }
 
 /// How long a lone character that matches the clipboard's first character is
@@ -10558,10 +10599,13 @@ impl<'a> PasteHeadEvidence<'a> {
         // A lone shifted character is held for the same short window as a
         // clipboard prefix: the rest of a paste follows it inside a
         // millisecond, a typed character has no follow up that fast.
-        if self.shifted_head
-            && pend.chars().count() == 1
-            && self.held_for < PASTE_HEAD_PREFIX_HOLD
-        {
+        let lone = pend.chars().count() == 1;
+        // A lone character still waiting for its release was typed, not
+        // written by a host (see head_released).
+        if lone && !self.head_released {
+            return false;
+        }
+        if self.shifted_head && lone && self.held_for < PASTE_HEAD_PREFIX_HOLD {
             return true;
         }
         if !self.clipboard_starts_with(pend) {
@@ -10570,7 +10614,7 @@ impl<'a> PasteHeadEvidence<'a> {
         // One character on prefix evidence alone: hold it for
         // PASTE_HEAD_PREFIX_HOLD and no longer. Two characters is a burst
         // shape and keeps the full window.
-        pend.chars().count() >= 2 || self.held_for < PASTE_HEAD_PREFIX_HOLD
+        !lone || self.held_for < PASTE_HEAD_PREFIX_HOLD
     }
 }
 

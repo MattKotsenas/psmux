@@ -126,13 +126,38 @@ class KeyLat
         if ((mods & 4) != 0) ctrl |= LEFT_ALT_PRESSED;
     }
 
+    // --keyshape human: a keystroke is written the way a keyboard produces it,
+    // the press alone and the release only after the echo has been seen (a
+    // finger lifts tens of milliseconds after it pressed). The default, pair,
+    // writes press and release in one call, which is what a host writing TEXT
+    // into the console input buffer does: psmux's paste head check treats that
+    // shape as a possible paste, so pair mode times the paste guard as well as
+    // the keystroke path whenever the clipboard starts with the typed letter.
+    static bool HumanShape = false;
+
     static bool InjectChar(char c)
     {
         ushort vk; uint ctrl;
         KeyFor(c, out vk, out ctrl);
-        var recs = new INPUT_RECORD[] { Rec(true, vk, c, ctrl), Rec(false, vk, c, 0) };
         uint w;
+        if (HumanShape)
+        {
+            var down = new INPUT_RECORD[] { Rec(true, vk, c, ctrl) };
+            return WriteConsoleInput(hIn, down, 1, out w) && w == 1;
+        }
+        var recs = new INPUT_RECORD[] { Rec(true, vk, c, ctrl), Rec(false, vk, c, 0) };
         return WriteConsoleInput(hIn, recs, 2, out w) && w == 2;
+    }
+
+    // The release that --keyshape human holds back until the echo is in.
+    static void ReleaseChar(char c)
+    {
+        if (!HumanShape) return;
+        ushort vk; uint ctrl;
+        KeyFor(c, out vk, out ctrl);
+        var up = new INPUT_RECORD[] { Rec(false, vk, c, 0) };
+        uint w;
+        WriteConsoleInput(hIn, up, 1, out w);
     }
 
     static bool InjectVk(ushort vk, char c)
@@ -232,6 +257,7 @@ class KeyLat
         string text = a.ContainsKey("text") ? a["text"] : "the quick brown fox jumps over the lazy dog";
         double cps = a.ContainsKey("cps") ? double.Parse(a["cps"], CultureInfo.InvariantCulture) : 10;
         uint pid = a.ContainsKey("pid") ? uint.Parse(a["pid"]) : 0;
+        HumanShape = a.ContainsKey("keyshape") && a["keyshape"] == "human";
 
         if (pid == 0) { File.WriteAllText(outFile, "ERROR no --pid\n"); return 90; }
 
@@ -308,6 +334,7 @@ class KeyLat
         // (src/pty_trace.rs logs raw QPC ticks). QPC is system wide.
         long qpcBase = Stopwatch.GetTimestamp();
         Log.Add("QPCBASE " + qpcBase + " freq " + Stopwatch.Frequency);
+        Log.Add("KEYSHAPE " + (HumanShape ? "human" : "pair"));
         var samples = new List<double>();
         var raw = new List<string>();
         int total = n + warmup;
@@ -335,6 +362,7 @@ class KeyLat
                 if (now - t0 > timeoutMs) break;
                 SpinUs(spinUs, sw);
             }
+            ReleaseChar(c);
             if (appear < 0) { timeouts++; }
             else if (t >= warmup)
             {

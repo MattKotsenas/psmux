@@ -173,6 +173,17 @@ param(
     # Quiet window for the idle CPU sample, in seconds. Nothing is typed during
     # it, so whatever the server and the client burn is work nobody asked for.
     [int]$IdleSeconds = 3,
+    # How keylat writes each keystroke. "human" (the default) writes the press
+    # alone and the release after the echo, the way a keyboard does. "pair"
+    # writes both in one call, the way a host writes pasted TEXT, which psmux's
+    # paste head check (#684) holds for a few ms when the typed letter is the
+    # clipboard's first character. Until 2026-10-21 the gate typed in pair
+    # shape, so its p99 depended on what was on the developer's clipboard:
+    # with a clipboard starting "r" every typed "r" was held, 3.4 to 12 ms,
+    # one key in 26, and that was the whole p99 tail (6.2 ms against a 2.3 ms
+    # p90). Use -KeyShape pair to time that guard deliberately.
+    [ValidateSet("human", "pair")]
+    [string]$KeyShape = "human",
     # At or under this percentage of TOTAL cpu the machine counts as quiet and
     # the echo median is a hard failure; above it, a warning. The p99 assertion
     # is hard either way. See the header for the measurements behind that split.
@@ -313,10 +324,10 @@ function Invoke-Run([int]$idx, [string]$cell = "echo", [bool]$withResources = $f
         }
         if ($cell -eq "pwsh") {
             & $KeyLat --pid $client.Id --label "gate$cell$idx" --out $out `
-                --mode single --n $N --warmup 5 --gap 120 --oracle "cursor" | Out-Null
+                --mode single --n $N --warmup 5 --gap 120 --oracle "cursor" --keyshape $KeyShape | Out-Null
         } else {
             & $KeyLat --pid $client.Id --label "gate$idx" --out $out `
-                --mode single --n $N --warmup 5 --gap 120 --oracle "cell:0,0" --noerase | Out-Null
+                --mode single --n $N --warmup 5 --gap 120 --oracle "cell:0,0" --noerase --keyshape $KeyShape | Out-Null
         }
         if ($withResources -and $resAtPrompt) {
             $resAfterKeys = Get-PerfResourceSnapshot $roles
@@ -448,6 +459,7 @@ $jsonPath = Write-PerfMetrics -Suite "test_keystroke_latency_gate" -Binary $Bina
     -FileStem "keystroke-latency" -MetricsDir $MetricsDir -Stamp $stamp -Data ([ordered]@{
     runs         = $Runs
     keysPerRun   = $N
+    key_shape    = $KeyShape
     medianMaxMs  = $MedianMaxMs
     p99MaxMs     = $P99MaxMs
     quiet_load_pct    = $QuietLoadPct
@@ -616,6 +628,7 @@ if (-not $SkipPwsh) {
             -FileStem "keystroke-latency-pwsh" -MetricsDir $MetricsDir -Stamp $stamp -Data ([ordered]@{
             runs      = $Runs
             keysPerRun = $N
+            key_shape = $KeyShape
             medianDeltaMaxMs = $PwshMedianDeltaMaxMs
             p99DeltaMaxMs    = $PwshP99DeltaMaxMs
             absMedianMaxMs   = $PwshAbsMedianMaxMs

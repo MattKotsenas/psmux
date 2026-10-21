@@ -53,6 +53,7 @@ fn shifted(held_ms: u64) -> PasteHeadEvidence<'static> {
         clip_head: None,
         held_for: Duration::from_millis(held_ms),
         shifted_head: true,
+        head_released: true,
     }
 }
 

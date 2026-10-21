@@ -239,7 +239,7 @@ fn paste_states_do_not_zero_latency_flush() {
 #[test]
 fn the_first_character_of_a_clipboard_paste_is_held() {
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false, head_released: true };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
@@ -248,14 +248,14 @@ fn the_first_character_of_a_clipboard_paste_is_held() {
 fn a_burst_under_an_open_ctrl_v_gesture_is_held_whatever_the_clipboard_says() {
     // Hosts that forward the Ctrl+V press give the client the stronger
     // signal; the clipboard may even be unreadable at that instant.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::ZERO, shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::ZERO, shifted_head: false, head_released: true };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
 #[cfg(windows)]
 #[test]
 fn a_character_that_is_not_the_clipboard_head_still_flushes_immediately() {
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false, head_released: true };
     assert!(should_zero_latency_flush_paste_pend("x", true, false, false, ev));
     // The second character of a burst is judged on its own pending buffer,
     // which is why typing after the held head is not delayed as well.
@@ -268,7 +268,7 @@ fn a_clipboard_of_one_or_two_characters_never_holds() {
     // At two characters or fewer both paths end in the same `send-text`, so
     // holding would buy nothing and cost the 20 ms window.
     for clip in ["a", "ab"] {
-        let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false };
+        let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false, head_released: true };
         assert!(should_zero_latency_flush_paste_pend("a", true, false, false, ev));
     }
 }
@@ -282,11 +282,11 @@ fn a_lone_clipboard_head_is_released_as_typing_after_the_short_hold() {
     // keystroke that happens to match the clipboard, and it goes out as
     // typing 3 ms late rather than 20 (keystroke gate p99 23 ms otherwise).
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let early = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(2), shifted_head: false };
+    let early = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(2), shifted_head: false, head_released: true };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, early));
-    let late = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: PASTE_HEAD_PREFIX_HOLD, shifted_head: false };
+    let late = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: PASTE_HEAD_PREFIX_HOLD, shifted_head: false, head_released: true };
     assert!(should_zero_latency_flush_paste_pend("M", true, false, false, late));
-    let later = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false };
+    let later = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false, head_released: true };
     assert!(should_zero_latency_flush_paste_pend("M", true, false, false, later));
 }
 
@@ -296,15 +296,34 @@ fn two_prefix_characters_keep_the_full_window() {
     // A second character inside the hold is the burst shape; the ordinary
     // 20 ms window then decides, however long the first has been held.
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false, head_released: true };
     assert!(!should_zero_latency_flush_paste_pend("Mi", true, false, false, ev));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_typed_clipboard_head_whose_key_is_still_down_is_not_held() {
+    // A host writes each pasted character as a press and release pair, so the
+    // pair is drained together. A keystroke arrives as a press alone; holding
+    // it because it matches the clipboard only delays the echo.
+    let clip = "Microsoft Windows [Version 10.0.19045.7725]";
+    let typed = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false, head_released: false };
+    assert!(should_zero_latency_flush_paste_pend("M", true, false, false, typed));
+    // The shifted head rule is the same evidence (#766) and follows it.
+    let shifted = PasteHeadEvidence { shifted_head: true, clip_head: None, ..typed };
+    assert!(should_zero_latency_flush_paste_pend("Y", true, false, false, shifted));
+    // An open Ctrl+V gesture is not about the key's own release and still holds.
+    let gesture = PasteHeadEvidence { gesture_open: true, ..typed };
+    assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, gesture));
+    // Two characters are a burst whatever the release says.
+    assert!(!should_zero_latency_flush_paste_pend("Mi", true, false, false, typed));
 }
 
 #[cfg(windows)]
 #[test]
 fn an_open_gesture_holds_past_the_short_hold() {
     // The Ctrl+V press is the stronger signal and is not on a timer.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::from_millis(19), shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::from_millis(19), shifted_head: false, head_released: true };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
@@ -313,7 +332,7 @@ fn an_open_gesture_holds_past_the_short_hold() {
 fn paste_detection_off_never_holds_the_head() {
     // The user asked for no paste detection: nothing may add latency, whatever
     // is on the clipboard.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false, head_released: true };
     assert!(should_zero_latency_flush_paste_pend("M", false, false, false, ev));
 }
 
