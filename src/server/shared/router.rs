@@ -25,6 +25,7 @@ pub const SUPPORTED: &[&str] = &[
     "last-pane", "lastp",
     "rename-window", "renamew",
     "set-pane-title",
+    "switch-client", "switchc",
     // input and output
     "send-keys", "send",
     "send-text", "send-key", "send-paste",

@@ -2161,6 +2161,285 @@ pub(crate) fn dispatch(
                     app.status_message = Some((msg, std::time::Instant::now(), None));
                     state_dirty = true;
                 }
+                // copied from server/mod.rs run_server (line 7370 at 0145958f)
+                CtrlReq::SwitchClient(target, flag, resp_tx) => {
+                    // Resolve the target session name based on the flag
+                    let current = app.port_file_base();
+                    // This server's own `-L` namespace, as tmux's switch-client
+                    // only ever sees the sessions of the server it runs on. The
+                    // unscoped listing held only default namespace bases, so
+                    // under -L `-l` never found the (namespaced) last session
+                    // and `-n`/`-p`, finding no current session in the list,
+                    // moved the client into the DEFAULT namespace's first one.
+                    let all_sessions = crate::session::list_session_names_ns(app.socket_name.as_deref());
+                    // Last session, taken from THIS client's own history
+                    // (issue #566): never the data-dir-global `last_session`
+                    // file, which every attach overwrites with the session
+                    // being entered. No recorded previous session is "no last
+                    // session", as tmux reports for a client that has not moved.
+                    let last = app.latest_client_id
+                        .and_then(|cid| app.client_registry.get(&cid))
+                        .and_then(|info| info.last_session.clone());
+                    let resolved = crate::session::resolve_switch_client(
+                        flag,
+                        &target,
+                        &current,
+                        &all_sessions,
+                        last.as_deref(),
+                        app.socket_name.as_deref(),
+                    );
+                    // #566: every branch now reports its outcome on the optional
+                    // channel as well as on the TUI status line, because a
+                    // one-shot CLI caller never sees a status line and so could
+                    // not tell a completed switch from a silent no-op.
+                    let mut reply = "OK".to_string();
+                    match resolved {
+                        Some(ref sess) if sess != &current => {
+                            // Signal the attached client to switch by sending a directive
+                            if let Some(cid) = app.latest_client_id {
+                                crate::types::send_directive_to_client(cid, &format!("SWITCH {}", sess));
+                            } else {
+                                // No specific client ID, send to all attached clients
+                                // shared: this session's clients, not every client of the process.
+                                for c in lp.clients.iter() {
+                                    crate::types::send_directive_to_client(*c, &format!("SWITCH {}", sess));
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            // Target is the same as current session
+                            app.status_message = Some(("switch-client: already on that session".to_string(), std::time::Instant::now(), None));
+                            state_dirty = true;
+                        }
+                        None => {
+                            let msg = if flag == 't' && !target.is_empty() {
+                                format!("switch-client: session not found: {}", target)
+                            } else if flag == 'l' {
+                                "switch-client: no last session".to_string()
+                            } else if all_sessions.len() <= 1 {
+                                "switch-client: only one session available".to_string()
+                            } else {
+                                "switch-client: no target session".to_string()
+                            };
+                            reply = format!("ERROR {}", msg);
+                            app.status_message = Some((msg, std::time::Instant::now(), None));
+                            state_dirty = true;
+                        }
+                    }
+                    if let Some(rtx) = resp_tx {
+                        let _ = rtx.send(reply);
+                    }
+                }
+                // copied from server/mod.rs run_server (line 7435 at 0145958f)
+                CtrlReq::SwitchClientTarget(raw, resp_tx) => {
+                    // #483: `switch-client -t <target>` with a full
+                    // session:window.pane / @window / %pane spec. Switch the
+                    // client's session AND select the addressed window/pane, and
+                    // validate the target exists so the CLI can exit non-zero.
+                    let now = std::time::Instant::now();
+                    let current = app.port_file_base();
+                    // Resolve inside this server's own `-L` namespace. The
+                    // unscoped listing skips every namespaced base, so on a
+                    // `-L` socket it came back empty and any `-t <session>`
+                    // failed with "can't find session" even though the target
+                    // was right there in `list-sessions`. Registry bases carry
+                    // the `<ns>__` prefix while the user types the bare name,
+                    // so the request is qualified before it is matched.
+                    let nav_ns = crate::session::session_namespace(&current).map(|s| s.to_string());
+                    let all_sessions = crate::session::list_session_names_ns(nav_ns.as_deref());
+                    let qualify = |name: &str| match nav_ns.as_deref() {
+                        Some(ns) => format!("{}__{}", ns, name),
+                        None => name.to_string(),
+                    };
+                    let pt = crate::cli::parse_target(&raw);
+                    let sess_req = pt.session.clone().filter(|s| !s.is_empty());
+
+                    // Resolve destination session: explicit prefix, else current.
+                    let target_session = match &sess_req {
+                        Some(s) => {
+                            let q = qualify(s);
+                            if all_sessions.contains(&q) {
+                                Some(q)
+                            } else {
+                                all_sessions.iter().find(|x| x.starts_with(&q)).cloned()
+                            }
+                        }
+                        None => Some(current.clone()),
+                    };
+
+                    let outcome: Result<bool, String> = match target_session {
+                        None => Err(format!("can't find session: {}", sess_req.clone().unwrap_or_default())),
+                        Some(dest) => {
+                            let same_session = dest == current;
+                            if !same_session {
+                                // Cross-session (#483): if the target also names
+                                // a window/pane, pre-select it on the DESTINATION
+                                // server (one server per session) so the client
+                                // lands there after it re-attaches, then signal
+                                // the client to re-attach to dest.
+                                //
+                                // #555: the window/pane component is resolved on
+                                // the destination BEFORE anything is signalled.
+                                // The old shape forwarded the pre-select
+                                // fire-and-forget (FocusWindow silently no-ops on
+                                // a miss) and emitted SWITCH unconditionally, so
+                                // an unresolvable cross-session component exited
+                                // 0 and switched anyway, while the identical
+                                // same-session target correctly errored — a
+                                // driver's exit code was right exactly half the
+                                // time. resolve_session also replaces the
+                                // hand-rolled port-file/key reads.
+                                // shared (#798 step 2): the destination is a
+                                // session of this same server, served by this
+                                // very loop, so the per session route (a TCP
+                                // check and pre-select on the destination's
+                                // listener) would wait on itself. A session
+                                // target switches the client; a window or pane
+                                // in another session is deferred to step 3.
+                                if pt.window.is_some() || pt.window_name.is_some() || pt.pane.is_some() {
+                                    Err("switch-client: a window or pane of another session is not supported by the shared server yet (step 2 of #798)".to_string())
+                                } else {
+                                    if let Some(cid) = app.latest_client_id {
+                                        crate::types::send_directive_to_client(cid, &format!("SWITCH {}", dest));
+                                    } else {
+                                        for c in lp.clients.iter() {
+                                            crate::types::send_directive_to_client(*c, &format!("SWITCH {}", dest));
+                                        }
+                                    }
+                                    Ok(false)
+                                }
+                            } else {
+                            // Same-session window/pane selection acts on THIS
+                            // server directly.
+                                if let Some(pid) = pt.pane {
+                                    if pt.pane_is_id {
+                                        if crate::tree::find_pane_by_id_global(&app, pid).is_some() {
+                                            switch_with_copy_save(&mut app, |app| { crate::tree::focus_pane_by_id(app, pid); });
+                                            unzoom_if_zoomed(&mut app);
+                                            resize_all_panes(&mut app);
+                                            Ok(true)
+                                        } else {
+                                            Err(format!("can't find pane: %{}", pid))
+                                        }
+                                    } else {
+                                        // tmux (cmd-switch-client.c:140-151):
+                                        // window_set_active_pane on the TARGET
+                                        // window, then session_set_current to
+                                        // it. focus_pane_by_index works on the
+                                        // active window, so a `s:1.1` sent from
+                                        // window 0 used to pick pane 1 of window
+                                        // 0 and never move (test_issue483
+                                        // case 3: srcWin=0 srcPane=0). Resolve
+                                        // the window part first.
+                                        let target_win = if let Some(w) = pt.window {
+                                            if pt.window_is_id {
+                                                app.windows.iter().position(|x| x.id == w)
+                                            } else {
+                                                app.win_pos(w)
+                                            }
+                                        } else if let Some(ref wname) = pt.window_name {
+                                            app.windows.iter().position(|x| x.name == *wname)
+                                        } else {
+                                            Some(app.active_idx)
+                                        };
+                                        match target_win {
+                                            Some(i) => {
+                                                switch_with_copy_save(&mut app, |app| {
+                                                    if i != app.active_idx {
+                                                        app.last_window_idx = app.active_idx;
+                                                        app.active_idx = i;
+                                                    }
+                                                    if let Some(pos) = pid.checked_sub(app.pane_base_index) {
+                                                        crate::tree::focus_pane_by_index(app, pos);
+                                                    }
+                                                });
+                                                if let Some(win) = app.windows.get_mut(i) {
+                                                    win.activity_flag = false; win.bell_flag = false; win.silence_flag = false;
+                                                }
+                                                unzoom_if_zoomed(&mut app);
+                                                resize_all_panes(&mut app);
+                                                Ok(true)
+                                            }
+                                            None => Err(format!("can't find window: {}", raw)),
+                                        }
+                                    }
+                                } else if let Some(w) = pt.window {
+                                    let internal = if pt.window_is_id {
+                                        app.windows.iter().position(|x| x.id == w)
+                                    } else {
+                                        app.win_pos(w)
+                                    };
+                                    match internal {
+                                        Some(i) => {
+                                            if i != app.active_idx {
+                                                switch_with_copy_save(&mut app, |app| {
+                                                    app.last_window_idx = app.active_idx;
+                                                    app.active_idx = i;
+                                                });
+                                                if let Some(win) = app.windows.get_mut(i) {
+                                                    win.activity_flag = false; win.bell_flag = false; win.silence_flag = false;
+                                                }
+                                                resize_all_panes(&mut app);
+                                            }
+                                            Ok(true)
+                                        }
+                                        None => Err(format!("can't find window: {}", raw)),
+                                    }
+                                } else if let Some(ref wname) = pt.window_name {
+                                    match app.windows.iter().position(|x| x.name == *wname) {
+                                        Some(i) => {
+                                            if i != app.active_idx {
+                                                switch_with_copy_save(&mut app, |app| {
+                                                    app.last_window_idx = app.active_idx;
+                                                    app.active_idx = i;
+                                                });
+                                                resize_all_panes(&mut app);
+                                            }
+                                            Ok(true)
+                                        }
+                                        None => Err(format!("can't find window: {}", wname)),
+                                    }
+                                } else {
+                                    // Session-only target equal to the current session: no-op.
+                                    Ok(false)
+                                }
+                            }
+                        }
+                    };
+
+                    match outcome {
+                        Ok(selected) => {
+                            meta_dirty = true;
+                            state_dirty = true;
+                            if selected { hook_event = Some("after-select-window"); }
+                            let _ = resp_tx.send("OK".to_string());
+                        }
+                        Err(msg) => {
+                            app.status_message = Some((format!("switch-client: {}", msg), now, None));
+                            state_dirty = true;
+                            let _ = resp_tx.send(format!("ERROR {}", msg));
+                        }
+                    }
+                }
+                // copied from server/mod.rs run_server (line 7633 at 0145958f)
+                CtrlReq::SwitchClientTable(table, resp_tx) => {
+                    // tmux `cmd_switch_client_exec`: `key_bindings_get_table(name, 0)`
+                    // does NOT create the table, so naming one that has no
+                    // bindings is an error, not a silent latch (issue #640).
+                    // "root" and "prefix" always exist in tmux, and "root" is
+                    // the default table the client falls back to.
+                    match crate::server::helpers::resolve_switch_client_table(&app, &table) {
+                        Ok(resolved) => {
+                            app.current_key_table = resolved;
+                            if let Some(rt) = resp_tx { let _ = rt.send("OK".to_string()); }
+                        }
+                        Err(msg) => {
+                            app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
+                            if let Some(rt) = resp_tx { let _ = rt.send(format!("ERROR {}", msg)); }
+                        }
+                    }
+                    state_dirty = true;
+                }
                 // shared: everything step 2 does not handle (see the module
                 // comment). Its reply channel, if any, closes here.
                 _ => {}

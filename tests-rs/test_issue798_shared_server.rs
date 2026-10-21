@@ -118,7 +118,7 @@ fn supported_and_unsupported_commands() {
         "has-session", "kill-session", "kill-server", "dump-state", "client-attach", "set", "bind"] {
         assert!(router::is_supported(ok), "{ok}");
     }
-    for no in ["rotate-window", "move-window", "link-window", "join-pane", "switch-client",
+    for no in ["rotate-window", "move-window", "link-window", "join-pane", "swap-pane",
         "choose-tree", "new-session", "rename-session", "run-shell", "if-shell", "source-file"] {
         assert!(!router::is_supported(no), "{no}");
     }
