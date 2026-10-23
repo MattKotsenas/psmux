@@ -4531,7 +4531,6 @@ pub enum CtrlReq {
     CommandPrompt(String, bool, mpsc::Sender<String>),
     /// A client reports that the prompt of request `<id>` closed.
     PromptDone(u64),
-    ShowMessages(mpsc::Sender<String>),
     /// The warnings THIS server recorded while loading its config, framed by
     /// `server::config_warnings_reply`. Answered by the main loop, so it is
     /// never answered before the config is loaded (#706).
