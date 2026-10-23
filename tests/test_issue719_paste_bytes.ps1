@@ -28,6 +28,21 @@ function Write-Fail($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red; $script
 function Write-Skip($m) { Write-Host "  [SKIP] $m" -ForegroundColor Yellow; $script:Skip++ }
 function Write-Info($m) { Write-Host "  [INFO] $m" -ForegroundColor DarkGray }
 
+# Set-Clipboard does not report a clipboard another window is holding open: the
+# old contents stay and Ctrl+V pastes them (sweeps 2026-10-22 and 2026-10-23
+# pasted the previous suite's selection, then the previous case's text). Wait
+# until the clipboard really holds the test text before the gesture.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value.TrimEnd("`r", "`n")) { return $true }
+    }
+    return $false
+}
+
 foreach ($v in 'PSMUX_SESSION_NAME','PSMUX_SESSION','PSMUX_PANE','TMUX','TMUX_PANE') { Remove-Item "Env:\$v" -EA SilentlyContinue }
 $savedDataDir = $env:PSMUX_DATA_DIR
 $savedNoWarm  = $env:PSMUX_NO_WARM
@@ -201,7 +216,11 @@ public static class I719Ui {
                 foreach ($c in $clips) {
                     $strayA = 0; $ok = 0; $nofocus = 0; $bad = @()
                     for ($i = 1; $i -le 3; $i++) {
-                        Set-Clipboard -Value $c.t; Start-Sleep -Milliseconds 200
+                        if (-not (Set-ClipboardVerified $c.t)) {
+                            Write-Info "paste-detection $pd, $($c.n): the clipboard never took the test text in 5 s; it holds '$(try { Get-Clipboard -Raw } catch { '?' })'"
+                            $nofocus++; continue
+                        }
+                        Start-Sleep -Milliseconds 200
                         $pre = (Read-ProbeText $p.Log).Length
                         if (-not ([I719Ui]::Focus($hwnd) -and [I719Ui]::CtrlV($hwnd))) { $nofocus++; continue }
                         Start-Sleep -Milliseconds 1500

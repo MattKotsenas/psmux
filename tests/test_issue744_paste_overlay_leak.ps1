@@ -34,6 +34,21 @@ function Write-Skip($m) { Write-Host "  [SKIP] $m" -ForegroundColor Yellow; $scr
 function Write-Info($m) { Write-Host "  [INFO] $m" -ForegroundColor DarkGray }
 function P { & $PSMUX -L $NS @args 2>&1 }
 
+# Set-Clipboard does not report a clipboard another window is holding open: the
+# old contents stay, and the client, correctly, does not take typed text that is
+# not the clipboard's head as a paste (sweeps 2026-10-22 and 2026-10-23). Wait
+# until the clipboard really holds the test text before the gesture.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value.TrimEnd("`r", "`n")) { return $true }
+    }
+    return $false
+}
+
 foreach ($v in 'PSMUX_SESSION_NAME','PSMUX_SESSION','PSMUX_PANE','TMUX','TMUX_PANE') { Remove-Item "Env:\$v" -EA SilentlyContinue }
 $savedDataDir = $env:PSMUX_DATA_DIR
 $savedNoWarm = $env:PSMUX_NO_WARM
@@ -113,7 +128,7 @@ try {
         Start-Sleep -Milliseconds 900
     }
     function Do-Paste([string]$mode, [string]$text) {
-        Set-Clipboard -Value $text
+        if (-not (Set-ClipboardVerified $text)) { Write-Info "the clipboard never took '$text' in 5 s; it holds '$(try { Get-Clipboard -Raw } catch { '?' })'" }
         Start-Sleep -Milliseconds 150
         & $paste $client.Id $mode 150 $text | Out-Null
         $rc = $LASTEXITCODE
@@ -262,7 +277,7 @@ try {
     Start-Sleep -Milliseconds 500
     [void](Keys "^b{SLEEP:300}:{SLEEP:400}")
     for ($i = 0; $i -lt 5; $i++) {
-        Set-Clipboard -Value " abc def"
+        [void](Set-ClipboardVerified " abc def")
         & $paste $client.Id 'host' 60 " abc def" | Out-Null
         Start-Sleep -Milliseconds 250
     }

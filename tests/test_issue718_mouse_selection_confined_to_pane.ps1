@@ -32,6 +32,10 @@ $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $DRAG)) { & $csc /nologo /optimize /out:$DRAG "$PSScriptRoot\mouse_drag_injector.cs" 2>&1 | Out-Null }
 if (-not (Test-Path $DRAG)) { Write-Host "FATAL: drag injector failed to compile"; exit 1 }
 
+# The drag copies to the system clipboard, which is the user's (and the next
+# suite's): put back what was there.
+$savedClip = try { Get-Clipboard -Raw -EA Stop } catch { $null }
+
 function Wait-Until([scriptblock]$cond, [int]$ms) {
     $deadline = (Get-Date).AddMilliseconds($ms)
     while ((Get-Date) -lt $deadline) { if (& $cond) { return $true }; Start-Sleep -Milliseconds 150 }
@@ -105,6 +109,7 @@ try {
     if ($inMode -eq '0') { Write-Pass "mouse off: no copy mode entered" } else { Write-Fail "mouse off: pane_in_mode=$inMode" }
 } finally {
     & $PSMUX -L $ns kill-server 2>$null
+    if ($null -ne $savedClip) { try { Set-Clipboard -Value $savedClip -EA Stop } catch {} }
     if ($client) { Stop-Process -Id $client.ProcessId -Force -EA SilentlyContinue }
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue }
 }
