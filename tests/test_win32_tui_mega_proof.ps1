@@ -369,6 +369,10 @@ Write-Host "  PSMUX Win32 TUI Mega Proof Test Suite" -ForegroundColor Magenta
 Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Magenta
 Write-Host "============================================================`n" -ForegroundColor Magenta
 
+# The copy mode section copies a pane line to the system clipboard, which is
+# the user's: put back what was there before.
+$savedClip = try { Get-Clipboard -Raw -EA Stop } catch { $null }
+
 Cleanup-Session $SESSION
 Cleanup-Session "${SESSION}_target"
 Cleanup-Session "${SESSION}_newsess"
@@ -937,6 +941,14 @@ else { Write-Pass "TUI process state after detach: running=$(-not $proc.HasExite
 # =============================================================================
 
 Write-Host "`n=== Cleanup ===" -ForegroundColor Cyan
+
+if ($null -ne $savedClip) {
+    for ($i = 0; $i -lt 10; $i++) {
+        try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
+        if ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip) { break }
+        Start-Sleep -Milliseconds 200
+    }
+}
 
 if (-not $SkipCleanup) {
     Cleanup-Session $SESSION
