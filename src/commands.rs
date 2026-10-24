@@ -3677,6 +3677,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         let mut win = app.windows.remove(removed_pos);
                         kill_all_children(&mut win.root);
                         app.on_window_removed(removed_pos);
+                        if removed_pos < app.active_idx {
+                            app.active_idx -= 1;
+                        }
                         if app.active_idx >= app.windows.len() {
                             app.active_idx = app.windows.len() - 1;
                         }
@@ -4403,3 +4406,7 @@ mod tests_pane_base_index_window_scope;
 #[cfg(test)]
 #[path = "../tests-rs/test_set_hook_cli_command_list.rs"]
 mod tests_set_hook_cli_command_list;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_unlink_window_focus.rs"]
+mod tests_unlink_window_focus;

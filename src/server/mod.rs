@@ -7006,6 +7006,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let mut win = app.windows.remove(removed_pos);
                             kill_all_children(&mut win.root);
                             app.on_window_removed(removed_pos);
+                            if removed_pos < app.active_idx {
+                                app.active_idx -= 1;
+                            }
                             if app.active_idx >= app.windows.len() {
                                 app.active_idx = app.windows.len() - 1;
                             }
