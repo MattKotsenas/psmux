@@ -30,6 +30,20 @@ function Write-Info($msg) { Write-Host "  [INFO] $msg" -ForegroundColor DarkCyan
 function Write-Head($msg) { Write-Host "`n--- $msg ---" -ForegroundColor Yellow }
 function Check($ok, $pass, $fail) { if ($ok) { Write-Pass $pass } else { Write-Fail $fail } }
 
+# Set-Clipboard does not report a clipboard another window is holding open: the
+# old contents stay (sweeps 2026-10-23 and 2026-10-24 failed here, deep in the
+# run, and passed alone). Wait until the clipboard really holds the text.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value) { return $true }
+    }
+    return $false
+}
+
 Write-Host "binary: $PSMUX" -ForegroundColor Cyan
 
 $env:PSMUX_SESSION_NAME = $null
@@ -187,14 +201,16 @@ Inj "^b{SLEEP:400}*"
 Start-Sleep -Milliseconds 4000
 Check ((Floats) -eq 1) "prefix * opened a float" "no float"
 
-Set-Clipboard -Value "PASTEMARK"
+if (-not (Set-ClipboardVerified "PASTEMARK")) {
+    Write-Info ("the clipboard never took PASTEMARK in 5 s; it holds [{0}]" -f (try { Get-Clipboard -Raw } catch { '?' }))
+}
 Start-Sleep -Milliseconds 400
 Inj "^v"
 Start-Sleep -Milliseconds 1500
 $pr = Screen
 $mark = -1
 for ($i = 0; $i -lt $pr.Count; $i++) { if (([string]$pr[$i]).IndexOf("PASTEMARK") -ge 0) { $mark = $i; break } }
-Write-Info ("PASTEMARK landed on row {0}" -f $mark)
+Write-Info ("PASTEMARK landed on row {0}; the clipboard holds [{1}]" -f $mark, (try { Get-Clipboard -Raw } catch { '?' }))
 Write-Info ("row 0, the pane behind: [{0}]" -f ([string]$pr[0]).Trim())
 Check ($mark -gt 0) "the paste is in the float" "it is on row $mark, the pane behind"
 Check ((([string]$pr[0]).IndexOf("PASTEMARK")) -lt 0) "nothing leaked to the pane behind" `
