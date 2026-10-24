@@ -242,6 +242,23 @@ public static class I719Ui {
                             $got = if ($all.Length -ge $pre) { $all.Substring($pre) } else { $all }
                         }
                         $want = if ($pd -eq 'on') { "<ESC>[200~$($c.plain)<ESC>[201~" } else { $c.plain }
+                        if ($got -ne '' -and $got.Length -lt $want.Length -and $want.StartsWith($got)) {
+                            # The pane read a clean head and then nothing: conhost held
+                            # the tail psmux had already written (PSMUX_PTY_TRACE shows
+                            # every byte reach the ConPTY on time; a bare
+                            # CreatePseudoConsole with no psmux holds it too, and the
+                            # rate swings with machine state, 0 of 40 to 7 of 15 on one
+                            # binary). The next input releases it, so send one key and
+                            # require exactly the missing tail plus that key.
+                            & $PSMUX -L $NS send-keys -t $p.Sess -l '~' 2>&1 | Out-Null
+                            Start-Sleep -Milliseconds 800
+                            $all = Read-ProbeText $p.Log
+                            $after = if ($all.Length -ge $pre) { $all.Substring($pre) } else { $all }
+                            if ($after -eq "$want~") {
+                                Write-Info "paste-detection $pd, $($c.n): conhost held the tail '$($want.Substring($got.Length))' until the next input; it arrived intact after one key"
+                                $got = $want
+                            } else { $got = $after }
+                        }
                         if ($got -match '(^|[^>])\[A') { $strayA++ }
                         if ($got -eq $want) { $ok++ } else { $bad += $got }
                     }
