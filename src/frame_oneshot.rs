@@ -21,7 +21,15 @@
 //! helpers::drain_osc52). The fields are always the LAST ones in the frame,
 //! clipboard then bell, written by [`append`] and read back by [`take`], so
 //! nothing here has to parse the rest of the JSON.
+//!
+//! The sixel image blobs (#431) are carried the same way. The server sends
+//! each image's bytes in one frame only (server::build_image_blobs_json) and
+//! later frames name the image by id, so a superseded frame that held a blob
+//! left the client with an image it could never draw. The frame builders
+//! write `image_blobs` just before the clipboard and the bell.
 
+/// The image blobs field as the frame builders write it.
+const BLOBS_KEY: &str = ",\"image_blobs\":{";
 /// The clipboard field as the frame builders write it.
 const CLIP_KEY: &str = ",\"clipboard_osc52\":\"";
 /// The bell field as the frame builders write it.
@@ -29,6 +37,8 @@ const BELL_FIELD: &str = ",\"bell\":true";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OneShots {
+    /// The members of `image_blobs` (`"id":"base64",...`) without the braces.
+    pub image_blobs: String,
     /// Base64 clipboard text for OSC 52.
     pub clip_b64: Option<String>,
     pub bell: bool,
@@ -36,21 +46,41 @@ pub(crate) struct OneShots {
 
 impl OneShots {
     pub(crate) fn is_empty(&self) -> bool {
-        self.clip_b64.is_none() && !self.bell
+        self.image_blobs.is_empty() && self.clip_b64.is_none() && !self.bell
     }
 
-    /// `newer` happened after `self`: a bell from either rings, and the newer
-    /// clipboard write wins.
+    /// `newer` happened after `self`: the blobs of both are kept, a bell from
+    /// either rings, and the newer clipboard write wins.
     pub(crate) fn merge_newer(&mut self, newer: OneShots) {
+        if !newer.image_blobs.is_empty() {
+            if !self.image_blobs.is_empty() {
+                self.image_blobs.push(',');
+            }
+            self.image_blobs.push_str(&newer.image_blobs);
+        }
         self.bell |= newer.bell;
         if newer.clip_b64.is_some() {
             self.clip_b64 = newer.clip_b64;
         }
     }
+
+    /// The image blobs as the client's `DumpState::image_blobs` holds them.
+    pub(crate) fn image_blob_map(&self) -> std::collections::HashMap<String, String> {
+        if self.image_blobs.is_empty() {
+            return Default::default();
+        }
+        serde_json::from_str(&format!("{{{}}}", self.image_blobs)).unwrap_or_default()
+    }
 }
 
 fn is_base64(s: &str) -> bool {
     s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// Decimal ids and base64 bytes, quoted, so pane text (whose quotes are
+/// escaped with a backslash) never reads as the field.
+fn is_blob_members(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'"' | b':' | b','))
 }
 
 /// Append the one shots to a frame that ends with `}`. A line still carrying
@@ -61,6 +91,11 @@ pub(crate) fn append(frame: &mut String, shots: &OneShots) {
         return;
     }
     frame.truncate(end - 1);
+    if !shots.image_blobs.is_empty() {
+        frame.push_str(BLOBS_KEY);
+        frame.push_str(&shots.image_blobs);
+        frame.push('}');
+    }
     if let Some(b64) = &shots.clip_b64 {
         frame.push_str(CLIP_KEY);
         frame.push_str(b64);
@@ -73,7 +108,8 @@ pub(crate) fn append(frame: &mut String, shots: &OneShots) {
 }
 
 /// Remove the one shots from the end of a frame and return them. A frame
-/// without them (or a line that is not a frame) is left as it is.
+/// without them (or a line that is not a frame) is left as it is, except that
+/// an empty `image_blobs` is removed as well.
 pub(crate) fn take(frame: &mut String) -> OneShots {
     let mut shots = OneShots::default();
     let trimmed = frame.trim_end().len();
@@ -95,7 +131,19 @@ pub(crate) fn take(frame: &mut String) -> OneShots {
             }
         }
     }
-    if !shots.is_empty() {
+    // An empty `image_blobs` comes off too, so a frame that later gets
+    // another frame's blobs appended never has the field twice.
+    let head = &frame[..end];
+    if head.ends_with('}') {
+        if let Some(pos) = head.rfind(BLOBS_KEY) {
+            let members = &head[pos + BLOBS_KEY.len()..head.len() - 1];
+            if is_blob_members(members) {
+                shots.image_blobs = members.to_string();
+                end = pos;
+            }
+        }
+    }
+    if end != trimmed - 1 {
         frame.truncate(end);
         frame.push('}');
     }

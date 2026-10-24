@@ -970,6 +970,8 @@ pub(crate) fn take_frame_oneshots(app: &mut AppState) -> crate::frame_oneshot::O
     crate::frame_oneshot::OneShots {
         clip_b64: app.clipboard_osc52.take().map(|t| crate::util::base64_encode(&t)),
         bell: std::mem::take(&mut app.bell_forward),
+        // The frame builders write `image_blobs` themselves.
+        image_blobs: String::new(),
     }
 }
 

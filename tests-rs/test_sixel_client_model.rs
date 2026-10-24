@@ -116,3 +116,24 @@ fn malformed_blob_id_or_base64_is_skipped_not_panicked() {
     // Neither entry lands in the cache; no panic occurred.
     assert!(cache.is_empty(), "malformed entries skipped, cache stays empty");
 }
+
+#[test]
+fn a_reshipped_id_replaces_the_cached_blob() {
+    // After switch-client the client talks to another server, whose image ids
+    // start at 1 as well.  Its blob for id 1 must replace the one cached from
+    // the first server, or the client draws the old image.
+    let old: &[u8] = b"\x1bPq#0~~\x1b\\";
+    let new: &[u8] = b"\x1bPq#1@@\x1b\\";
+    let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
+    let ship = |raw: &[u8]| -> HashMap<String, String> {
+        HashMap::from([("1".to_string(), base64::engine::general_purpose::STANDARD.encode(raw))])
+    };
+    crate::client::merge_image_blobs(&mut cache, &ship(old));
+    crate::client::merge_image_blobs(&mut cache, &ship(new));
+    assert_eq!(cache.get(&1).map(|v| v.as_slice()), Some(new));
+
+    // Malformed entries are still skipped.
+    let bad: HashMap<String, String> = serde_json::from_str(r#"{"x":"AAAA","2":"!!"}"#).unwrap();
+    crate::client::merge_image_blobs(&mut cache, &bad);
+    assert_eq!(cache.len(), 1);
+}

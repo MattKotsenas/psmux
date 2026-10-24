@@ -173,9 +173,6 @@ pub struct Screen {
     /// grid).  See [`crate::image`].
     sixel_images: Vec<crate::image::SixelImage>,
 
-    /// Monotonic id source for `sixel_images`; starts at 1 (0 = "no image").
-    next_image_id: u64,
-
     /// Currently-running command as announced by the shell via shell-integration
     /// OSC sequences (issue #299). `None` when the shell is idle (at the prompt)
     /// or hasn't emitted any command-identity sequence. `Some(<cmd>)` when:
@@ -341,7 +338,6 @@ impl Screen {
             osc52_clipboard: None,
             hyperlinks: Vec::new(),
             sixel_images: Vec::new(),
-            next_image_id: 1,
             osc_shell_command: None,
             palette: None,
             palette_generation: 0,
@@ -1192,8 +1188,7 @@ impl Screen {
     /// grid.  Mirrors the `set_progress` side-channel; called by the parser
     /// from `unhook` once a full sixel DCS has been reconstructed.
     pub fn add_image(&mut self, mut img: crate::image::SixelImage) -> u64 {
-        let id = self.next_image_id;
-        self.next_image_id += 1;
+        let id = crate::image::next_image_id();
         img.id = id;
         img.on_alt = self.mode(MODE_ALTERNATE_SCREEN);
         img.anchor_line = self.grid().absolute_line_of_cursor();
@@ -1201,6 +1196,34 @@ impl Screen {
         self.sixel_images.push(img);
         self.prune_images();
         id
+    }
+
+    /// The cursor row and the margins a sixel starting there is laid out in,
+    /// as `(row, top, bottom)` screen rows.  A cursor below the scroll region
+    /// is not confined by it.
+    pub(crate) fn sixel_text_area(&self) -> (u16, u16, u16) {
+        let grid = self.grid();
+        let row = grid.pos().row;
+        let (top, bottom) = grid.scroll_margins();
+        if row > bottom {
+            (row, 0, grid.size().rows - 1)
+        } else {
+            (row, top, bottom)
+        }
+    }
+
+    /// Ends a sixel the way the pane's console host does: `scroll` line feeds
+    /// at the bottom margin to make room, then the text cursor goes to `row`,
+    /// back in the column the image started in.
+    pub(crate) fn finish_sixel(&mut self, scroll: u16, row: u16, col: u16) {
+        let (_, _, bottom) = self.sixel_text_area();
+        let grid = self.grid_mut();
+        if scroll > 0 {
+            grid.row_set(bottom);
+            grid.row_inc_scroll(scroll);
+        }
+        grid.row_set(row);
+        grid.col_set(col);
     }
 
     /// Returns the sixel images currently retained on this screen (both grids).

@@ -545,13 +545,16 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         self.dcs_buf.push(0x1b);
         self.dcs_buf.push(b'\\');
 
-        let (px_width, px_height) = sixel_pixel_dims(&self.dcs_buf);
+        let (row, top, bottom) = self.screen.sixel_text_area();
+        let (_, col) = self.screen.cursor_position();
+        let layout = sixel_layout(&self.dcs_buf, bottom + 1 - row, bottom + 1 - top);
+        let (px_width, px_height) = (layout.px_width, layout.px_height);
         let (cell_width, cell_height) =
             crate::image::cell_dims_from_px(px_width, px_height);
 
         let img = crate::image::SixelImage {
             id: 0,             // assigned by add_image
-            raw: self.dcs_buf.clone(),
+            raw: bound_background(&self.dcs_buf, &layout),
             px_width,
             px_height,
             cell_width,
@@ -562,137 +565,217 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         };
         self.screen.add_image(img);
 
-        // Cursor advance (tmux sixel-scrolling = xterm default): move to the
-        // left margin, then down cell_height rows, reusing cr()/lf() so scroll
-        // region, scrollback push and first_line accounting stay uniform.
-        self.screen.cr();
-        for _ in 0..cell_height {
-            self.screen.lf();
-        }
+        // The pane's real terminal is the console host, and the text it sends
+        // after the image (a CR LF, a prompt, cursor moves) assumes the cursor
+        // is where that host left it.  tmux moves to the line below the image
+        // (screen-write.c:2947), but OpenConsole, the only host that passes
+        // sixel through, follows Windows Terminal: same column, on the row
+        // holding the top of the last sixel band.  Following tmux here put
+        // every later line one row lower than the host had it.
+        let final_row = row
+            .saturating_add(layout.cursor_rows)
+            .saturating_sub(layout.scroll_rows)
+            .max(top)
+            .min(bottom);
+        self.screen
+            .finish_sixel(layout.scroll_rows, final_row, col);
 
         self.dcs_active = false;
         self.dcs_buf.clear();
     }
 }
 
-/// Determines a sixel image's pixel dimensions from its reconstructed DCS blob.
+/// Where a sixel lands and where it leaves the text cursor, in the units the
+/// pane's console host uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SixelLayout {
+    /// Image width in pixels: the widest band, or the raster width if larger.
+    pub px_width: u32,
+    /// Image height in pixels: down to the bottom of the last band that drew
+    /// something, or the raster height if larger.
+    pub px_height: u32,
+    /// Rows from the image's top row down to the row the cursor ends on.
+    pub cursor_rows: u16,
+    /// Lines the text scrolls up first so the image fits above the bottom
+    /// margin.
+    pub scroll_rows: u16,
+    /// Pixel aspect ratio the introducer selects, before any raster command.
+    pub aspect: u32,
+}
+
+/// The blob with a raster command `"aspect;1;width;height` put right after the
+/// introducer, so a terminal that fills the background stops at the image.
 ///
-/// Prefers the raster attributes command `"Pan;Pad;Ph;Pv` (the width `Ph` and
-/// height `Pv` follow the introducer's `q`).  If the raster is absent, falls
-/// back to scanning the sixel data: width = the widest band's column count
-/// (honouring `!Rn` run-length repeats), height = 6 pixels per band.  The
-/// fallback is deliberately conservative and only feeds cell-footprint math
-/// (cursor advance / clipping), never the rasterised pixels.
-fn sixel_pixel_dims(buf: &[u8]) -> (u32, u32) {
-    // Locate the payload: everything after the introducer's final 'q'.  The
-    // blob always starts with ESC P, so search from index 2 onward for 'q'.
-    let payload_start = buf
-        .iter()
-        .position(|&b| b == b'q')
-        .map_or(buf.len(), |i| i + 1);
-    let payload = &buf[payload_start..];
+/// With background select 0 (the default) and no raster size, Windows
+/// Terminal fills from the image to the bottom right of the page with colour
+/// 0 (`_fillImageBackground`).  Text written afterwards erases that fill,
+/// which hides it when an application prints the image once.  The client
+/// draws the image again whenever the set of images changes, though, and
+/// ratatui does not rewrite unchanged cells, so the fill blanked every row
+/// below the image, other panes to its right and the status line.
+///
+/// The aspect ratio is the one the introducer already selects, so the image
+/// keeps its shape, and a raster command of the image's own comes after this
+/// one and still wins.
+fn bound_background(buf: &[u8], layout: &SixelLayout) -> Vec<u8> {
+    let Some(q) = buf.iter().position(|&b| b == b'q') else {
+        return buf.to_vec();
+    };
+    let raster = format!(
+        "\"{};1;{};{}",
+        layout.aspect, layout.px_width, layout.px_height
+    );
+    let mut out = Vec::with_capacity(buf.len() + raster.len());
+    out.extend_from_slice(&buf[..=q]);
+    out.extend_from_slice(raster.as_bytes());
+    out.extend_from_slice(&buf[q + 1..]);
+    out
+}
 
-    // Raster attributes: `"Pan;Pad;Ph;Pv`.  Scan for the '"' and read the
-    // following ';'-separated decimal fields.
-    if let Some(q) = payload.iter().position(|&b| b == b'"') {
-        let mut fields: [u32; 4] = [0; 4];
-        let mut idx = 0usize;
-        let mut cur: u32 = 0;
-        let mut saw_digit = false;
-        for &b in &payload[q + 1..] {
-            match b {
-                b'0'..=b'9' => {
-                    cur = cur.saturating_mul(10).saturating_add(u32::from(b - b'0'));
-                    saw_digit = true;
-                }
-                b';' => {
-                    if idx < 4 {
-                        fields[idx] = cur;
-                    }
-                    idx += 1;
-                    cur = 0;
-                    if idx >= 4 {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        if idx < 4 && saw_digit {
-            fields[idx] = cur;
-            idx += 1;
-        }
-        // Need all four fields (Pan;Pad;Ph;Pv) with a non-zero size to trust it.
-        if idx >= 4 && fields[2] > 0 && fields[3] > 0 {
-            return (fields[2], fields[3]);
-        }
-    }
+/// Lays out a reconstructed sixel DCS the way Windows Terminal's
+/// `SixelParser` does (microsoft/terminal, src/terminal/adapter/SixelParser.cpp
+/// at c829d4ca), since OpenConsole runs that parser for the pane and its
+/// later output assumes the result.  `avail_rows` is the room from the cursor
+/// row to the bottom margin and `margin_rows` the height of the margins.
+///
+/// - Cells are 10 by 20 pixels (`CellSizeForLevel`).
+/// - A sixel band is 6 pixels times the pixel aspect ratio.  The ratio comes
+///   from the first introducer parameter, 2:1 when it is 0 or omitted
+///   (`_initRasterAttributes`), and a raster command `"Pan;Pad;...` replaces
+///   it with `ceil(Pan / Pad)` (`_updateRasterAttributes`).
+/// - Each graphics new line (`-`) first scrolls the text while the band does
+///   not fit with a pixel to spare, then moves down one band
+///   (`_executeNextLine`, `_maybeFlushImageBuffer`).  The end of the sequence
+///   runs the same scroll check.
+/// - The cursor ends on the row holding the top of the last band
+///   (`_updateTextCursor`).
+pub(crate) fn sixel_layout(buf: &[u8], avail_rows: u16, margin_rows: u16) -> SixelLayout {
+    let cell_h = i64::from(crate::image::DEFAULT_CELL_PX.1);
 
-    // Fallback: scan the sixel data to estimate dimensions.
+    // The introducer sits between ESC P and the first 'q'.
+    let q = buf.iter().position(|&b| b == b'q').unwrap_or(buf.len());
+    let intro = buf.get(2..q).unwrap_or(&[]);
+    let macro_param = intro
+        .split(|&b| b == b';')
+        .next()
+        .and_then(|p| std::str::from_utf8(p).ok())
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let intro_aspect: u32 = match macro_param {
+        0 | 1 | 5 | 6 => 2,
+        2 => 5,
+        3 | 4 => 3,
+        _ => 1,
+    };
+    let mut aspect = i64::from(intro_aspect);
+    let margin_px = i64::from(margin_rows) * cell_h;
+    let max_aspect = (margin_px / 6).max(1);
+    let mut sixel_h = 6 * aspect;
+    let mut segment_h = sixel_h;
+    let mut avail = i64::from(avail_rows) * cell_h;
+    let mut y: i64 = 0;
+    let mut scroll: i64 = 0;
     let mut cur_x: u32 = 0;
     let mut max_x: u32 = 0;
-    let mut bands: u32 = 1;
+    let mut drawn_bottom: i64 = 0;
+    let mut raster = (0u32, 0u32);
+
+    let fit = |segment_h: i64, avail: &mut i64, scroll: &mut i64| {
+        if segment_h > *avail {
+            while *avail < margin_px && segment_h >= *avail {
+                *scroll += 1;
+                *avail += cell_h;
+            }
+        }
+    };
+
+    let payload = buf.get(q + 1..).unwrap_or(&[]);
     let mut i = 0usize;
+    // Reads `;` separated decimal fields starting at `payload[i]`.
+    let read_fields = |i: &mut usize| -> Vec<u32> {
+        let mut fields = vec![0u32];
+        while *i < payload.len() {
+            match payload[*i] {
+                b @ b'0'..=b'9' => {
+                    let last = fields.last_mut().expect("never empty");
+                    *last = last.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                }
+                b';' => fields.push(0),
+                _ => break,
+            }
+            *i += 1;
+        }
+        fields
+    };
     while i < payload.len() {
-        let b = payload[i];
-        match b {
-            b'!' => {
-                // Run-length: !Rn <sixel-char> repeats the next data char n times.
+        match payload[i] {
+            b'"' => {
                 i += 1;
-                let mut n: u32 = 0;
-                while i < payload.len() && payload[i].is_ascii_digit() {
-                    n = n.saturating_mul(10).saturating_add(u32::from(payload[i] - b'0'));
-                    i += 1;
+                let f = read_fields(&mut i);
+                let (pan, pad) = (f.first().copied().unwrap_or(0), f.get(1).copied().unwrap_or(0));
+                if pad > 0 {
+                    aspect = (i64::from(pan.div_ceil(pad))).clamp(1, max_aspect);
+                    sixel_h = 6 * aspect;
+                    segment_h = segment_h.max(sixel_h);
                 }
-                // Consume the repeated data char (if present); it advances n cols.
-                if i < payload.len() && (0x3f..=0x7e).contains(&payload[i]) {
-                    i += 1;
-                }
-                cur_x = cur_x.saturating_add(n.max(1));
+                raster = (
+                    f.get(2).copied().filter(|&w| w > 0).unwrap_or(raster.0),
+                    f.get(3).copied().filter(|&h| h > 0).unwrap_or(raster.1),
+                );
+                max_x = max_x.max(cur_x);
+                cur_x = 0;
                 continue;
             }
             b'#' => {
-                // Color introducer: skip its numeric/';'-separated params (no x).
                 i += 1;
-                while i < payload.len()
-                    && (payload[i].is_ascii_digit() || payload[i] == b';')
-                {
-                    i += 1;
-                }
+                let _ = read_fields(&mut i);
                 continue;
             }
-            b'"' => {
-                // Raster (already handled above); skip its numeric params here.
+            b'!' => {
                 i += 1;
-                while i < payload.len()
-                    && (payload[i].is_ascii_digit() || payload[i] == b';')
-                {
+                let n = read_fields(&mut i).first().copied().unwrap_or(0).max(1);
+                if i < payload.len() && (0x3f..=0x7e).contains(&payload[i]) {
+                    cur_x = cur_x.saturating_add(n);
+                    drawn_bottom = drawn_bottom.max(y + sixel_h);
                     i += 1;
                 }
                 continue;
             }
             b'$' => {
-                // Carriage return within the band: reset x, same band.
                 max_x = max_x.max(cur_x);
                 cur_x = 0;
             }
             b'-' => {
-                // Graphics newline: next band, 6 more pixels tall.
                 max_x = max_x.max(cur_x);
                 cur_x = 0;
-                bands = bands.saturating_add(1);
+                fit(segment_h, &mut avail, &mut scroll);
+                segment_h = sixel_h;
+                if avail > 0 {
+                    y += sixel_h;
+                    avail -= sixel_h;
+                }
             }
             0x3f..=0x7e => {
-                // A sixel data byte occupies one column.
                 cur_x = cur_x.saturating_add(1);
+                drawn_bottom = drawn_bottom.max(y + sixel_h);
             }
             0x1b => break, // ESC of the ST terminator
             _ => {}
         }
         i += 1;
     }
+    fit(segment_h, &mut avail, &mut scroll);
     max_x = max_x.max(cur_x);
-    (max_x.max(1), bands.saturating_mul(6))
+
+    let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
+    let to_u16 = |v: i64| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+    SixelLayout {
+        px_width: max_x.max(raster.0).max(1),
+        px_height: to_u32(drawn_bottom).max(raster.1).max(1),
+        cursor_rows: to_u16(y / cell_h),
+        scroll_rows: to_u16(scroll),
+        aspect: intro_aspect,
+    }
 }
 
 // ---------------------------------------------------------------------------

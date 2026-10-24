@@ -264,8 +264,9 @@ fn serialize_overlay_json(app: &AppState) -> String {
 /// so subsequent frames ship only the tiny per-leaf descriptor.  When every
 /// visible id has already shipped this returns `"{}"`, keeping steady-state
 /// frames small and NC-dedup effective (sixel design section 3b / M4).  Called
-/// at BOTH dump-state build sites (design risk 7).
-fn build_image_blobs_json(app: &mut AppState) -> String {
+/// at BOTH dump-state build sites (design risk 7), and by the shared
+/// server's `shared::frame::build_frame`.
+pub(crate) fn build_image_blobs_json(app: &mut AppState) -> String {
     use base64::Engine as _;
     let visible = helpers::visible_image_blobs(app);
     let mut json = String::from("{");
@@ -9515,7 +9516,7 @@ mod test_issue370_startup_error_passthrough;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue431_m4_blobs.rs"]
-mod test_issue431_m4_blobs;
+pub(crate) mod test_issue431_m4_blobs;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue459_warm_single_instance.rs"]

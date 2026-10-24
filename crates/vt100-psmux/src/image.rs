@@ -30,18 +30,32 @@ pub fn cell_dims_from_px(px_width: u32, px_height: u32) -> (u16, u16) {
     )
 }
 
+/// Source of image ids for every pane in the process.  The server ships each
+/// blob once per id and the client caches blobs by id, so an id must not be
+/// handed out twice: a counter per screen started every pane, and every RIS,
+/// at 1 again, and pane B's first image was then never shipped because pane
+/// A's had been.
+static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Takes the next unused image id (never 0).
+pub(crate) fn next_image_id() -> u64 {
+    NEXT_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A single sixel image anchored at a logical position on a pane's grid.
 #[derive(Clone, Debug)]
 pub struct SixelImage {
-    /// Stable per-`Screen` monotonic id.  The blob is shipped to the client
-    /// once and referenced by id thereafter.
+    /// Id unique in the process (see [`next_image_id`]).  The blob is shipped
+    /// to the client once and referenced by id thereafter.
     pub id: u64,
-    /// Exact re-emit bytes: `ESC P` + params + intermediates + `q` + payload +
-    /// `ST`.  Writable verbatim to a sixel-capable terminal after a cursor move.
+    /// Re-emit bytes: `ESC P` + params + intermediates + `q` + a raster
+    /// command bounding the background to the image + payload + `ST`.
+    /// Writable verbatim to a sixel-capable terminal after a cursor move.
     pub raw: Vec<u8>,
-    /// Image width in pixels (from the raster attributes, else scanned).
+    /// Image width in pixels: the widest band, or the raster width if larger.
     pub px_width: u32,
-    /// Image height in pixels (from the raster attributes, else scanned).
+    /// Image height in pixels at the image's aspect ratio: the bottom of the
+    /// last band that draws, or the raster height if larger.
     pub px_height: u32,
     /// Cell width = `ceil(px_width / cell_px_w)` (see [`DEFAULT_CELL_PX`]).
     pub cell_width: u16,

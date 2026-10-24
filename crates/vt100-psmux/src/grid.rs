@@ -839,6 +839,11 @@ impl Grid {
         self.scroll_down(lines + extra_lines);
     }
 
+    /// The scroll region as `(top, bottom)` screen rows, both inclusive.
+    pub fn scroll_margins(&self) -> (u16, u16) {
+        (self.scroll_top, self.scroll_bottom)
+    }
+
     pub fn row_set(&mut self, i: u16) {
         self.pos.row = i;
         self.row_clamp();

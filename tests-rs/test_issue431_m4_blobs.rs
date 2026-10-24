@@ -44,7 +44,7 @@ fn sixel_bytes() -> Vec<u8> {
 
 /// Build a one-window, one-pane AppState with the sixel pre-loaded into the
 /// pane's screen (fed through the real vt100 parser, bypassing conhost).
-fn app_with_sixel_pane() -> AppState {
+pub(crate) fn app_with_sixel_pane() -> AppState {
     let (reader, _peer_r) = tcp_pair();
     let (writer, _peer_w) = tcp_pair();
     let pane = crate::proxy_pane::create_proxy_pane(

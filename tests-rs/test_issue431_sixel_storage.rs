@@ -35,18 +35,18 @@ fn add_image_sets_anchor_and_id() {
     // Move cursor to row 5, col 3 (1-indexed) => pos.row=4, col=2.
     p.process(b"\x1b[5;3H");
     let id = p.screen_mut().add_image(mk_image(100, 40));
-    assert_eq!(id, 1, "first image gets id 1");
+    assert_ne!(id, 0, "0 is never an image id");
     let imgs = p.screen().images();
     assert_eq!(imgs.len(), 1);
     let img = &imgs[0];
-    assert_eq!(img.id, 1);
+    assert_eq!(img.id, id);
     assert_eq!(img.anchor_line, 4, "no scrollback => abs line == cursor row");
     assert_eq!(img.anchor_col, 2);
     assert!(!img.on_alt, "added on the main grid");
 
-    // Second image gets the next id.
+    // Second image gets a later id.
     let id2 = p.screen_mut().add_image(mk_image(10, 20));
-    assert_eq!(id2, 2);
+    assert!(id2 > id, "ids increase: {id} then {id2}");
     assert_eq!(p.screen().images().len(), 2);
 }
 
@@ -59,7 +59,6 @@ fn image_pruned_when_anchor_scrolls_off_scrollback() {
     let id1 = p.screen_mut().add_image(mk_image(10, 20)); // 1 cell tall
     assert_eq!(p.screen().images().len(), 1);
     assert_eq!(p.screen().images()[0].anchor_line, 0);
-    assert_eq!(id1, 1);
 
     // Scroll well past the scrollback cap so first_line advances beyond
     // anchor_line + cell_height (== 1).
@@ -68,10 +67,10 @@ fn image_pruned_when_anchor_scrolls_off_scrollback() {
     }
     // Adding a new image runs prune_images, which must drop the scrolled-off id1.
     let id2 = p.screen_mut().add_image(mk_image(10, 20));
-    assert_eq!(id2, 2);
+    assert_ne!(id2, id1);
     let imgs = p.screen().images();
     assert_eq!(imgs.len(), 1, "scrolled-off image pruned, only new one remains");
-    assert_eq!(imgs[0].id, 2, "the surviving image is the newly added one");
+    assert_eq!(imgs[0].id, id2, "the surviving image is the newly added one");
 }
 
 #[test]
@@ -142,4 +141,28 @@ fn clear_scrollback_keeps_cursor_absolute_line_stable() {
     let after = p.screen_mut().add_image(mk_image(10, 20));
     let anchor_after = p.screen().images().iter().find(|i| i.id == after).unwrap().anchor_line;
     assert_eq!(anchor_before, anchor_after, "cursor absolute line stable across 3J");
+}
+
+#[test]
+fn two_panes_never_share_an_image_id() {
+    // The server ships each blob once per id and the client caches by id, so
+    // two panes must not both hand out the same id.  With a counter per
+    // screen, both panes' first image was id 1 and only one blob was shipped.
+    let mut a: Parser = Parser::new(10, 40, 100);
+    let mut b: Parser = Parser::new(10, 40, 100);
+    let ia = a.screen_mut().add_image(mk_image(10, 20));
+    let ib = b.screen_mut().add_image(mk_image(10, 20));
+    assert_ne!(ia, ib, "pane A and pane B got the same image id");
+}
+
+#[test]
+fn ris_does_not_reuse_an_image_id() {
+    // RIS rebuilds the screen.  The image id must not restart, or the client
+    // would draw the blob it cached for the image from before the reset.
+    let mut p: Parser = Parser::new(10, 40, 100);
+    let before = p.screen_mut().add_image(mk_image(10, 20));
+    p.process(b"\x1bc");
+    assert!(p.screen().images().is_empty(), "RIS drops the image");
+    let after = p.screen_mut().add_image(mk_image(10, 20));
+    assert_ne!(before, after, "RIS restarted the image ids");
 }
