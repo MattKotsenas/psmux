@@ -643,7 +643,7 @@ pub fn server_info_text(app: &AppState) -> String {
         app.session_name,
         app.windows.len(),
         (chrono::Local::now() - app.created_at).num_seconds(),
-        crate::paths::port_file(&app.port_file_base())
+        crate::paths::port_file(app.port_file_base())
     )
 }
 
