@@ -446,6 +446,11 @@ impl Drop for AsyncFormatGuard {
     }
 }
 
+pub(crate) type JobContext = Box<dyn FnOnce(&mut std::process::Command) + Send>;
+
+pub(crate) static JOB_CONTEXT: std::sync::OnceLock<fn() -> Option<JobContext>> =
+    std::sync::OnceLock::new();
+
 /// The child a `#()` job runs in. tmux starts it through job_run with no
 /// session (format.c:431), so it has $TMUX and the global environment (#804).
 fn format_job_command(cmd: &str) -> std::process::Command {
@@ -536,8 +541,13 @@ fn run_shell_command(cmd: &str, app: &AppState) -> String {
             // other #() expansions in the same push don't double-spawn.
             guard.insert(cmd.to_string(), crate::types::ShellEntry { at: base_at, value: last_value.clone(), running: true });
             drop(guard);
+            let job_context = JOB_CONTEXT.get().and_then(|capture| capture());
             std::thread::spawn(move || {
-                let output = format_job_command(&cmd_owned).output();
+                let mut command = format_job_command(&cmd_owned);
+                if let Some(apply) = job_context {
+                    apply(&mut command);
+                }
+                let output = command.output();
                 let value = match output {
                     Ok(o) if o.status.success() => {
                         String::from_utf8_lossy(&o.stdout).trim().to_string()

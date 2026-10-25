@@ -123,6 +123,113 @@ function Scenario($exe, $mode) {
     return ($sig -join "`n")
 }
 
+function Run-Raw($exe, $ctx, $mode, [string[]]$a, $extraEnv = @{}) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $quoted = @('-L', $ctx.Ns) + $a | ForEach-Object {
+        if ($_ -eq '' -or $_ -match '[\s"]') { '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"' } else { $_ }
+    }
+    $psi.Arguments = $quoted -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
+    $psi.EnvironmentVariables['PSMUX_DATA_DIR'] = $ctx.Dir
+    $psi.EnvironmentVariables.Remove('PSMUX_SERVER_MODE')
+    $psi.EnvironmentVariables.Remove('T895_V')
+    if ($mode -ne '<unset>') { $psi.EnvironmentVariables['PSMUX_SERVER_MODE'] = $mode }
+    foreach ($k in $extraEnv.Keys) { $psi.EnvironmentVariables[$k] = $extraEnv[$k] }
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    $outMs = New-Object IO.MemoryStream; $errMs = New-Object IO.MemoryStream
+    $outTask = $p.StandardOutput.BaseStream.CopyToAsync($outMs)
+    $errTask = $p.StandardError.BaseStream.CopyToAsync($errMs)
+    if (-not $p.WaitForExit(20000)) {
+        try { $p.Kill() } catch {}
+        return @{ Error = "timed out after 20 s: $($a -join ' ')" }
+    }
+    if (-not [Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 5000)) {
+        return @{ Error = "output not drained 5 s after exit: $($a -join ' ')" }
+    }
+    $p.WaitForExit()
+    return @{ Code = $p.ExitCode; Out = $outMs.ToArray(); Err = $errMs.ToArray() }
+}
+
+function Hex([byte[]]$bytes, $max = 0) {
+    if ($null -eq $bytes) { $bytes = [byte[]]@() }
+    if ($max -gt 0 -and $bytes.Length -gt $max) { $bytes = $bytes[0..($max - 1)] }
+    ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
+}
+
+function Sha([byte[]]$bytes) {
+    if ($null -eq $bytes) { $bytes = [byte[]]@() }
+    $h = [Security.Cryptography.SHA256]::Create()
+    try { Hex $h.ComputeHash($bytes) } finally { $h.Dispose() }
+}
+
+function JobSample($exe, $mode) {
+    $res = @{ Items = [ordered]@{}; Error = '' }
+    foreach ($f in 'payload.txt', 'identity.txt', 'done.txt') { Remove-Item (Join-Path $JOB $f) -Force -EA SilentlyContinue }
+    Get-ChildItem $JOB -Filter *.tmp -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
+    $left = @(Get-ChildItem $JOB -Name -EA SilentlyContinue | Where-Object { $_ -ne 'ctx.cmd' })
+    if ($left.Count) { $res.Error = "outputs of an earlier sample left: $($left -join ',')"; return $res }
+    $ctx = New-Ns "j"
+    $res.Ns = $ctx.Ns
+    $steps = @(
+        @('new', @('new-session', '-d', '-s', 'J', '-x', '100', '-y', '30', '-c', $JOBDIR), @{ T895_V = 'fixed895' }),
+        @('interval', @('set-option', '-t', 'J', 'status-interval', '1'), @{}),
+        @('right', @('set-option', '-t', 'J', 'status-right', "#($JOB\ctx.cmd)"), @{}),
+        @('show', @('show-options', '-v', '-t', 'J', 'status-right'), @{}))
+    foreach ($s in $steps) {
+        $r = Run-Raw $exe $ctx $mode $s[1] $s[2]
+        if ($r.Error) { $res.Error = $r.Error; Stop-Ns $exe $ctx; return $res }
+        $res.Items["$($s[0]).out"] = $r.Out
+        $res.Items["$($s[0]).err"] = $r.Err
+        $res.Items["$($s[0]).code"] = [Text.Encoding]::ASCII.GetBytes("$($r.Code)")
+    }
+    $base = "$($ctx.Ns)__J"
+    try {
+        $res.Port = (Get-Content (Join-Path $ctx.Dir "$base.port") -Raw -EA Stop).Trim()
+        $res.Pid = ((Get-Content (Join-Path $ctx.Dir "$base.pid") -Raw -EA Stop).Trim() -split ':')[0]
+        $key = (Get-Content (Join-Path $ctx.Dir "$base.key") -Raw -EA Stop).Trim()
+    } catch { $res.Error = "registry of J not readable: $_"; Stop-Ns $exe $ctx; return $res }
+    $done = Join-Path $JOB 'done.txt'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path $done) -and $sw.ElapsedMilliseconds -lt 10000) {
+        try {
+            $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', [int]$res.Port)
+            $st = $t.GetStream(); $st.ReadTimeout = 4000
+            $b = [Text.Encoding]::UTF8.GetBytes("AUTH $key`ndump-state`n"); $st.Write($b, 0, $b.Length); $st.Flush()
+            $buf = New-Object byte[] 65536
+            try { while ($st.Read($buf, 0, $buf.Length) -gt 0) {} } catch {}
+            $t.Close()
+        } catch {}
+        $next = $sw.ElapsedMilliseconds + 1200
+        while (-not (Test-Path $done) -and $sw.ElapsedMilliseconds -lt [Math]::Min($next, 10000)) { Start-Sleep -Milliseconds 100 }
+    }
+    $ran = Test-Path $done
+    Stop-Ns $exe $ctx
+    $gone = $false
+    for ($i = 0; $i -lt 50 -and -not $gone; $i++) { $gone = (@(Server-Procs $exe $ctx.Ns).Count -eq 0); if (-not $gone) { Start-Sleep -Milliseconds 100 } }
+    if (-not $ran) { $res.Error = 'the job wrote no done.txt within 10 s of the first dump-state'; return $res }
+    if (-not $gone) { $res.Error = 'server processes of the sample left 5 s after kill-server'; return $res }
+    $res.Items['payload'] = [IO.File]::ReadAllBytes((Join-Path $JOB 'payload.txt'))
+    $res.Identity = [IO.File]::ReadAllBytes((Join-Path $JOB 'identity.txt'))
+    return $res
+}
+
+function Identity-Problem($s) {
+    $text = [Text.Encoding]::ASCII.GetString($s.Identity)
+    if ($text -cnotmatch '^T=([^;\r\n]*);X=([^\r\n]*)\r\n$') { return "unexpected identity bytes $(Hex $s.Identity 64)" }
+    $target = $Matches[1]; $fields = $Matches[2] -split ','
+    if ($target -cne "$($s.Ns)__J") { return "T=$target, registry $($s.Ns)__J" }
+    if ($fields.Count -ne 3) { return "X has $($fields.Count) fields: $($Matches[2])" }
+    if ($fields[0] -cne "/tmp/psmux-$($s.Pid)/$($s.Ns)" -or $fields[1] -cne $s.Port -or $fields[2] -cne '0') {
+        return "X=$($Matches[2]), registry pid $($s.Pid) port $($s.Port)"
+    }
+    return ''
+}
+
 try {
     Head "Part 1: the default path is the same with the switch unset, per-session and empty"
     $sigs = @{}
@@ -138,6 +245,60 @@ try {
     if ($BASE) {
         $b = Scenario $BASE '<unset>'
         Check ($b -eq $sigs['<unset>']) "the signature equals the baseline binary's" ("`nbaseline:`n$b")
+    }
+
+    $JOB = Join-Path $ROOT 'job'; $JOBDIR = Join-Path $ROOT 'job-dir'
+    if ($ROOT -match '\s') {
+        Fail "job samples need a temp folder without spaces (cmd /C runs the job path): $ROOT"
+    } else {
+        New-Item -ItemType Directory -Force $JOB, $JOBDIR | Out-Null
+        Set-Content -Encoding ASCII (Join-Path $JOB 'ctx.cmd') @(
+            '@echo off',
+            "if exist `"$JOB\done.txt`" exit /b 0",
+            ">`"$JOB\payload.tmp`" echo V=%T895_V%;D=%CD%",
+            ">`"$JOB\identity.tmp`" echo T=%PSMUX_TARGET_SESSION%;X=%TMUX%",
+            "move /y `"$JOB\payload.tmp`" `"$JOB\payload.txt`" >nul",
+            "move /y `"$JOB\identity.tmp`" `"$JOB\identity.txt`" >nul",
+            ">`"$JOB\done.tmp`" echo done",
+            "move /y `"$JOB\done.tmp`" `"$JOB\done.txt`" >nul",
+            'echo ok')
+        $samples = [ordered]@{}
+        foreach ($m in '<unset>', 'per-session', '') { $samples["mode '$m'"] = JobSample $PSMUX $m }
+        if ($BASE) { $samples['baseline'] = JobSample $BASE '<unset>' }
+        $ref = $samples["mode '<unset>'"]
+        foreach ($name in $samples.Keys) {
+            $s = $samples[$name]
+            Check (-not $s.Error) "job sample ${name}: the job ran and its server ended" $s.Error
+        }
+        if (-not $ref.Error) {
+            Write-Host "      payload bytes: $(Hex $ref.Items['payload'])"
+            $want = [Text.Encoding]::ASCII.GetBytes("V=fixed895;D=$JOBDIR`r`n")
+            Check ((Sha $ref.Items['payload']) -ceq (Sha $want)) "job sample: the job kept the CLI's environment and ran in the session directory" (Hex $ref.Items['payload'])
+        }
+        foreach ($name in @($samples.Keys | Select-Object -Skip 1)) {
+            $s = $samples[$name]
+            if ($s.Error -or $ref.Error) { continue }
+            $diff = @()
+            foreach ($item in $ref.Items.Keys) {
+                $a = Sha $ref.Items[$item]; $b2 = Sha $s.Items[$item]
+                if ($a -cne $b2) { $diff += "$item unset=$a $(Hex $ref.Items[$item] 64) ${name}=$b2 $(Hex $s.Items[$item] 64)" }
+            }
+            Check ($diff.Count -eq 0 -and $s.Items.Count -eq $ref.Items.Count) "job sample ${name}: every raw byte item equals mode '<unset>'s ($($ref.Items.Count) items)" ($diff -join ' | ')
+        }
+        $norm = @{}
+        foreach ($name in $samples.Keys) {
+            $s = $samples[$name]
+            if ($s.Error) { continue }
+            $problem = Identity-Problem $s
+            Check (-not $problem) "job sample ${name}: the job saw its own session's target and TMUX" $problem
+            if (-not $problem) {
+                $norm[$name] = [Text.Encoding]::ASCII.GetString($s.Identity).Replace("/tmp/psmux-$($s.Pid)/", '/tmp/psmux-<pid>/').Replace($s.Ns, '<ns>').Replace(",$($s.Port),", ',<port>,')
+            }
+        }
+        if ($norm.Count -eq $samples.Count) {
+            $first = $norm["mode '<unset>'"]
+            Check (@($norm.Values | Where-Object { $_ -cne $first }).Count -eq 0) "job samples: the normalised identity lines are the same" (($norm.Values | ForEach-Object { $_.Trim() }) -join ' | ')
+        }
     }
 
     Head "Part 2: shared never runs the per session server (step 2: it runs the shared one)"
