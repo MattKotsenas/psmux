@@ -182,6 +182,31 @@ impl Write for ReplyStream {
     }
 }
 
+/// Write an AUTH refusal and close the connection gracefully. A client sends
+/// its command right behind the AUTH line, often as a second segment, so it
+/// can land after we stop reading. Closing a socket with unread data makes
+/// Windows send RST instead of FIN, and the RST throws away the refusal
+/// still sitting in the client's receive buffer: `list-sessions` then read an
+/// error and reported a wrong key as "no response from server (timed out)"
+/// (issue #809). Half-close first, then drain what the client sends until it
+/// closes, for a bounded time.
+fn refuse_auth(write_stream: &mut ReplyStream, r: &mut io::BufReader<TcpStream>, msg: &[u8]) {
+    let _ = write_stream.write_all(msg);
+    let _ = write_stream.flush();
+    let _ = write_stream.socket().shutdown(std::net::Shutdown::Write);
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
+    let mut sink = [0u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match io::Read::read(r, &mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+}
+
 /// A command's failure reply on a one-shot connection: `ERROR: <message>`, or
 /// `ERROR <message>` as the switch-client handlers answer.
 pub(crate) fn is_error_reply(text: &str) -> bool {
@@ -1937,8 +1962,7 @@ let auth_line = auth_line.trim();
 if !auth_line.starts_with("AUTH ") {
     auth_debug(&format!("client_id={} reject: no AUTH prefix, line={:?}", client_id, auth_line));
     // Legacy client without auth - reject for security
-    let _ = write_stream.write_all(b"ERROR: Authentication required\n");
-    let _ = write_stream.flush();
+    refuse_auth(&mut write_stream, &mut r, b"ERROR: Authentication required\n");
     return;
 }
 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
@@ -1947,8 +1971,7 @@ if provided_key != session_key {
         "client_id={} reject: key mismatch provided={:?} expected={:?}",
         client_id, provided_key, session_key
     ));
-    let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
-    let _ = write_stream.flush();
+    refuse_auth(&mut write_stream, &mut r, b"ERROR: Invalid session key\n");
     return;
 }
 // Auth successful - send OK and flush immediately

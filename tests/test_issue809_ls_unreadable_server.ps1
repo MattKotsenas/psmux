@@ -119,6 +119,29 @@ try {
             if ($r.rc -ne 0) { Pass "badkey ${tag}: non-zero exit" } else { Fail "badkey ${tag}: exit 0" }
         }
         CheckAll 'badkey'
+
+        # The command a client sends right behind AUTH can arrive after the
+        # server refused the key. Closing with that data unread made Windows
+        # reset the connection, which threw away the refusal before the client
+        # read it, so list-sessions said "timed out" for a wrong key. Sending
+        # the command late makes that ordering certain on every try.
+        $portFile = Get-ChildItem $Data -Filter '*beta.port' | Select-Object -First 1
+        $bport = [int](Get-Content $portFile.FullName -Raw).Trim()
+        $lateOk = 0; $lateSeen = @{}
+        for ($i = 0; $i -lt 30; $i++) {
+            $tcp = [Net.Sockets.TcpClient]::new('127.0.0.1', $bport); $tcp.NoDelay = $true
+            $st = $tcp.GetStream(); $st.ReadTimeout = 3000
+            $b = [Text.Encoding]::ASCII.GetBytes("AUTH 0000000000000000`n"); $st.Write($b, 0, $b.Length)
+            Start-Sleep -Milliseconds 3
+            $q = [Text.Encoding]::ASCII.GetBytes("list-sessions -F x`n"); try { $st.Write($q, 0, $q.Length) } catch {}
+            Start-Sleep -Milliseconds 30
+            $buf = New-Object byte[] 256
+            $seen = try { $got = $st.Read($buf, 0, 256); [Text.Encoding]::ASCII.GetString($buf, 0, $got).Trim() } catch { "read error: $($_.Exception.InnerException.SocketErrorCode)" }
+            if ($seen -eq 'ERROR: Invalid session key') { $lateOk++ } else { $lateSeen[$seen] = 1 }
+            $tcp.Close()
+        }
+        if ($lateOk -eq 30) { Pass "late command after a refused key: the refusal was read 30 of 30 times" }
+        else { Fail "late command after a refused key: refusal read $lateOk of 30, else [$($lateSeen.Keys -join '; ')]" }
     } finally { Set-Content $keyFile.FullName $key -NoNewline }
 
     $r = Probe @('list-sessions', '-F', '#{session_name}'); Show 'key restored -F' $r

@@ -1018,7 +1018,17 @@ fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>, 
         return;
     }
     if line.trim_end().strip_prefix("AUTH ") != Some(key) {
+        // Half-close and drain so the refusal is not lost to an RST (#809).
         let _ = w.write_all(b"ERROR: Invalid session key\n");
+        let _ = w.flush();
+        let _ = w.shutdown(std::net::Shutdown::Write);
+        let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(250)));
+        let mut sink = [0u8; 4096];
+        while let Ok(k) = io::Read::read(&mut r, &mut sink) {
+            if k == 0 {
+                break;
+            }
+        }
         return;
     }
     line.clear();

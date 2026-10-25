@@ -53,6 +53,26 @@ $classic = "{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}"
 Set-ItemProperty $sk -Name DelegationConsole -Value $classic; Set-ItemProperty $sk -Name DelegationTerminal -Value $classic
 function Restore { if ($oDC) { Set-ItemProperty $sk -Name DelegationConsole -Value $oDC } else { Remove-ItemProperty $sk -Name DelegationConsole -EA SilentlyContinue }; if ($oDT) { Set-ItemProperty $sk -Name DelegationTerminal -Value $oDT } else { Remove-ItemProperty $sk -Name DelegationTerminal -EA SilentlyContinue } }
 
+# Set-Clipboard and Get-Clipboard fail quietly while another window holds the
+# clipboard open, so a set is checked and a read is retried.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value) { return $true }
+    }
+    return $false
+}
+function Read-Clipboard {
+    for ($i = 0; $i -lt 20; $i++) {
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now -ne '') { return $now.TrimEnd("`r", "`n") }
+        Start-Sleep -Milliseconds 100
+    }
+    return ''
+}
 function Read-MLog { if (Test-Path $mlog) { (Get-Content $mlog -EA SilentlyContinue) -join "," } else { "" } }
 function Clear-MLog { if (Test-Path $mlog) { Remove-Item $mlog -Force -EA SilentlyContinue } }
 
@@ -85,13 +105,13 @@ else { Write-Fail "pane does not report wants_mouse=true; mouse-aware gating can
 
 # --- Case A: force OFF (default): app owns the drag (PR #479 behavior) ---
 Write-Host "`n[Case A] force off: nvim owns the drag" -ForegroundColor Yellow
-Set-Clipboard -Value "CLIP_SENTINEL_575"
+if (-not (Set-ClipboardVerified "CLIP_SENTINEL_575")) { Write-Host "  [INFO] the clipboard did not take the sentinel" }
 Clear-MLog
 & $DRAG $cpid drag 2 5 25 5 6 60 | Out-Null
 Start-Sleep -Seconds 2
 $logA = Read-MLog
 $bufA = (& $PSMUX show-buffer -t $S 2>&1 | Out-String).Trim()
-$clipA = ""; try { $clipA = Get-Clipboard -Raw -EA SilentlyContinue } catch {}
+$clipA = Read-Clipboard
 if ($logA -match "press" -and $logA -match "drag") { Write-Pass "nvim received press+drag ($logA)" }
 else { Write-Fail "nvim missing gesture, log=[$logA]" }
 if ($clipA -eq "CLIP_SENTINEL_575" -and $bufA -notmatch "SELROW") { Write-Pass "psmux did not copy (clipboard sentinel intact)" }
@@ -106,7 +126,7 @@ Clear-MLog
 Start-Sleep -Seconds 2
 $logB = Read-MLog
 $bufB = (& $PSMUX show-buffer -t $S 2>&1 | Out-String).Trim()
-$clipB = ""; try { $clipB = Get-Clipboard -Raw -EA SilentlyContinue } catch {}
+$clipB = Read-Clipboard
 if ($logB -notmatch "drag") { Write-Pass "no drag reached nvim (log=[$logB])" }
 else { Write-Fail "drag leaked to nvim: [$logB]" }
 if ($bufB -match "SELROW05" -or $clipB -match "SELROW05") { Write-Pass "dragged text copied (SELROW05)" }
