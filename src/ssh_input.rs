@@ -387,8 +387,9 @@ pub fn is_conemu_host() -> bool {
 /// Whether the client asks the host terminal for bracketed paste
 /// (`ESC[?2004h`).
 ///
-/// tmux always asks (`tty_start_tty`, tty.c:367-368 in 3.7c), because its
-/// input reader always decodes the markers (`ESC[200~` and `ESC[201~` in the
+/// tmux asks whenever the outer terminal has the `Enbp` capability
+/// (`tty_start_tty`, tty.c:372-373, from the bpaste feature), and it can,
+/// because its input reader always decodes the markers (`ESC[200~` and `ESC[201~` in the
 /// key table, tty-keys.c:212-213). psmux decodes them only on the VT input
 /// route and the pipe route. On the console route that is fine under ConPTY,
 /// where conhost strips the markers before the client reads its input (see
