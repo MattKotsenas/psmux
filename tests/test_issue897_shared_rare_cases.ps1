@@ -10,7 +10,9 @@
 #      behind a command alias does not run and gets the unknown command reply;
 #      ordinary batches still work, and an attach is not held 2 s at the gate;
 #   C. the namespace lock never collides with a per session session's lock:
-#      shared `-L x__y` starts next to session `y@shared-server` in `-L x`.
+#      shared `-L x__y` starts next to session `y@shared-server` in `-L x`;
+#   D. a new-session whose first pane would be over 2^22 cells is refused
+#      before anything is created, and the server and its sessions go on.
 #
 # Every step runs under its own -L namespace in a PSMUX_DATA_DIR of its own,
 # with an isolated config, and cleans up only with `-L <ns> kill-server`.
@@ -201,6 +203,22 @@ try {
     Check ($r.Code -eq 0 -and $sw.ElapsedMilliseconds -lt 10000) "shared: -L ${base}__x starts next to it ($($sw.ElapsedMilliseconds) ms)" $r.Out
     Check (@(Shared-Procs $c2.Ns).Count -eq 1) "with its own shared server"
     Check ((S $c1 @('has-session', '-t', 'x@shared-server')).Code -eq 0) "and the per session session is untouched"
+
+    Head "D: a new-session too big for the shared process is refused"
+    $d = New-Ns "d"
+    $r = Run $d 'shared' @('new-session', '-d', '-s', 'A', '-x', '80', '-y', '24')
+    Check ($r.Code -eq 0) "session A at 80x24" $r.Out
+    $ids = { (S $d @('display-message', '-p', '-t', 'A', '#{session_id} #{window_id} #{pane_id}')).Out }
+    $server = { (@(Shared-Procs $d.Ns) | ForEach-Object { "$($_.ProcessId)/$($_.CreationDate.Ticks)" }) -join ',' }
+    $idsBefore = & $ids
+    $serverBefore = & $server
+    $r = Run $d 'shared' @('new-session', '-d', '-s', 'big', '-x', '2049', '-y', '2048')
+    Check ($r.Code -eq 1 -and $r.Out -ceq 'size too large: 2049x2048 is 4196352 cells, more than 4194304') "2049x2048 (4196352 cells, just over 2^22) is refused" "exit $($r.Code): $($r.Out)"
+    Check ((S $d @('has-session', '-t', 'big')).Code -eq 1) "no session big exists"
+    Check ($serverBefore -ne '' -and (& $server) -ceq $serverBefore) "the same shared server still runs" "before [$serverBefore] after [$(& $server)]"
+    Check ($idsBefore -ne '' -and (& $ids) -ceq $idsBefore) "session A keeps its ids ($idsBefore)"
+    $r = Run $d 'shared' @('new-session', '-d', '-s', 'B', '-x', '80', '-y', '24')
+    Check ($r.Code -eq 0 -and (S $d @('has-session', '-t', 'B')).Code -eq 0) "a session after it is created as usual" $r.Out
 } finally {
     Remove-Item Env:PSMUX_SERVER_MODE -EA SilentlyContinue
     foreach ($pair in $script:Namespaces) {
