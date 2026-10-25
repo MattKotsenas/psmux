@@ -561,6 +561,39 @@ try {
     Check ((S $j @('show', '-v', '-t', 'B', '@if895')).Out -eq 'yes') "and its branch ran"
     $r = Run $j '<unset>' @('kill-server')
     Check ($r.Code -eq 0 -and (Wait-Until { @(Server-Procs $j.Ns).Count -eq 0 } 5000)) "kill-server ends that shared server"
+
+    Head "Part 12: a status line #() job runs with its own session's context (#895)"
+    $q = New-Ns "q"
+    $qDirA = Join-Path $ROOT "dir12A"; $qDirB = Join-Path $ROOT "dir12 B"
+    New-Item -ItemType Directory -Force $qDirA, $qDirB | Out-Null
+    $qLog = Join-Path $ROOT "job12.log"; $qCmd = Join-Path $ROOT "job12.cmd"
+    Set-Content -Encoding ASCII $qCmd @(
+        "@echo off",
+        ">>`"$qLog`" echo T=%PSMUX_TARGET_SESSION%^|X=%TMUX%^|D=%CD%",
+        "echo ok")
+    Run $q 'shared' @('new-session', '-d', '-s', 'A', '-x', '120', '-y', '30', '-c', $qDirA) | Out-Null
+    Run $q 'shared' @('new-session', '-d', '-s', 'B', '-x', '120', '-y', '30', '-c', $qDirB) | Out-Null
+    S $q @('set-option', '-t', 'A', 'status-interval', '1') | Out-Null
+    S $q @('set-option', '-t', 'A', 'status-right', "#($qCmd)") | Out-Null
+    $rightA = (S $q @('show-options', '-v', '-t', 'A', 'status-right')).Out
+    $rightB = (S $q @('show-options', '-v', '-t', 'B', 'status-right')).Out
+    Check ($ROOT -notmatch '\s' -and @(Shared-Procs $q.Ns).Count -eq 1 -and $rightA -ceq "#($qCmd)" -and $rightB -notmatch 'job12') "the #() job is set on A only, in one shared server" "A=[$rightA] B=[$rightB] root=$ROOT"
+    $qPortA = (Get-Content (Join-Path $q.Dir "$($q.Ns)__A.port")).Trim()
+    for ($i = 0; $i -lt 12; $i++) {
+        if ($i -gt 0) { Start-Sleep -Milliseconds 1200 }
+        Tcp-Raw $q 'A' @('dump-state') | Out-Null
+    }
+    $enough = Wait-Until { @(Get-Content $qLog -EA SilentlyContinue).Count -ge 10 } 15000
+    $qLines = @(Get-Content $qLog -EA SilentlyContinue)
+    Write-Host "      job log ($($qLines.Count) lines): $qLog"
+    $qLines | ForEach-Object { Write-Host "        $_" }
+    Check $enough "the job ran at least 10 times within 15 s of the last request" "($($qLines.Count) lines)"
+    $parsed = @($qLines | ForEach-Object { if ($_ -match '^T=([^|]*)\|X=([^|]*)\|D=(.*?)\s*$') { , @($Matches[1], $Matches[2], $Matches[3]) } else { , @('?', '?', '?') } })
+    Check ($parsed.Count -ge 10 -and @($parsed | Where-Object { $_[0] -cne "$($q.Ns)__A" }).Count -eq 0) "every job line names A as its target session"
+    Check ($parsed.Count -ge 10 -and @($parsed | Where-Object { $_[1] -cnotmatch (',' + $qPortA + ',0$') }).Count -eq 0) "every job line has A's TMUX (port $qPortA)"
+    Check ($parsed.Count -ge 10 -and @($parsed | Where-Object { $_[2] -ne $qDirA }).Count -eq 0) "every job line ran in A's directory"
+    $r = Run $q '<unset>' @('kill-server')
+    Check ($r.Code -eq 0 -and (Wait-Until { @(Server-Procs $q.Ns).Count -eq 0 } 5000)) "kill-server ends that shared server"
 } finally {
     Remove-Item Env:PSMUX_SERVER_MODE -EA SilentlyContinue
     foreach ($p in $script:Windows) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -EA SilentlyContinue } }

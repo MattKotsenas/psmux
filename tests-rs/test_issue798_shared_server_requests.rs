@@ -266,3 +266,197 @@ fn the_reply_carries_the_identity_and_never_the_socket_path() {
     }
     assert!(values_of(&env, crate::socket_path::SOCKET_PATH_ENV).is_empty());
 }
+
+#[cfg(windows)]
+const T895_WORKER: &str =
+    "server::shared::server::tests_issue798_shared_server_requests::job_context_order_worker";
+#[cfg(windows)]
+static T895_REAL: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static T895_RELEASE_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static T895_RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+#[cfg(windows)]
+static T895_HOOK_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn t895_hook() -> Option<crate::format::JobContext> {
+    *T895_HOOK_THREAD.lock().unwrap() = Some(std::thread::current().id());
+    let captured = if T895_REAL.load(Ordering::SeqCst) {
+        capture_job_context()
+    } else {
+        None
+    };
+    let release = T895_RELEASE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a release receiver for this case");
+    Some(Box::new(move |command: &mut std::process::Command| {
+        if release
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .is_err()
+        {
+            T895_RELEASE_TIMED_OUT.store(true, Ordering::SeqCst);
+            panic!("#895 test: no release within 15 s");
+        }
+        if let Some(apply) = captured {
+            apply(command);
+        }
+    }))
+}
+
+#[cfg(windows)]
+fn t895_enter(value: &str, only_b: Option<&str>, port: u16, dir: &std::path::Path) {
+    std::env::set_var("T895_V", value);
+    match only_b {
+        Some(v) => std::env::set_var("T895_BONLY", v),
+        None => std::env::remove_var("T895_BONLY"),
+    }
+    std::env::set_var("PSMUX_TARGET_SESSION", format!("t895__{value}"));
+    crate::commands::publish_job_env(Some(port), Some("t895"));
+    std::env::set_current_dir(dir).expect("enter the session directory");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "run by job_context_order in a child process"]
+fn job_context_order_worker() {
+    use std::io::Write as _;
+    let Some(root) = std::env::var_os("PSMUX_T895_WORKER") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("result.txt"))
+        .expect("result file");
+    let mut record = |line: &str| {
+        writeln!(result, "{line}").expect("result line");
+        result.flush().expect("result flush");
+    };
+    let probe = root.join("probe.cmd");
+    std::fs::write(
+        &probe,
+        "@echo V=%T895_V%;B=%T895_BONLY%;D=%CD%;T=%PSMUX_TARGET_SESSION%;X=%TMUX%\r\n",
+    )
+    .expect("probe.cmd");
+    let (dir_a, dir_b) = (root.join("dirA"), root.join("dirB"));
+    std::fs::create_dir_all(&dir_a).expect("dirA");
+    std::fs::create_dir_all(&dir_b).expect("dirB");
+    let (port_a, port_b) = (41895, 42895);
+    let tmux_a = crate::pane::tmux_env_value(Some(port_a), Some("t895"));
+    crate::format::JOB_CONTEXT
+        .set(t895_hook)
+        .expect("JOB_CONTEXT is unset in the worker process");
+    let format = format!("#({})", probe.display());
+    for (case, real) in [("control", false), ("real", true)] {
+        t895_enter("A", None, port_a, &dir_a);
+        let (release, waiter) = std::sync::mpsc::channel();
+        *T895_RELEASE.lock().unwrap() = Some(waiter);
+        *T895_HOOK_THREAD.lock().unwrap() = None;
+        T895_REAL.store(real, Ordering::SeqCst);
+        let mut app = AppState::new("t895".to_string());
+        app.status_interval = 1;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.format_job_tx = Some(tx);
+        {
+            let _async = crate::format::AsyncFormatGuard::new();
+            crate::format::expand_format(&format, &app);
+        }
+        let hook_thread = *T895_HOOK_THREAD.lock().unwrap();
+        if hook_thread != Some(std::thread::current().id()) {
+            record(&format!("RESULT {case} fail hook thread {hook_thread:?}"));
+            panic!("{case}: the hook did not run on the expanding thread: {hook_thread:?}");
+        }
+        t895_enter("B", Some("b"), port_b, &dir_b);
+        release.send(()).expect("release");
+        let received = rx.recv_timeout(std::time::Duration::from_secs(20));
+        if let Err(e) = &received {
+            let timed_out = T895_RELEASE_TIMED_OUT.load(Ordering::SeqCst);
+            record(&format!(
+                "RESULT {case} fail no result ({e}, release timed out: {timed_out})"
+            ));
+            panic!("{case}: no job result ({e}, release timed out: {timed_out})");
+        }
+        let (_, value) = received.expect("checked above");
+        record(&format!("CASE {case} {value}"));
+        let ok = if real {
+            value == format!("V=A;B=;D={};T=t895__A;X={tmux_a}", dir_a.display())
+        } else {
+            value.starts_with(&format!("V=B;B=b;D={};T=t895__B;X=", dir_b.display()))
+        };
+        if !ok {
+            record(&format!("RESULT {case} fail unexpected value"));
+            panic!("{case}: unexpected job value {value}");
+        }
+        record(&format!("RESULT {case} ok"));
+    }
+    record("DONE 2");
+}
+
+#[cfg(windows)]
+#[test]
+fn job_context_order() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("psmux_t895_{}_{unique}", std::process::id()));
+    assert!(
+        !root.to_string_lossy().chars().any(char::is_whitespace),
+        "set TEMP to a folder without spaces (cmd /C runs the probe path): {}",
+        root.display()
+    );
+    std::fs::create_dir_all(&root).expect("temp folder");
+    let stdout = std::fs::File::create(root.join("child-out.txt")).expect("child-out.txt");
+    let stderr = std::fs::File::create(root.join("child-err.txt")).expect("child-err.txt");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test exe"))
+        .args([
+            "--exact",
+            T895_WORKER,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("PSMUX_T895_WORKER", &root)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn the worker");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break Some(status);
+        }
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let read = |name: &str| {
+        let text = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        text.chars().take(4000).collect::<String>()
+    };
+    let result = read("result.txt");
+    let report = format!(
+        "worker status {status:?}\nresult.txt:\n{result}\nchild stdout:\n{}\nchild stderr:\n{}",
+        read("child-out.txt"),
+        read("child-err.txt")
+    );
+    let lines: Vec<&str> = result.lines().collect();
+    let passed = status.is_some_and(|s| s.success())
+        && ["RESULT control ok", "RESULT real ok", "DONE 2"]
+            .iter()
+            .all(|want| lines.contains(want));
+    if let Err(e) = std::fs::remove_dir_all(&root) {
+        eprintln!("could not remove {}: {e}", root.display());
+    }
+    assert!(passed, "{report}");
+}

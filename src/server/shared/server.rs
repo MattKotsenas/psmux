@@ -316,6 +316,7 @@ fn namespace_label(ns: &Option<String>) -> String {
 
 fn run(ns: Option<String>) -> ! {
     IN_SHARED_SERVER.store(true, Ordering::Relaxed);
+    let _ = crate::format::JOB_CONTEXT.set(capture_job_context);
     #[cfg(windows)]
     crate::platform::mouse_inject::SERVER_PROCESS.store(true, Ordering::Relaxed);
     let label = namespace_label(&ns);
@@ -1163,6 +1164,18 @@ fn serve_session_connection(
         // An attached client, or no good AUTH (the handler refuses it).
         _ => connection::handle_connection(stream, tx, key, aliases),
     }
+}
+
+fn capture_job_context() -> Option<crate::format::JobContext> {
+    let env = crate::commands::job_environment();
+    let dir = std::env::current_dir().ok();
+    Some(Box::new(move |command: &mut std::process::Command| {
+        command.env_clear();
+        command.envs(env);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+    }))
 }
 
 fn job_identity(port: u16, ns: &Option<String>, base: &str) -> Vec<(String, String)> {
