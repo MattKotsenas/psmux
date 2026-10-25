@@ -757,6 +757,25 @@ fn session_alive_elsewhere(base: &str) -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+const MAX_NEW_SESSION_CELLS: u64 = 1 << 22;
+
+fn new_session_size_error(args: &NewSessionArgs) -> Option<String> {
+    let (width, height) = match (args.width, args.height) {
+        (None, None) => return None,
+        (width, height) => (width.unwrap_or(80), height.unwrap_or(24)),
+    };
+    let width = if width > 1 { width } else { 120 };
+    let height = if height > 1 { height } else { 30 };
+    let cells = u64::from(width) * u64::from(height);
+    if cells > MAX_NEW_SESSION_CELLS {
+        return Some(format!(
+            "size too large: {}x{} is {} cells, more than {}",
+            width, height, cells, MAX_NEW_SESSION_CELLS
+        ));
+    }
+    None
+}
+
 /// Create a session in this server (run_server's start up, copied and cut
 /// down to what step 2 serves).
 fn create_session(
@@ -767,6 +786,9 @@ fn create_session(
     pty_system: &dyn portable_pty::PtySystem,
     globals: &Arc<Globals>,
 ) -> Result<Session, String> {
+    if let Some(msg) = new_session_size_error(args) {
+        return Err(msg);
+    }
     let name = match args.name.as_deref().filter(|n| !n.is_empty()) {
         Some(n) => n.to_string(),
         None => crate::session::next_session_name(ns.as_deref()),
@@ -1494,3 +1516,7 @@ mod tests_issue798_shared_server_requests;
 #[cfg(test)]
 #[path = "../../../tests-rs/test_issue894_897_shared_guards.rs"]
 mod tests_issue894_897_shared_guards;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue897_shared_new_session_size.rs"]
+mod tests_issue897_shared_new_session_size;
