@@ -766,8 +766,6 @@ fn query_every_session(ns: Option<&str>, line: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The session (port file base name) whose server has the client `spec`
-/// attached, by name or tty as tmux's cmd_find_client accepts them.
 /// The tty a client `-t` names, if it names a client: a tty path as given, or
 /// `%N` for `/dev/pts/N`. Anything else is not a client spec.
 fn client_target_tty(target: &str) -> Option<String> {
@@ -778,6 +776,8 @@ fn client_target_tty(target: &str) -> Option<String> {
     }
 }
 
+/// The session (port file base name) whose server has the client `spec`
+/// attached, by name or tty as tmux's cmd_find_client accepts them.
 fn session_holding_client(ns: Option<&str>, spec: &str) -> Option<String> {
     let line = format!("list-clients -F {}\n", crate::util::quote_arg("#{client_name}"));
     query_every_session(ns, &line)
