@@ -74,7 +74,11 @@ Add-Result "customize_num_buffer declared" `
 # ── Picker open clears the buffer ──────────────────────────────
 Write-Test "Open seeds the collapsed set so every window starts collapsed"
 Add-Result "tree picker open collapses windows" `
-    ($src -match '(?s)do_choose_tree\s*\{.*?choose_tree::default_collapsed') ""
+    (($src -match '(?s)do_choose_tree\s*\{.*?choose_tree::default_collapsed') -or
+     # Since #890 every opener (prefix w, the prompt, -s / -w) shares
+     # open_tree_chooser!, which seeds the set; the call site only invokes it.
+     (($src -match '(?s)macro_rules!\s*open_tree_chooser\s*\{.*?choose_tree::default_collapsed') -and
+      ($src -match '(?s)if\s+do_choose_tree\s*\{\s*open_tree_chooser!\(\)'))) ""
 
 Write-Test "Open clears buffer_num_buffer when picker opens"
 Add-Result "buffer picker open clears buffer (CLI path)" `

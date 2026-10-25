@@ -171,20 +171,40 @@ Test-Case "show-options -w returns window options" {
 # TEST 7: set-buffer -w clipboard (#298)
 # ────────────────────────────────────────────────
 Write-Host "--- #298: set-buffer -w clipboard ---" -ForegroundColor Yellow
+# Another process holding the clipboard makes a bare Set-Clipboard or
+# Get-Clipboard fail silently (an empty read, a value that never landed), so
+# both cases set a verified sentinel and read with retries.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value) { return $true }
+    }
+    return $false
+}
+function Read-Clipboard {
+    for ($i = 0; $i -lt 20; $i++) {
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now -ne '') { return $now.TrimEnd("`r", "`n") }
+        Start-Sleep -Milliseconds 100
+    }
+    return ''
+}
 Test-Case "set-buffer -w propagates to system clipboard" {
     $marker = "PSMUX_CLIP_TEST_$(Get-Random)"
-    Set-Clipboard "ORIGINAL"
+    $null = Set-ClipboardVerified "ORIGINAL"
     & $PSMUX set-buffer -w $marker 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $clip = Get-Clipboard
-    $clip -eq $marker
+    (Read-Clipboard) -eq $marker
 }
 
 Test-Case "set-buffer without -w does NOT touch clipboard" {
-    Set-Clipboard "SHOULD_STAY"
+    $null = Set-ClipboardVerified "SHOULD_STAY"
     & $PSMUX set-buffer "NO_CLIPBOARD" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    (Get-Clipboard) -eq "SHOULD_STAY"
+    (Read-Clipboard) -eq "SHOULD_STAY"
 }
 
 # ────────────────────────────────────────────────
