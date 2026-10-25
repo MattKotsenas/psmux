@@ -1246,7 +1246,7 @@ psmux -S $sock display-message -p "#{socket_path}`t#{pid}"   # answers before an
 psmux -S $sock new-session -d -s work                        # lands in that same server process
 ```
 
-psmux keeps one process per session, so its empty server is the namespace's standby server, made visible while it is unclaimed with `exit-empty off`. The first `new-session` in that namespace becomes that process, whatever flags it carries (`-f` is ignored, as tmux ignores it for a running server). With `exit-empty on` (the default), a plain `start-server` leaves nothing to query, as in tmux, where the server exits at once. Unlike tmux, killing the last session of a namespace still ends that session's process even with `exit-empty off`.
+psmux keeps one process per session, so its empty server is the namespace's standby server, made visible while it is unclaimed with `exit-empty off`. The first `new-session` in that namespace becomes that process, whatever flags it carries (`-f` is ignored, as tmux ignores it for a running server). With `exit-empty on` (the default), a plain `start-server` leaves nothing to query, as in tmux, where the server exits at once. Unlike tmux, killing the last session of a namespace still ends that session's process even with `exit-empty off`. The shared server (`PSMUX_SERVER_MODE`) also exits when its last session ends, whatever `exit-empty` says, for now (#897).
 
 ## Dead Panes and Respawn
 

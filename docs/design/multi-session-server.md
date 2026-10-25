@@ -565,7 +565,10 @@ What the later steps add in shared mode (the original stage 1 list):
   `session_base_owning_tmux_port` uses it to break the port tie.
 * Window and pane ids unique per server (stage 0a allocator, shared).
 * `kill-session` ends one session; the process exits when the last session ends and
-  `exit-empty` is on. `kill-server` ends the shared server once:
+  `exit-empty` is on. Today it also exits with `exit-empty off` (#897 D): an empty
+  shared server has no `.port` file for `kill-server` to find and would be exposed
+  to the orphan reaper, so honouring the option waits for both of those (step 3).
+  `kill-server` ends the shared server once:
   `kill_server_targets` dedupes by `(port, pid)`.
 * Frames, directives and `DETACH` go only to the clients of the affected session.
 * `%sessions-changed` is sent to every control client on create and destroy.
