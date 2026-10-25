@@ -14,6 +14,9 @@
 # carries one of this run's namespaces, never anything by name.
 
 $ErrorActionPreference = 'Continue'
+# psmux prints UTF-8; read it as UTF-8 whatever code page the console that
+# started this script has, or 'café' and '日本' never match ls.
+$prevOut = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } else { (Get-Command psmux -EA Stop).Source }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -208,4 +211,5 @@ try {
 }
 
 Write-Host "`nResults: $script:TestsPassed passed, $script:TestsFailed failed"
+[Console]::OutputEncoding = $prevOut
 exit $(if ($script:TestsFailed -eq 0) { 0 } else { 1 })
