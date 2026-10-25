@@ -124,11 +124,15 @@ try {
     Head "Part 0: the default path is untouched (owner ruling)"
     # Every commit of this work since the step 1 base touches src/ only inside
     # src/server/shared. Checked per commit, so it stays true after a merge.
+    # The work is the commits whose subject says so (#798, or a "shared:"
+    # prefix). A fix for the default path that also brings the shared server
+    # along (an auth, format or command fix touching both) is not this work.
     $repo = Split-Path $PSScriptRoot -Parent
     $base = if ($env:PSMUX_798_BASE) { $env:PSMUX_798_BASE } else { '0145958f' }
     $git = Get-Command git -EA SilentlyContinue
     if ($git -and (git -C $repo rev-parse --verify --quiet "$base^{commit}" 2>$null)) {
-        $commits = @(git -C $repo log --format=%H "$base..HEAD" -- src/server/shared)
+        $commits = @(git -C $repo log --format='%H %s' "$base..HEAD" -- src/server/shared |
+            Where-Object { $_ -match '^\S+ (shared[:(]|.*#798)' } | ForEach-Object { $_.Split(' ')[0] })
         $outside = @()
         foreach ($c in $commits) {
             $outside += @(git -C $repo diff-tree --no-commit-id --name-only -r $c -- src ':!src/server/shared' | ForEach-Object { "$($c.Substring(0, 8)) $_" })
