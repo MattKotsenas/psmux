@@ -2561,6 +2561,20 @@ impl AppState {
             return false;
         }
 
+        // A confirm prompt that is open while no client is attached was asked
+        // of nobody on a screen: a script opened it to answer it itself with
+        // send-keys or confirm-respond. The first client to attach did not
+        // ask for it, so it is dropped rather than shown; shown, it took that
+        // client's first key as its answer (prefix, then the `:` and the
+        // command it was typing). tmux never has such a prompt: it refuses
+        // confirm-before with `no current client` (cmd-find.c:1298).
+        if !is_control
+            && matches!(self.mode, Mode::ConfirmMode { .. })
+            && !self.client_registry.values().any(|ci| !ci.is_control)
+        {
+            self.mode = Mode::Passthrough;
+        }
+
         let tty = client_tty_name(cid, pid);
         self.client_registry.insert(cid, ClientInfo {
             id: cid,
@@ -2638,15 +2652,6 @@ impl AppState {
         if self.client_registry.remove(&cid).is_some() {
             self.attached_clients = self.attached_clients.saturating_sub(1);
             self.client_prefix_active = false;
-            // A confirm prompt lives on a client in tmux (status_prompt_set),
-            // so it goes with the last client that could answer it. Kept, it
-            // greeted the next client to attach, which answered it no with
-            // whatever key it pressed first.
-            if matches!(self.mode, Mode::ConfirmMode { .. })
-                && !self.client_registry.values().any(|ci| !ci.is_control)
-            {
-                self.mode = Mode::Passthrough;
-            }
             // A detaching client takes its `switch-client -T` latch with it
             // (issue #640): the next client starts in the default table.
             self.current_key_table = None;

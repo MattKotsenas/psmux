@@ -111,7 +111,7 @@ fn yes_closes_the_prompt_and_runs_the_command() {
 }
 
 #[test]
-fn no_attached_client_is_refused_with_no_current_client() {
+fn no_attached_client_opens_the_prompt_for_scripts_and_the_first_attach_drops_it() {
     let _lock = crate::util::lock_test_env();
     let _back = EnvBack(std::env::var("PSMUX_TARGET_SESSION").ok());
     let ns = Some("tconfirm".to_string());
@@ -120,8 +120,10 @@ fn no_attached_client_is_refused_with_no_current_client() {
     assert!(a.app.reap_client(1));
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "kill-pane".to_string(), Some(tx)));
-    assert_eq!(rx.recv().unwrap(), "ERROR: no current client");
-    assert!(confirm_prompt(&a.app).is_none(), "BUG: a prompt nobody draws was opened");
+    assert_eq!(rx.recv().unwrap(), "", "accepted, as on a per session server");
+    assert!(confirm_prompt(&a.app).is_some(), "a script can answer it with confirm-respond");
+    assert!(a.app.register_client(2, false));
+    assert!(confirm_prompt(&a.app).is_none(), "BUG: it greeted the client that attached");
 }
 
 #[test]
