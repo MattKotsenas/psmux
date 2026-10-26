@@ -44,6 +44,23 @@ fn sixel_bytes() -> Vec<u8> {
 
 /// Build a one-window, one-pane AppState with the sixel pre-loaded into the
 /// pane's screen (fed through the real vt100 parser, bypassing conhost).
+// Ids are never reused, so an id no pane holds never needs its blob again.
+// Past SHIPPED_IMAGE_IDS_PRUNE_AT the set forgets those, and keeps the ids
+// still on screen so their blobs are not sent twice.
+#[test]
+fn shipped_ids_forget_images_no_pane_holds() {
+    let mut app = app_with_sixel_pane();
+    let live: Vec<u64> = visible_image_blobs(&app).iter().map(|(id, _)| *id).collect();
+    assert_eq!(live.len(), 1);
+    // Ids far above any a pane could hold, as if their images were gone.
+    app.shipped_image_ids.extend((0..2000u64).map(|n| u64::MAX - n));
+    let shipped = build_image_blobs_json(&mut app);
+    assert!(shipped.contains(&format!("\"{}\"", live[0])), "the live blob ships: {shipped}");
+    assert_eq!(app.shipped_image_ids.len(), 1, "only the live id is kept");
+    assert!(app.shipped_image_ids.contains(&live[0]));
+    assert_eq!(build_image_blobs_json(&mut app), "{}", "and it is not sent again");
+}
+
 pub(crate) fn app_with_sixel_pane() -> AppState {
     let (reader, _peer_r) = tcp_pair();
     let (writer, _peer_w) = tcp_pair();

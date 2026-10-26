@@ -858,6 +858,29 @@ pub(crate) fn visible_pane_images(
 /// [`visible_pane_images`] for the viewport/alt cull so the set of ids here is
 /// identical to the descriptors emitted per leaf; the caller then filters out
 /// ids already in `shipped_image_ids` and base64-encodes the survivors.
+/// The ids of every sixel image any pane of any window still holds.
+pub(crate) fn all_image_ids(app: &AppState) -> std::collections::HashSet<u64> {
+    fn walk(node: &Node, out: &mut std::collections::HashSet<u64>) {
+        match node {
+            Node::Leaf(p) => {
+                if let Ok(parser) = p.term.lock() {
+                    out.extend(parser.screen().images().iter().map(|img| img.id));
+                }
+            }
+            Node::Split { children, .. } => {
+                for c in children {
+                    walk(c, out);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for w in &app.windows {
+        walk(&w.root, &mut out);
+    }
+    out
+}
+
 pub(crate) fn visible_image_blobs(app: &AppState) -> Vec<(u64, Vec<u8>)> {
     let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
     let win = match app.windows.get(app.active_idx) {

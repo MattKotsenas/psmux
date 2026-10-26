@@ -286,8 +286,18 @@ pub(crate) fn build_image_blobs_json(app: &mut AppState) -> String {
         app.shipped_image_ids.insert(id);
     }
     json.push('}');
+    if app.shipped_image_ids.len() > SHIPPED_IMAGE_IDS_PRUNE_AT {
+        let live = helpers::all_image_ids(app);
+        app.shipped_image_ids.retain(|id| live.contains(id));
+    }
     json
 }
+
+/// How many shipped ids the session keeps before it forgets the ones no pane
+/// holds any more.  Ids are never reused, so an id that is gone never needs
+/// its blob again; pruning only past this keeps the frame path free of the
+/// walk over every window's panes.
+const SHIPPED_IMAGE_IDS_PRUNE_AT: usize = 1024;
 
 /// The longest the standby waits after the boot hold for the pool to have its
 /// spares. It is only needed by the NEXT `new-session`.
