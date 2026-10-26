@@ -144,6 +144,37 @@ try {
     $out = (P nosuchcmd) -join ' '
     $rc = $LASTEXITCODE
     if ($rc -ne 0 -and $out -match 'unknown command: nosuchcmd') { Write-Pass "nosuchcmd refused (rc=$rc)" } else { Write-Fail "nosuchcmd rc=$rc out='$out'" }
+
+    Write-Host "`n[14] a CLI alias runs in the same process, one lookup above a plain command" -ForegroundColor Yellow
+    # Re-running the binary for the alias's commands cost a second process
+    # start: info took 32 ms against 17 ms for display -p. In process it is
+    # the alias table round trip only (about 4 ms).
+    function Median($argv) {
+        $t = foreach ($i in 1..15) {
+            $sw = [Diagnostics.Stopwatch]::StartNew(); P @argv | Out-Null; $sw.Elapsed.TotalMilliseconds
+        }
+        ($t | Sort-Object)[7]
+    }
+    $null = Median @('display', '-p', 'x'); $null = Median @('info')
+    $plain = Median @('display', '-p', 'x')
+    $alias = Median @('info')
+    $over = $alias - $plain
+    if ($over -le 10) { Write-Pass ("info median {0:N1} ms is {1:N1} ms over display -p ({2:N1} ms)" -f $alias, $over, $plain) }
+    else { Write-Fail ("info median {0:N1} ms is {1:N1} ms over display -p ({2:N1} ms), budget 10 ms" -f $alias, $over, $plain) }
+    $pids = @(Get-Process psmux -EA SilentlyContinue | ForEach-Object Id)
+    P info | Out-Null
+    $after = @(Get-Process psmux -EA SilentlyContinue | ForEach-Object Id)
+    if ($after.Count -le $pids.Count) { Write-Pass "no extra psmux process left after an alias run" } else { Write-Fail "psmux processes $($pids.Count) -> $($after.Count)" }
+
+    Write-Host "`n[15] with no server an alias or unknown name says so, as tmux's client does" -ForegroundColor Yellow
+    P kill-server | Out-Null
+    Start-Sleep -Milliseconds 800
+    foreach ($name in 'info', 'nosuchcmd') {
+        $out = (P $name) -join ' | '
+        $rc = $LASTEXITCODE
+        if ($rc -ne 0 -and $out -match "^psmux: no server running on session '$NS`__default'$") { Write-Pass "$name with no server: '$out'" }
+        else { Write-Fail "$name with no server rc=$rc out='$out'" }
+    }
 }
 finally {
     P kill-server | Out-Null

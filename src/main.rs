@@ -919,18 +919,17 @@ fn run_list_command_alone(list: &CommandList, command: &[String]) -> i32 {
     }
 }
 
-/// Set on the run of this binary that carries an alias's commands, so a name
-/// still unknown there is not looked up again (tmux expands an alias once).
-/// [`run_main`] takes it out of the environment before anything is spawned.
-const ALIAS_EXPANDED_ENV: &str = "PSMUX_ALIAS_EXPANDED";
-
 /// `psmux <alias> ...` for a `command-alias`. The client keeps no alias table,
 /// so it asks the server, as tmux's client leaves a name it cannot parse to
-/// the server's parser. The alias's commands run as this binary run again
-/// with the same global flags, so each takes its own client side arm
-/// (`display -p`, `attach`, a command list). The exit status, or None when
-/// `args[index]` is no alias or no server answers.
-fn run_cli_alias(args: &[String], index: usize) -> Option<i32> {
+/// the server's parser. The alias's commands go through [`run_main_with`]
+/// again, in this process, with the same global flags, so each takes its own
+/// client side arm (`display -p`, `attach`, a command list) without paying
+/// for a second process start. That run is marked expanded, so a name still
+/// unknown there is not looked up again (tmux expands an alias once).
+/// None when `args[index]` is no alias. When no server answers the lookup
+/// the error is returned, as tmux's client reports "no server running" for
+/// a name it could not parse (client.c).
+fn run_cli_alias(args: &[String], index: usize) -> Option<io::Result<()>> {
     // The table is the server's, not the command's target's: the -t is for
     // the alias's command to resolve in the run below. Scoped to it, a pane
     // the routed session does not hold made the query fail and the alias an
@@ -938,15 +937,20 @@ fn run_cli_alias(args: &[String], index: usize) -> Option<i32> {
     let saved_full = env::var("PSMUX_TARGET_FULL").ok();
     env::remove_var("PSMUX_TARGET_FULL");
     let query = || send_control_with_response("show-options -s command-alias\n".to_string());
-    let reply = query().or_else(|_| {
+    // When neither answers, the routed attempt's error is the one to show:
+    // it names the namespace and session the command was aimed at.
+    let reply = query().or_else(|first| {
         let saved_session = env::var("PSMUX_TARGET_SESSION").ok();
         env::remove_var("PSMUX_TARGET_SESSION");
         let reply = query();
         if let Some(v) = saved_session { env::set_var("PSMUX_TARGET_SESSION", v); }
-        reply
+        reply.map_err(|_| first)
     });
     if let Some(v) = saved_full { env::set_var("PSMUX_TARGET_FULL", v); }
-    let reply = reply.ok()?;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(e) => return Some(Err(e)),
+    };
     let commands = crate::command_alias::from_show_output(&reply).expand(&args[index..])?;
     let mut argv: Vec<String> = Vec::new();
     for words in &commands {
@@ -956,19 +960,11 @@ fn run_cli_alias(args: &[String], index: usize) -> Option<i32> {
         argv.extend(words.iter().cloned());
     }
     if argv.is_empty() {
-        return Some(0);
+        return Some(Ok(()));
     }
-    let exe = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-    let mut child = std::process::Command::new(exe);
-    child.args(&args[1..index]).args(&argv).env(ALIAS_EXPANDED_ENV, "1");
-    let _ = io::stdout().flush();
-    Some(match child.status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("psmux: {}", e);
-            1
-        }
-    })
+    let mut full: Vec<String> = args[..index].to_vec();
+    full.extend(argv);
+    Some(run_main_with(full, true))
 }
 
 fn main() {
@@ -1253,16 +1249,18 @@ fn write_shell_output(mut stream: impl Write, _std_handle: i32, bytes: &[u8]) ->
 }
 
 fn run_main() -> io::Result<()> {
-    // Read once and dropped, so a server or pane this run starts never
-    // inherits it and stops expanding aliases.
-    let alias_expanded = env::var_os(ALIAS_EXPANDED_ENV).is_some();
-    env::remove_var(ALIAS_EXPANDED_ENV);
+    run_main_with(env::args().collect(), false)
+}
+
+/// One CLI run over `argv` (program name first). `alias_expanded` is set on
+/// the run that carries a `command-alias`'s commands (run_cli_alias).
+fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
     // first would mis-split `-L=foo` into `-L` + `=foo`.
     let args: Vec<String> = crate::cli::normalize_attached_target_flag(
         crate::cli::normalize_attached_global_args(
-            crate::cli::normalize_flag_equals(env::args().collect()),
+            crate::cli::normalize_flag_equals(argv),
         ),
     );
     // `psmux a \; b`: from here on `args` is the first command alone, which
@@ -6153,8 +6151,8 @@ fn run_main() -> io::Result<()> {
             _ => {
                 // A `command-alias` of the server's, or an unknown command.
                 if let Some(index) = command_index.filter(|_| !cmd.is_empty() && !alias_expanded) {
-                    if let Some(code) = run_cli_alias(&args, index) {
-                        std::process::exit(code);
+                    if let Some(result) = run_cli_alias(&args, index) {
+                        return result;
                     }
                 }
                 // Unknown command - print error and exit
