@@ -1731,6 +1731,85 @@ pub fn strip_exact_match_prefix(target: &str) -> &str {
     target.strip_prefix('=').unwrap_or(target)
 }
 
+/// A target with its empty pane part dropped: `s:1.` is `s:1`, `=s:two.` is
+/// `=s:two`, `s:.` is `s:`, `:1.` is `:1` and `@2.` is `@2`. None when there
+/// is nothing to drop.
+///
+/// tmux splits a target at the colon and at the first period after it, then
+/// reads an empty part as no part at all (cmd-find.c, "Empty is the same as
+/// NULL"), so `s:1.` names window 1 of `s` and that window's active pane.
+/// psmux's resolvers each split the pane off themselves and only when it is
+/// non-empty, so `s:1.` was looked up as a window named `1.` ("can't find
+/// window: 1."). A choose-tree template's `%%` for a window row is exactly
+/// that shape (`=s:1.`, window_tree_get_target), which is why it matters.
+/// Only the shape tmux defines is touched: the first period after the colon
+/// (or after a bare `@id`) has to be the last character.
+pub fn drop_empty_pane_part(target: &str) -> Option<String> {
+    let after = match target.find(':') {
+        Some(colon) => colon + 1,
+        None if strip_exact_match_prefix(target).starts_with('@') => 0,
+        None => return None,
+    };
+    let dot = after + target[after..].find('.')?;
+    (dot + 1 == target.len()).then(|| target[..dot].to_string())
+}
+
+/// Does `-s` name a target (a source pane or window) for this command, as
+/// tmux's `cmd_entry.source` does, rather than something else (`new-session
+/// -s` is a session NAME)?
+fn source_flag_is_target(command: &str) -> bool {
+    matches!(
+        command,
+        "join-pane" | "joinp" | "move-pane" | "movep" | "swap-pane" | "swapp"
+            | "move-window" | "movew" | "swap-window" | "swapw" | "link-window" | "linkw"
+            | "break-pane" | "breakp"
+    )
+}
+
+/// Drop the empty pane part ([`drop_empty_pane_part`]) from every target value
+/// in a command's flag region: `-t`, and `-s` where it is a source target.
+/// `tokens[0]` is the command name. The flag region ends where tmux's getopt
+/// ends it (`--`, a bare `-`, the first operand), so keys, messages and other
+/// operands are never touched, and a value attached to its flag (`-tb:1.`,
+/// `-dtb:1.`) is rewritten in place. True when a value was rewritten.
+pub fn canonicalize_target_values(tokens: &mut [String]) -> bool {
+    let Some(command) = tokens.first().cloned() else { return false };
+    let mut changed = false;
+    let rewrites = |flag: char| flag == 't' || (flag == 's' && source_flag_is_target(&command));
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i].clone();
+        if token == "--" || !token.starts_with('-') || token.len() < 2 {
+            return changed;
+        }
+        for (at, flag) in token.char_indices().skip(1) {
+            if !flag_takes_value(&command, flag) {
+                continue;
+            }
+            let value_at = at + flag.len_utf8();
+            if value_at < token.len() {
+                if rewrites(flag) {
+                    if let Some(v) = drop_empty_pane_part(&token[value_at..]) {
+                        tokens[i] = format!("{}{}", &token[..value_at], v);
+                        changed = true;
+                    }
+                }
+            } else {
+                i += 1;
+                if rewrites(flag) {
+                    if let Some(v) = tokens.get(i).and_then(|v| drop_empty_pane_part(v)) {
+                        tokens[i] = v;
+                        changed = true;
+                    }
+                }
+            }
+            break;
+        }
+        i += 1;
+    }
+    changed
+}
+
 /// Does a bare `-t` token name a WINDOW rather than a session?
 ///
 /// tmux's window table (`cmd-find.c:51`, `cmd_find_window_table`) is
@@ -2398,3 +2477,7 @@ mod tests_issue829_client_path;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue865_display_reply_error.rs"]
 mod tests_issue865_display_reply_error;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_empty_pane_target.rs"]
+mod tests_empty_pane_target;

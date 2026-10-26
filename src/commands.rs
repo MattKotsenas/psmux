@@ -2380,7 +2380,12 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
     // whitespace split kept them: a copy mode prompt's `rename-window '%%'`
     // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
     // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
-    let tokens = parse_command_line(cmd);
+    let mut tokens = parse_command_line(cmd);
+    // `-t s:1.` is `-t s:1` (tmux reads an empty pane part as none). The line
+    // is rebuilt, so the arms that hand `cmd` on whole carry it too.
+    if crate::cli::canonicalize_target_values(&mut tokens) {
+        return execute_unaliased_command(app, &crate::command_alias::command_line(&tokens));
+    }
     let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }
 
