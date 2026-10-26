@@ -164,3 +164,46 @@ fn an_image_at_the_bottom_scrolls_the_text_up_first() {
     );
     assert_eq!(p.screen().images().len(), 1);
 }
+
+// A sixel DCS is held at most tmux's input-buffer-size default (1 MiB,
+// INPUT_BUF_DEFAULT_SIZE) and thrown away past it, as tmux input_input does.
+// Before the limit `ESC P q` with no ST grew the server by twice what the pane
+// wrote: 64 MiB written took the server from 4 MB to 134 MB.
+
+fn sixel_with_body(len: usize) -> Vec<u8> {
+    let mut v = b"\x1bPq#0;2;100;0;0#0".to_vec();
+    v.extend(std::iter::repeat(b'~').take(len));
+    v.extend_from_slice(b"\x1b\\");
+    v
+}
+
+#[test]
+fn a_sixel_over_the_input_buffer_size_is_discarded() {
+    let mut p: Parser = Parser::new(24, 80, 100);
+    p.process(&sixel_with_body(2 << 20));
+    assert_eq!(p.screen().images().len(), 0, "an oversized sixel is not kept");
+    p.process(b"AFTER");
+    assert!(p.screen().contents().contains("AFTER"), "text after it still lands");
+}
+
+#[test]
+fn an_unterminated_sixel_does_not_grow_without_bound() {
+    let mut p: Parser = Parser::new(24, 80, 100);
+    p.process(b"\x1bPq#0;2;100;0;0#0");
+    let chunk = vec![b'~'; 1 << 20];
+    for _ in 0..8 {
+        p.process(&chunk);
+    }
+    // The ESC that ends it, then text.
+    p.process(b"\x1b[0mAFTER");
+    assert_eq!(p.screen().images().len(), 0);
+    assert!(p.screen().contents().contains("AFTER"));
+}
+
+#[test]
+fn a_sixel_under_the_limit_is_kept_and_the_next_one_after_a_discard_too() {
+    let mut p: Parser = Parser::new(24, 80, 100);
+    p.process(&sixel_with_body(2 << 20));
+    p.process(&sixel_with_body((1 << 20) - 64));
+    assert_eq!(p.screen().images().len(), 1, "the image under the limit is kept");
+}

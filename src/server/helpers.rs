@@ -970,8 +970,14 @@ pub(crate) fn take_frame_oneshots(app: &mut AppState) -> crate::frame_oneshot::O
     crate::frame_oneshot::OneShots {
         clip_b64: app.clipboard_osc52.take().map(|t| crate::util::base64_encode(&t)),
         bell: std::mem::take(&mut app.bell_forward),
-        // The frame builders write `image_blobs` themselves.
-        image_blobs: String::new(),
+        // Last in the frame with the clipboard and bell, so a frame that
+        // supersedes this one unread carries them on: the server sends each
+        // blob once, and the builder's own text is followed by the render
+        // options and overlay fields, where `take` cannot find them.
+        image_blobs: {
+            let json = crate::server::build_image_blobs_json(app);
+            json[1..json.len() - 1].to_string()
+        },
     }
 }
 

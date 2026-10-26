@@ -4189,14 +4189,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let status_justify_escaped = json_escape_string(&app.status_justify);
                     let status_format_json = &sf.status_format_json;
                     let cursor_style_code = crate::rendering::configured_cursor_code();
-                    // Sixel M4: ship each currently-visible image blob's base64
-                    // bytes exactly once.  The per-leaf `images` descriptor is
-                    // emitted every frame (tiny); the large raw bytes go into
-                    // this top-level `image_blobs` map only for visible ids not
-                    // yet in `shipped_image_ids`.  Steady-state frames (all ids
-                    // already shipped) emit `"image_blobs":{}` so NC-dedup and
-                    // frame caching keep working.  See helpers::visible_image_blobs.
-                    let image_blobs_json = build_image_blobs_json(&mut app);
                     // The blink on its own, for a `cursor-style` that names no
                     // shape. A shape carries its blink in the code above.
                     let cursor_blink_mode = match crate::rendering::blink_only_mode() {
@@ -4205,7 +4197,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         None => "null",
                     };
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{},\"image_blobs\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index_of(app.active_idx), cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -4225,7 +4217,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         crate::mouse_keys::client_overrides(&app),
                         app.bold_is_bright,
                         app.sixel,
-                        image_blobs_json,
                     ));
                     // #633 follow up: a malformed buffer here used to be a quiet
                     // no op; never let it end the server. Skipping the append
@@ -9043,11 +9034,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             let status_justify_escaped = json_escape_string(&app.status_justify);
             let status_format_json = &sf.status_format_json;
             let cursor_style_code = crate::rendering::configured_cursor_code();
-            // Sixel M4: ship each currently-visible image blob's base64 bytes
-            // exactly once (mirror of the response-path site above; both build
-            // sites MUST inject `image_blobs` or images vanish intermittently
-            // depending on which path served the frame — design risk 7).
-            let image_blobs_json = build_image_blobs_json(&mut app);
             // The blink on its own, for a `cursor-style` that names no shape.
             let cursor_blink_mode = match crate::rendering::blink_only_mode() {
                 Some(true) => "true",
@@ -9055,7 +9041,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 None => "null",
             };
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{},\"image_blobs\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index_of(app.active_idx), cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -9074,7 +9060,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::mouse_keys::client_overrides(&app),
                 app.bold_is_bright,
                 app.sixel,
-                image_blobs_json,
             ));
             // #633 follow up: a malformed buffer here used to be a quiet
             // no op; never let it end the server. Skipping the append degrades

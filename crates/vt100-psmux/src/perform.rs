@@ -1,6 +1,12 @@
 const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
+/// The most a sixel DCS may hold before it is thrown away: tmux's
+/// `input-buffer-size` default (INPUT_BUF_DEFAULT_SIZE, tmux.h), past which
+/// `input_input` sets INPUT_DISCARD and the image is never drawn.  Without a
+/// limit a pane that writes `ESC P q` and no ST grew the server by twice
+/// what it wrote.
+const SIXEL_MAX_BYTES: usize = 1 << 20;
 
 pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
     pub screen: crate::screen::Screen,
@@ -533,6 +539,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
 
     fn put(&mut self, byte: u8) {
         if self.dcs_active {
+            if self.dcs_buf.len() >= SIXEL_MAX_BYTES {
+                self.dcs_active = false;
+                self.dcs_buf = Vec::new();
+                return;
+            }
             self.dcs_buf.push(byte);
         }
     }
@@ -581,7 +592,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             .finish_sixel(layout.scroll_rows, final_row, col);
 
         self.dcs_active = false;
-        self.dcs_buf.clear();
+        // Let go of the image's bytes rather than keep the capacity.
+        self.dcs_buf = Vec::new();
     }
 }
 
