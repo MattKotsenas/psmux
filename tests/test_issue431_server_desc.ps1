@@ -14,8 +14,26 @@
 # tests/test_issue413_copy_count_vi.ps1 and tests/test_issue428_proof.ps1.
 
 $ErrorActionPreference = "Continue"
-$PSMUX = (Get-Command psmux -EA Stop).Source
-$psmuxDir = "$env:USERPROFILE\.psmux"
+$PSMUX = if ($env:PSMUX_TEST_EXE) { $env:PSMUX_TEST_EXE } else { (Get-Command psmux -EA Stop).Source }
+# Isolation: a unique -L namespace and a private data dir and empty config on
+# every command; cleanup only with `-L <ns> kill-server`.
+$ns = "t431_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+$psmuxDir = Join-Path ([IO.Path]::GetTempPath()) "psmux_$ns"
+New-Item -ItemType Directory -Force $psmuxDir | Out-Null
+$oldData = $env:PSMUX_DATA_DIR; $oldConf = $env:PSMUX_CONFIG_FILE; $oldConpty = $env:PSMUX_CONPTY_DIR
+$env:PSMUX_DATA_DIR = $psmuxDir
+$env:PSMUX_CONFIG_FILE = Join-Path $psmuxDir 'empty.conf'
+Set-Content -Path $env:PSMUX_CONFIG_FILE -Value '' -Encoding UTF8
+Remove-Item Env:\TMUX -ErrorAction SilentlyContinue
+Remove-Item Env:\TMUX_PANE -ErrorAction SilentlyContinue
+function P { & $PSMUX -L $ns @args }
+function Stop-Namespace {
+    P kill-server 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
+    $env:PSMUX_DATA_DIR = $oldData; $env:PSMUX_CONFIG_FILE = $oldConf
+    if ($oldConpty) { $env:PSMUX_CONPTY_DIR = $oldConpty } else { Remove-Item Env:\PSMUX_CONPTY_DIR -ErrorAction SilentlyContinue }
+    Remove-Item -Recurse -Force $psmuxDir -ErrorAction SilentlyContinue
+}
 $S = "issue431desc"
 $script:Pass = 0
 $script:Fail = 0
@@ -23,18 +41,14 @@ function Write-Pass($m){ Write-Host "  [PASS] $m" -ForegroundColor Green; $scrip
 function Write-Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
 function Write-Info($m){ Write-Host "  [INFO] $m" -ForegroundColor Yellow }
 
-& $PSMUX kill-session -t $S 2>&1 | Out-Null
-Start-Sleep -Milliseconds 400
-Remove-Item "$psmuxDir\$S.*" -Force -EA SilentlyContinue
-
-$proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s",$S -PassThru
+$proc = Start-Process -FilePath $PSMUX -ArgumentList "-L",$ns,"new-session","-s",$S -PassThru
 Start-Sleep -Seconds 4
 # Two panes -> two leaves, so the "every leaf" assertion is meaningful.
-& $PSMUX split-window -h -t $S 2>&1 | Out-Null
+P split-window -h -t $S 2>&1 | Out-Null
 Start-Sleep -Seconds 2
 
-$port = (Get-Content "$psmuxDir\$S.port" -Raw).Trim()
-$key  = (Get-Content "$psmuxDir\$S.key" -Raw).Trim()
+$port = (Get-Content "$psmuxDir\${ns}__$S.port" -Raw).Trim()
+$key  = (Get-Content "$psmuxDir\${ns}__$S.key" -Raw).Trim()
 
 # Fresh non-persistent dump each call = no stale pipeline frames. Returns the
 # raw JSON line (the descriptor plumbing is best asserted on the raw string:
@@ -62,7 +76,7 @@ for ($t=0; $t -lt 12; $t++) {
   if ($raw -and ([regex]::Matches($raw, '"type":"leaf"')).Count -ge 2) { break }
   Start-Sleep -Milliseconds 500
 }
-if (-not $raw) { Write-Fail "no dump-state received"; & $PSMUX kill-session -t $S 2>&1|Out-Null; try{Stop-Process -Id $proc.Id -Force}catch{}; exit 1 }
+if (-not $raw) { Write-Fail "no dump-state received"; Stop-Namespace; try{Stop-Process -Id $proc.Id -Force}catch{}; exit 1 }
 
 # --- 1. Schema stability: one "images":[ per leaf ---
 $leafCount   = ([regex]::Matches($raw, '"type":"leaf"')).Count
@@ -83,7 +97,7 @@ if (($raw -match '"images":\[\{') ) {
 
 # --- 2. Best-effort live descriptor (needs M2 parser + ConPTY passthrough) ---
 Write-Host "`n--- live sixel (best-effort; full coverage is M8) ---" -ForegroundColor Cyan
-$sxScript = "$env:TEMP\psmux_issue431_sixel.ps1"
+$sxScript = Join-Path $psmuxDir "psmux_issue431_sixel.ps1"
 @'
 $e = [char]27
 # Raster attrs "Pan;Pad;Ph;Pv -> Ph=20px wide, Pv=40px tall => 2x2 cells.
@@ -95,7 +109,7 @@ Start-Sleep -Milliseconds 300
 
 # Emit the sixel from inside the active pane's child so the parser sees it on
 # the pane's OUTPUT stream (pwsh invoked explicitly => shell-agnostic).
-& $PSMUX send-keys -t $S ("pwsh -NoProfile -File `"$sxScript`"") Enter 2>&1 | Out-Null
+P send-keys -t $S ("pwsh -NoProfile -File `"$sxScript`"") Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 
 $raw2 = Get-RawState
@@ -117,7 +131,7 @@ if ($raw2) {
 }
 
 Remove-Item $sxScript -Force -EA SilentlyContinue
-& $PSMUX kill-session -t $S 2>&1 | Out-Null
+Stop-Namespace
 try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}
 
 Write-Host "`n=== Results: $($script:Pass) passed, $($script:Fail) failed (live=$live) ===" -ForegroundColor Cyan

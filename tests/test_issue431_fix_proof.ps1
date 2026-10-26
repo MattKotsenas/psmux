@@ -12,9 +12,36 @@
 # the pane stays functional. (Final rasterized pixels are an interactive WT step;
 # see the checklist printed at the end.)
 
+# The inbox conhost strips the sixel DCS before psmux reads the pane, so the
+# image only reaches the parser under an OpenConsole: point
+# PSMUX_CONPTY_DIR_FOR_TEST at a directory with conpty.dll and OpenConsole.exe
+# (nuget Microsoft.Windows.Console.ConPTY). Without it the suite says SKIP.
+$conptyDir = $env:PSMUX_CONPTY_DIR_FOR_TEST
+if (-not $conptyDir -or -not (Test-Path (Join-Path $conptyDir 'conpty.dll')) -or -not (Test-Path (Join-Path $conptyDir 'OpenConsole.exe'))) {
+    Write-Host "SKIP: set PSMUX_CONPTY_DIR_FOR_TEST to a directory with conpty.dll and OpenConsole.exe" -ForegroundColor Yellow
+    exit 0
+}
 $ErrorActionPreference = "Continue"
-$PSMUX = (Get-Command psmux -EA Stop).Source
-$psmuxDir = "$env:USERPROFILE\.psmux"
+$PSMUX = if ($env:PSMUX_TEST_EXE) { $env:PSMUX_TEST_EXE } else { (Get-Command psmux -EA Stop).Source }
+# Isolation: a unique -L namespace and a private data dir and empty config on
+# every command; cleanup only with `-L <ns> kill-server`.
+$ns = "t431_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+$psmuxDir = Join-Path ([IO.Path]::GetTempPath()) "psmux_$ns"
+New-Item -ItemType Directory -Force $psmuxDir | Out-Null
+$oldData = $env:PSMUX_DATA_DIR; $oldConf = $env:PSMUX_CONFIG_FILE; $oldConpty = $env:PSMUX_CONPTY_DIR
+$env:PSMUX_DATA_DIR = $psmuxDir
+$env:PSMUX_CONFIG_FILE = Join-Path $psmuxDir 'empty.conf'
+Set-Content -Path $env:PSMUX_CONFIG_FILE -Value '' -Encoding UTF8
+Remove-Item Env:\TMUX -ErrorAction SilentlyContinue
+Remove-Item Env:\TMUX_PANE -ErrorAction SilentlyContinue
+function P { & $PSMUX -L $ns @args }
+function Stop-Namespace {
+    P kill-server 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
+    $env:PSMUX_DATA_DIR = $oldData; $env:PSMUX_CONFIG_FILE = $oldConf
+    if ($oldConpty) { $env:PSMUX_CONPTY_DIR = $oldConpty } else { Remove-Item Env:\PSMUX_CONPTY_DIR -ErrorAction SilentlyContinue }
+    Remove-Item -Recurse -Force $psmuxDir -ErrorAction SilentlyContinue
+}
 $S = "issue431_fix"
 $MARKER = "13;57;91"   # distinctive sixel color embedded in the raw bytes
 $script:Pass = 0; $script:Fail = 0
@@ -22,16 +49,12 @@ function Pass($m){Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass+
 function FailX($m){Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++}
 function Info($m){Write-Host "  [INFO] $m" -ForegroundColor DarkCyan}
 
-function Cleanup {
-    & $PSMUX kill-session -t $S 2>&1 | Out-Null
-    Start-Sleep -Milliseconds 400
-    Remove-Item "$psmuxDir\$S.*" -Force -EA SilentlyContinue
-}
+function Cleanup { Stop-Namespace }
 
 function Get-DumpState {
     param([string]$Session)
-    $port = (Get-Content "$psmuxDir\$Session.port" -Raw).Trim()
-    $key  = (Get-Content "$psmuxDir\$Session.key" -Raw).Trim()
+    $port = (Get-Content "$psmuxDir\${ns}__$Session.port" -Raw).Trim()
+    $key  = (Get-Content "$psmuxDir\${ns}__$Session.key" -Raw).Trim()
     $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", [int]$port)
     $tcp.NoDelay = $true
     $stream = $tcp.GetStream()
@@ -52,14 +75,13 @@ function Get-DumpState {
     return $sb.ToString().Trim()
 }
 
-Cleanup
 Write-Host "`n=== Issue #431 FIX PROOF (server carries sixel) ===" -ForegroundColor Cyan
 
 # Build the sixel emitter: BEFORE_MARK + raw sixel (color 13;57;91) + AFTER_MARK
 $mid = [System.Text.Encoding]::ASCII.GetBytes('q"1;1;24;12#7;2;13;57;91#7!24~$-!24~$-')
 $sixel = [byte[]]@(0x1B,0x50) + $mid + [byte[]]@(0x1B,0x5C)
 $hex = ($sixel | ForEach-Object { '0x{0:X2}' -f $_ }) -join ','
-$emitter = "$env:TEMP\issue431_fix_emit.ps1"
+$emitter = Join-Path $psmuxDir "issue431_fix_emit.ps1"
 @"
 Write-Host "BEFORE_MARK"
 `$b = [byte[]]@($hex)
@@ -69,19 +91,20 @@ Start-Sleep -Milliseconds 150
 Write-Host "AFTER_MARK"
 "@ | Set-Content -Path $emitter -Encoding ASCII
 
-& $PSMUX new-session -d -s $S 2>&1 | Out-Null
+$env:PSMUX_CONPTY_DIR = $conptyDir
+P new-session -d -s $S 2>&1 | Out-Null
 Start-Sleep -Seconds 3
-& $PSMUX has-session -t $S 2>$null
+P has-session -t $S 2>$null
 if ($LASTEXITCODE -ne 0) { FailX "session did not start"; Cleanup; exit 1 }
 Pass "session started"
 
-& $PSMUX send-keys -t $S 'cls' Enter 2>&1 | Out-Null
+P send-keys -t $S 'cls' Enter 2>&1 | Out-Null
 Start-Sleep -Milliseconds 600
-& $PSMUX send-keys -t $S (". '" + $emitter + "'") Enter 2>&1 | Out-Null
+P send-keys -t $S (". '" + $emitter + "'") Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 2
 
 # 1) Pane stays functional: BEFORE/AFTER markers survive
-$cap = & $PSMUX capture-pane -t $S -p 2>&1 | Out-String
+$cap = P capture-pane -t $S -p 2>&1 | Out-String
 if ($cap -match "BEFORE_MARK" -and $cap -match "AFTER_MARK") { Pass "pane functional: BEFORE_MARK and AFTER_MARK both survive the sixel" }
 else { FailX "pane text markers missing (BEFORE=$($cap -match 'BEFORE_MARK') AFTER=$($cap -match 'AFTER_MARK'))" }
 
@@ -127,20 +150,20 @@ if ($dump -match '"image_blobs"\s*:\s*\{\s*"(\d+)"\s*:\s*"([A-Za-z0-9+/=]+)"') {
 
 # 3) one-shot: a SECOND immediate dump should have empty image_blobs (already shipped)
 $dump2 = Get-DumpState -Session $S
-if ($dump2 -match '"image_blobs"\s*:\s*\{\s*\}') { Pass "second dump has EMPTY image_blobs (blob shipped once, NC-dedup preserved)" }
-elseif ($dump2 -match '"image_blobs"\s*:\s*\{\s*"') { Info "second dump re-shipped blob (acceptable if a redraw/attach reset occurred)" }
-else { Info "second dump image_blobs state indeterminate" }
+if ($dump2 -and $dump2 -notmatch '"image_blobs"\s*:\s*\{\s*"') { Pass "second dump ships no blob (blob shipped once)" }
+elseif ($dump2) { FailX "second dump re-shipped the blob" }
+else { FailX "second dump returned nothing" }
 
 # 4) option gating: set -g sixel off is accepted and reflected
-& $PSMUX set-option -g sixel off 2>&1 | Out-Null
+P set-option -g sixel off 2>&1 | Out-Null
 Start-Sleep -Milliseconds 400
-$so = (& $PSMUX show-options -g 2>&1 | Out-String)
+$so = (P show-options -g 2>&1 | Out-String)
 if ($so -match 'sixel\s+off') { Pass "set -g sixel off reflected in show-options" }
 else { FailX "sixel option not reflected off (show-options)" }
-& $PSMUX set-option -g sixel on 2>&1 | Out-Null
+P set-option -g sixel on 2>&1 | Out-Null
 
-Cleanup
 Remove-Item $emitter -Force -EA SilentlyContinue
+Cleanup
 
 Write-Host "`n=== Result ===" -ForegroundColor Cyan
 Write-Host "  Passed: $($script:Pass)" -ForegroundColor Green
