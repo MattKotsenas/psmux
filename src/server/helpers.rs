@@ -1488,6 +1488,37 @@ pub fn best_prompt_client(app: &AppState) -> Option<u64> {
         .map(|ci| ci.id)
 }
 
+/// `confirm-before` from the command line or another connection: open the
+/// prompt the attached client draws, or refuse when there is no client to show
+/// it on. tmux resolves the target client first (CMD_CLIENT_TFLAG,
+/// cmd-queue.c:604) and fails with `no current client` (cmd-find.c:1298)
+/// before any prompt exists; a prompt opened here with nobody attached was
+/// answered no by the first key the next client to attach pressed.
+pub fn open_confirm_prompt(
+    app: &mut AppState,
+    spec: &crate::confirm::ConfirmSpec,
+    command: String,
+) -> Result<(), String> {
+    if best_prompt_client(app).is_none() {
+        return Err("no current client".to_string());
+    }
+    // tmux shows `-p` as given, formats expanded (status_prompt_set), and
+    // otherwise `Confirm '<command>'? (y/n)`. A newer prompt replaces the one
+    // showing, as status_prompt_set clears the old one.
+    let prompt = match &spec.prompt {
+        Some(p) => crate::format::expand_format(p, app),
+        None => crate::confirm::prompt_text(spec, &command),
+    };
+    app.mode = crate::types::Mode::ConfirmMode {
+        prompt,
+        command,
+        input: String::new(),
+        key: spec.key,
+        default_yes: spec.default_yes,
+    };
+    Ok(())
+}
+
 /// `command-prompt <args>` run anywhere but a client's own key binding: from
 /// the command line, a hook, or a binding the server runs. The prompt opens on
 /// an attached client (tmux status_prompt_set on the target client), which
@@ -1569,3 +1600,7 @@ pub fn request_client_prompt(app: &mut AppState, args: &str) -> Result<PromptReq
 #[cfg(test)]
 #[path = "../../tests-rs/test_cli_command_prompt_client.rs"]
 mod test_cli_command_prompt_client;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_stale_confirm.rs"]
+mod test_stale_confirm;

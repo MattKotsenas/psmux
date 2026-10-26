@@ -2638,6 +2638,15 @@ impl AppState {
         if self.client_registry.remove(&cid).is_some() {
             self.attached_clients = self.attached_clients.saturating_sub(1);
             self.client_prefix_active = false;
+            // A confirm prompt lives on a client in tmux (status_prompt_set),
+            // so it goes with the last client that could answer it. Kept, it
+            // greeted the next client to attach, which answered it no with
+            // whatever key it pressed first.
+            if matches!(self.mode, Mode::ConfirmMode { .. })
+                && !self.client_registry.values().any(|ci| !ci.is_control)
+            {
+                self.mode = Mode::Passthrough;
+            }
             // A detaching client takes its `switch-client -T` latch with it
             // (issue #640): the next client starts in the default table.
             self.current_key_table = None;
@@ -4502,8 +4511,9 @@ pub enum CtrlReq {
     /// Parsed `display-popup` arguments and whether the popup closes when its
     /// command exits.
     DisplayPopup(crate::popup::DisplayPopupArgs, bool),
-    /// `confirm-before`'s flags and the command it guards.
-    ConfirmBefore(crate::confirm::ConfirmSpec, String),
+    /// `confirm-before`'s flags, the command it guards, and where to say
+    /// `ERROR: no current client` when no client is attached to show it.
+    ConfirmBefore(crate::confirm::ConfirmSpec, String, Option<mpsc::Sender<String>>),
     ClockMode,
     ResizePaneAbsolute(String, u16),
     ResizePanePercent(String, u8), // axis, percentage (0-100)

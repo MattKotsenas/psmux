@@ -5996,7 +5996,16 @@ match cmd {
         match crate::confirm::parse_confirm_args(&args) {
             Ok((spec, start)) => {
                 let command = crate::confirm::command_line(&args[start..], requote_command_tail);
-                let _ = tx.send(CtrlReq::ConfirmBefore(spec, command));
+                // The command line hears `no current client` when nobody is
+                // attached to show the prompt, as in tmux.
+                let (rtx, rrx) = mpsc::channel::<String>();
+                let _ = tx.send(CtrlReq::ConfirmBefore(spec, command, Some(rtx)));
+                if let Ok(reply) = rrx.recv() {
+                    if !persistent && !reply.is_empty() {
+                        let _ = writeln!(write_stream, "{}", reply);
+                        let _ = write_stream.flush();
+                    }
+                }
             }
             Err(e) => {
                 let _ = writeln!(write_stream, "ERROR: confirm-before: {}", e);

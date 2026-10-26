@@ -6015,7 +6015,13 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 let parts: Vec<String> = cmd_args.iter().map(|s| {
                     crate::util::quote_arg_if_needed(s)
                 }).collect();
-                send_control(format!("{}\n", parts.join(" ")))?;
+                // With nobody attached to show the prompt, tmux fails with
+                // `no current client` (cmd-find.c:1298) at exit 1.
+                let resp = send_control_with_response(format!("{}\n", parts.join(" ")))?;
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             // refresh-client - Refresh the client display

@@ -9,6 +9,9 @@ use super::*;
 fn session(name: &str) -> Session {
     let mut app = AppState::new(name.to_string());
     app.socket_name = Some("tconfirm".to_string());
+    // A confirm prompt needs a client to show it on (no current client
+    // otherwise, as in tmux).
+    app.register_client(1, false);
     let aliases = app.command_aliases.clone();
     Session {
         app,
@@ -56,7 +59,7 @@ fn confirm_before_opens_the_prompt_in_the_requesting_session_only() {
     let mut a = session("A");
     let mut b = session("B");
     let spec = crate::confirm::ConfirmSpec { key: 'н', default_yes: true, ..Default::default() };
-    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(spec, "kill-pane".to_string()));
+    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(spec, "kill-pane".to_string(), None));
     let (prompt, command, key, default_yes) = confirm_prompt(&a.app)
         .expect("BUG: shared dispatch dropped ConfirmBefore, no prompt opened");
     assert_eq!(command, "kill-pane");
@@ -74,7 +77,7 @@ fn a_custom_prompt_is_shown_as_given() {
     let mut ids = ServerIds::new();
     let mut a = session("A");
     let spec = crate::confirm::ConfirmSpec { prompt: Some("really?".to_string()), ..Default::default() };
-    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(spec, "kill-pane".to_string()));
+    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(spec, "kill-pane".to_string(), None));
     assert_eq!(confirm_prompt(&a.app).map(|p| p.0).as_deref(), Some("really?"));
 }
 
@@ -85,7 +88,7 @@ fn no_closes_the_prompt_and_runs_nothing() {
     let ns = Some("tconfirm".to_string());
     let mut ids = ServerIds::new();
     let mut a = session("A");
-    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "rename-window NO_RAN".to_string()));
+    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "rename-window NO_RAN".to_string(), None));
     assert!(confirm_prompt(&a.app).is_some(), "BUG: no prompt opened");
     send(&mut a, &mut ids, &ns, CtrlReq::ConfirmRespond(false));
     assert!(confirm_prompt(&a.app).is_none(), "n closes the prompt");
@@ -99,12 +102,26 @@ fn yes_closes_the_prompt_and_runs_the_command() {
     let ns = Some("tconfirm".to_string());
     let mut ids = ServerIds::new();
     let mut a = session("A");
-    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "set-option -g @confirmed ran".to_string()));
+    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "set-option -g @confirmed ran".to_string(), None));
     assert!(confirm_prompt(&a.app).is_some(), "BUG: no prompt opened");
     send(&mut a, &mut ids, &ns, CtrlReq::ConfirmRespond(true));
     assert!(matches!(a.app.mode, Mode::Passthrough), "y closes the prompt");
     assert_eq!(a.app.user_options.get("@confirmed").map(String::as_str), Some("ran"),
         "y runs the guarded command in the session");
+}
+
+#[test]
+fn no_attached_client_is_refused_with_no_current_client() {
+    let _lock = crate::util::lock_test_env();
+    let _back = EnvBack(std::env::var("PSMUX_TARGET_SESSION").ok());
+    let ns = Some("tconfirm".to_string());
+    let mut ids = ServerIds::new();
+    let mut a = session("A");
+    assert!(a.app.reap_client(1));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    send(&mut a, &mut ids, &ns, CtrlReq::ConfirmBefore(Default::default(), "kill-pane".to_string(), Some(tx)));
+    assert_eq!(rx.recv().unwrap(), "ERROR: no current client");
+    assert!(confirm_prompt(&a.app).is_none(), "BUG: a prompt nobody draws was opened");
 }
 
 #[test]

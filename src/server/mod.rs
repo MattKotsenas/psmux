@@ -8165,22 +8165,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if let Some(r) = resp { let _ = r.send(String::new()); }
                     }
                 }
-                CtrlReq::ConfirmBefore(spec, cmd) => {
-                    // tmux shows `-p` as given, formats expanded
-                    // (status_prompt_set), and otherwise
-                    // `Confirm '<command>'? (y/n)`.
-                    let prompt_text = match &spec.prompt {
-                        Some(p) => crate::format::expand_format(p, &app),
-                        None => crate::confirm::prompt_text(&spec, &cmd),
+                CtrlReq::ConfirmBefore(spec, cmd, resp) => {
+                    let reply = match helpers::open_confirm_prompt(&mut app, &spec, cmd) {
+                        Ok(()) => { state_dirty = true; String::new() }
+                        Err(e) => format!("ERROR: {}", e),
                     };
-                    app.mode = Mode::ConfirmMode {
-                        prompt: prompt_text,
-                        command: cmd,
-                        input: String::new(),
-                        key: spec.key,
-                        default_yes: spec.default_yes,
-                    };
-                    state_dirty = true;
+                    if let Some(r) = resp { let _ = r.send(reply); }
                 }
                 CtrlReq::ResizePaneAbsolute(axis, size) => {
                     // tmux: resize-pane -x/-y sets the focused float's absolute

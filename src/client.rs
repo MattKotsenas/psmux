@@ -5489,6 +5489,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     crate::confirm::ConfirmInput::from_key_code(key.code),
                                 );
                                 cmd_batch.push(if yes { "confirm-respond y\n" } else { "confirm-respond n\n" }.into());
+                                // Answered: the keys typed before the next
+                                // frame are the user's again, not more answers
+                                // to a prompt that is already gone.
+                                srv_confirm_active = false;
                             }
                         }
                         else if srv_menu_active {

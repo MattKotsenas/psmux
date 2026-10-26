@@ -45,6 +45,9 @@ pub const SUPPORTED: &[&str] = &[
     "delete-buffer", "deleteb",
     "save-buffer", "saveb",
     "load-buffer", "loadb",
+    // a prompt on the attached client, refused with no current client
+    // when nobody is attached (the dispatch arms came in 8bf883ac)
+    "confirm-before", "confirm",
     // listings
     "list-windows", "lsw",
     "list-panes", "lsp",
