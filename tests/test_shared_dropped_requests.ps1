@@ -67,7 +67,7 @@ try {
 
     & $injector $proc.Id "^b{SLEEP:400}]" | Out-Null
     Start-Sleep -Milliseconds 1500
-    $cap = (P capture-pane -p -t A) -join "`n"
+    $cap = (P capture-pane -p -J -t A) -join "`n"
     if ($cap -match 'DROPS_MARKER_42') { Write-Pass "prefix ] pastes the buffer into the pane" } else { Write-Fail "prefix ] pasted nothing" }
 
     if ($Mode -eq "shared") {
