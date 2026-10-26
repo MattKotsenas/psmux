@@ -195,7 +195,11 @@ try {
     if ($null -eq $savedDataDir) { Remove-Item Env:\PSMUX_DATA_DIR -EA SilentlyContinue }
     $env:PSMUX_CONFIG_FILE = $savedConfig
     if ($null -eq $savedConfig) { Remove-Item Env:\PSMUX_CONFIG_FILE -EA SilentlyContinue }
+    # Read the default namespace the same way as before: with no data dir
+    # override, whatever the caller exported.
+    Remove-Item Env:\PSMUX_DATA_DIR -EA SilentlyContinue
     $defaultAfter = (& $PSMUX ls 2>&1 | Out-String).Trim()
+    if ($null -ne $savedDataDir) { $env:PSMUX_DATA_DIR = $savedDataDir }
     if ($defaultBefore -ne $null -and $defaultAfter -ne $defaultBefore) {
         Write-Fail "the default namespace changed: '$defaultBefore' -> '$defaultAfter'"
     }
