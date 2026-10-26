@@ -148,10 +148,18 @@ Add-Result "exactly four window rows are visible (no pane rows)" ($windowRows -e
 # Every visible line carries its tmux jump key and a +/- expansion marker, so
 # counting them counts the tree: one session plus four windows, nothing else.
 # The old flat listing rendered eleven rows numbered "1." to "11." instead.
-$listRows = ([regex]::Matches($screen, '(?m)^\W*\d+ [-+]')).Count
+# The side border is read back through a code page best fit, so it can come
+# back as any single character (a letter such as U+00AA once 0xA6 is decoded
+# as OEM): match one optional non blank in front of the key, not a class.
+$listRows = ([regex]::Matches($screen, '(?m)^\s*\S?\d+ [-+]')).Count
 Add-Result "exactly five visible lines (session plus its four windows)" ($listRows -eq 5) `
     "visible lines=$listRows"
-Add-Result "no row uses the old 1-based 'N.' numbering" (-not ($screen -match '(?m)^\W*\s*\d+\. ')) ""
+if ($listRows -ne 5) {
+    Write-Host "  [screen]`n$screen"
+    $row = ($screen -split "`n" | Where-Object { $_ -match "0 -$SESSION" } | Select-Object -First 1)
+    if ($row) { Write-Host ("  [row codes] " + (($row.TrimStart().Substring(0, [Math]::Min(8, $row.TrimStart().Length)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ')) }
+}
+Add-Result "no row uses the old 1-based 'N.' numbering" (-not ($screen -match '(?m)^\s*\S?\s*\d+\. ')) ""
 # tmux stamps '0'+line on the visible lines, so with one session the keys are
 # 0 for the session and 1..4 for the four windows.
 Add-Result "session row carries jump key 0" ($screen -match "0 -$SESSION") ""
