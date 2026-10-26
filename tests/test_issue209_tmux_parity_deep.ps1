@@ -296,7 +296,10 @@ Write-Host "`n=== GAP 4: send-keys -X (Copy Mode Commands) ===" -ForegroundColor
 
 # Test 4a: Enter copy mode, -X cancel exits it
 Write-Host "[4a] -X cancel exits copy mode" -ForegroundColor Yellow
-& $PSMUX send-keys -t $S1 -X copy-mode 2>&1 | Out-Null
+# Enter copy mode with the copy-mode command. `send-keys -X copy-mode` is not
+# a way in: tmux (cmd-send-keys.c) answers every -X outside a mode with
+# "not in a mode" and window-copy has no "copy-mode" command anyway.
+& $PSMUX copy-mode -t $S1 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $modeIn = (& $PSMUX display-message -t $S1 -p '#{pane_mode}' 2>&1 | Out-String).Trim()
 Write-Host "       Mode after copy-mode: '$modeIn'" -ForegroundColor DarkGray
@@ -314,13 +317,16 @@ if ($modeIn -match "copy" -and ($modeOut -eq "" -or $modeOut -notmatch "copy")) 
 
 # Test 4b: -X with non-copy mode should not crash
 Write-Host "[4b] -X in normal mode (no crash)" -ForegroundColor Yellow
-$err4b = & $PSMUX send-keys -t $S1 -X cancel 2>&1
-# tmux returns error "not in a mode" -- psmux should at least not crash
+$err4b = (& $PSMUX send-keys -t $S1 -X cancel 2>&1 | Out-String).Trim()
+$rc4b = $LASTEXITCODE
+# tmux returns error "not in a mode" with a failing exit status
 & $PSMUX has-session -t $S1 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Pass "Session survives -X in normal mode"
-} else {
+if ($LASTEXITCODE -ne 0) {
     Write-Fail "Session died after -X in normal mode!"
+} elseif ($err4b -match 'not in a mode' -and $rc4b -ne 0) {
+    Write-Pass "Session survives -X in normal mode and refuses it like tmux: '$err4b'"
+} else {
+    Write-Fail "-X outside a mode should fail with 'not in a mode' (rc=$rc4b, output='$err4b')"
 }
 
 # ============================================================
@@ -458,20 +464,21 @@ if ($allLines.Count -ge $prefixLines.Count) {
 }
 
 # ============================================================
-# GAP 8: resize-window -x/-y (intentional no-op on Windows)
+# GAP 8: resize-window -x/-y
 # tmux: cmd-resize-window.c
 #   -x width, -y height: set manual window size
-#   On psmux/Windows: terminal controls viewport, this is a documented no-op
+#   psmux keeps client viewport and target-window geometry separate.
 # ============================================================
-Write-Host "`n=== GAP 8: resize-window (Windows No-Op) ===" -ForegroundColor Cyan
+Write-Host "`n=== GAP 8: resize-window geometry ===" -ForegroundColor Cyan
 
-Write-Host "[8a] resize-window -x -y accepted without error" -ForegroundColor Yellow
+Write-Host "[8a] resize-window -x -y changes the target geometry" -ForegroundColor Yellow
 $err8 = & $PSMUX resize-window -t $S1 -x 200 -y 50 2>&1
-& $PSMUX has-session -t $S1 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Pass "resize-window accepted, session alive (no-op on Windows is by design)"
+$width8 = (& $PSMUX display-message -t $S1 -p '#{window_width}' 2>&1 | Out-String).Trim()
+$height8 = (& $PSMUX display-message -t $S1 -p '#{window_height}' 2>&1 | Out-String).Trim()
+if ($width8 -eq "200" -and $height8 -eq "50") {
+    Write-Pass "resize-window changed the target to ${width8}x${height8}"
 } else {
-    Write-Fail "Session died after resize-window!"
+    Write-Fail "Expected 200x50, got ${width8}x${height8}; output: $err8"
 }
 
 # ============================================================

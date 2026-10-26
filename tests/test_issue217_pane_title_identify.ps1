@@ -109,23 +109,54 @@ if ($statusRight -match "pane_title") {
     Write-Fail "status-right does not reference pane_title"
 }
 
-# === TEST 6: OSC title escape sequence should update pane_title ===
-Write-Host "`n[Test 6] OSC title escape sequence handling" -ForegroundColor Yellow
+# === TEST 6: OSC title escape sequences are GATED by allow-set-title ===
+#
+# This used to send OSC 2 with the option at its default and report a confirmed
+# bug when pane_title did not change. That is documented, deliberate behaviour,
+# not a defect: psmux ships `allow-set-title off` because PowerShell 7 rewrites
+# the terminal title to the current directory on EVERY prompt, so leaving it on
+# turns #{pane_title} into a churning path. See docs/pane-titles.md, the option
+# table in docs/configuration.md, and the FAQ entry.
+#
+# So both halves of the gate are asserted: off suppresses, on propagates.
+# Measured against real tmux 3.4, which has no such option at all
+# ("invalid option: allow-set-title") and always tracks the title:
+#   tmux printf '\033]2;TMUXMARKER\007'  ->  pane_title becomes TMUXMARKER
+Write-Host "`n[Test 6] OSC title escape sequences are gated by allow-set-title" -ForegroundColor Yellow
 $marker = "OSC_TEST_TITLE_217"
 
-# Send OSC 2 title sequence
+$optDefault = (& $PSMUX show-options -g -v allow-set-title -t $SESSION 2>&1 | Out-String).Trim()
+if ($optDefault -eq "off") { Write-Pass "allow-set-title defaults to off (documented Windows default)" }
+else { Write-Fail "expected allow-set-title default 'off', got '$optDefault'" }
+
+# --- half 1: with the option OFF the title must NOT follow the escape ---
 & $PSMUX send-keys -t $SESSION "Write-Host -NoNewline ([char]27 + `"]2;$marker`" + [char]7)" Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 2
-$titleAfterOSC = (& $PSMUX display-message -t $SESSION -p '#{pane_title}' 2>&1 | Out-String).Trim()
-Write-Host "  pane_title after OSC 2: '$titleAfterOSC'" -ForegroundColor DarkGray
-
-if ($titleAfterOSC -eq $marker) {
-    Write-Pass "OSC 2 title sequence updates pane_title"
-} elseif ($titleAfterOSC -eq $paneTitle) {
-    Write-Bug "OSC 2 title sequence does NOT update pane_title (still '$titleAfterOSC')"
+$titleOptOff = (& $PSMUX display-message -t $SESSION -p '#{pane_title}' 2>&1 | Out-String).Trim()
+Write-Host "  pane_title after OSC 2 with option off: '$titleOptOff'" -ForegroundColor DarkGray
+if ($titleOptOff -ne $marker) {
+    Write-Pass "option off suppresses the OSC title (still '$titleOptOff')"
 } else {
-    Write-Fail "pane_title after OSC is '$titleAfterOSC', expected '$marker'"
+    Write-Fail "option off did NOT suppress the OSC title: pane_title became '$titleOptOff'"
 }
+
+# --- half 2: with the option ON the title must follow the escape ---
+& $PSMUX set-option -t $SESSION -g allow-set-title on 2>&1 | Out-Null
+Start-Sleep -Seconds 1
+$markerOn = "OSC_ON_TITLE_217"
+& $PSMUX send-keys -t $SESSION "Write-Host -NoNewline ([char]27 + `"]2;$markerOn`" + [char]7)" Enter 2>&1 | Out-Null
+Start-Sleep -Seconds 2
+$titleOptOn = (& $PSMUX display-message -t $SESSION -p '#{pane_title}' 2>&1 | Out-String).Trim()
+Write-Host "  pane_title after OSC 2 with option on:  '$titleOptOn'" -ForegroundColor DarkGray
+if ($titleOptOn -eq $markerOn) {
+    Write-Pass "allow-set-title on: OSC 2 updates pane_title (tmux behaviour)"
+} else {
+    Write-Fail "allow-set-title on: expected '$markerOn', got '$titleOptOn'"
+}
+
+# Restore the shipped default so the later checks see a stock session.
+& $PSMUX set-option -t $SESSION -g allow-set-title off 2>&1 | Out-Null
+Start-Sleep -Milliseconds 500
 
 # === TEST 7: select-pane -T should set pane title ===
 Write-Host "`n[Test 7] select-pane -T sets pane title" -ForegroundColor Yellow

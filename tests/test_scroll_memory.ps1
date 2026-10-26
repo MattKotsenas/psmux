@@ -139,8 +139,10 @@ try {
 $stream = $tcp.GetStream()
 $writer = [System.IO.StreamWriter]::new($stream)
 $writer.AutoFlush = $true
+$reader = [System.IO.StreamReader]::new($stream)
 
 $writer.WriteLine("AUTH $key")
+$null = $reader.ReadLine()
 $writer.WriteLine("PERSISTENT")
 Start-Sleep -Milliseconds 200
 
@@ -158,15 +160,37 @@ $memorySamples += [PSCustomObject]@{
     Events = 0; MemoryMB = $baselineMB; Timestamp = (Get-Date)
 }
 
-while ($sent -lt $ScrollCount) {
+$writeDead = $false
+while ($sent -lt $ScrollCount -and -not $writeDead) {
     $burstNum++
     $thisBurst = [math]::Min($BurstSize, $ScrollCount - $sent)
 
     for ($i = 0; $i -lt $thisBurst; $i++) {
+        # A dead connection must end the whole run with ONE failure, not retry
+        # forever: $sent stops advancing after a write error, so without the
+        # $writeDead flag the outer loop spins until the harness timeout,
+        # emitting thousands of duplicate [FAIL] lines for one event.
         try { $writer.WriteLine("scroll-up 40 20") } catch {
-            Write-Fail "TCP write failed at event $sent : $_"; break
+            Write-Fail "TCP write failed at event $sent (connection closed by server) : $_"
+            $writeDead = $true
+            break
         }
         $sent++
+        # Root-cause note: a PERSISTENT connection receives a freshly-built
+        # dump-state frame pushed by the server (event-driven rendering)
+        # every time scroll-up marks state dirty -- exactly what a real TUI
+        # client continuously reads and renders. This test never read
+        # anything from the socket, so the OS receive buffer on this end
+        # filled up; the server's writer thread has a 5s write-timeout for
+        # exactly this backpressure case and (correctly) tears down a client
+        # that stops draining, which is what "connection closed by server
+        # after ~250 events" actually was -- confirmed via a side-by-side
+        # repro: identical flood WITH draining reads sent all 400 events with
+        # zero disconnects, session alive throughout. Drain here so this test
+        # behaves like a real client instead of a write-only stream.
+        try {
+            while ($stream.DataAvailable) { $null = $reader.ReadLine() }
+        } catch {}
         if ($BurstDelayMs -gt 0) { Start-Sleep -Milliseconds $BurstDelayMs }
     }
 

@@ -6,9 +6,17 @@
 
 /// Default root-table keybindings (no prefix required).
 /// These match tmux defaults for the root key table.
-pub const ROOT_DEFAULTS: &[(&str, &str)] = &[
-    ("PageUp",  "copy-mode -u"),
-];
+/// tmux binds NO keys in the root table by default (mouse aside) — in
+/// particular PPage/PageUp is bound only in the PREFIX table, so a bare
+/// PageUp must reach the running application (pagers, editors) untouched
+/// (issue #488). Users can restore the old behavior with
+/// `bind-key -n PageUp copy-mode -u`.
+pub const ROOT_DEFAULTS: &[(&str, &str)] = &[];
+
+/// The arguments of the `'` entry in PREFIX_DEFAULTS after `command-prompt`.
+/// The client opens the window index prompt from these when the key arrives
+/// before the first state sync, and for the old `select-window-index` name.
+pub const WINDOW_INDEX_PROMPT_ARGS: &str = "-T window-target -p index \"select-window -t ':%%'\"";
 
 /// Default prefix-table keybindings.
 /// Each entry is `(key_string, command_string)`.
@@ -31,7 +39,29 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
     ("w",       "choose-tree"),
     ("&",       "confirm-before -p 'kill-window #W? (y/n)' kill-window"),
     (",",       "rename-window"),
-    ("'",       "select-window-index"),
+    // tmux binds `'` to a plain prompt (key-bindings.c:364, tag 3.7c):
+    //     command-prompt -T window-target -pindex { select-window -t ':%%' }
+    // so the answer goes through the prompt editor every other prompt uses,
+    // with its history, and `select-window` resolves an index or a name. It
+    // used to be `select-window-index`, a box of the client's own that took
+    // four keys and let the rest reach the pane (#821). `-T window-target` is
+    // kept for the reason given for `.` below. The client opens the same
+    // prompt from WINDOW_INDEX_PROMPT_ARGS before the first state sync.
+    ("'",       "command-prompt -T window-target -p index \"select-window -t ':%%'\""),
+    // tmux binds `.` by default: prompt for an index and move the current
+    // window there. Measured on tmux 3.6a, `list-keys -T prefix` renders it as
+    //     command-prompt -T target { move-window -t "%%" }
+    // psmux has no `{}` command blocks, so the same command is written in the
+    // quoting form psmux's parser reads. parse_command_line strips the quotes
+    // again before move-window sees the index, so the two are equivalent.
+    //
+    // `-T target` is what every tmux release from 3.4 to 3.7b binds here. tmux
+    // dropped the `target` and `window-target` prompt types after 3.7b (7b02cb6d,
+    // "Fix . and ; bindings"), so its own HEAD now writes the binding without a
+    // prompt type. It is kept because it is what a user copying a released tmux
+    // will have, and psmux consumes and ignores the flag either way: the prompt
+    // types only ever chose which completions tmux offered, and psmux has none.
+    (".",       "command-prompt -T target \"move-window -t '%%'\""),
     ("0",       "select-window -t :0"),
     ("1",       "select-window -t :1"),
     ("2",       "select-window -t :2"),
@@ -62,6 +92,8 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
     ("{",       "swap-pane -U"),
     ("}",       "swap-pane -D"),
     ("!",       "break-pane"),
+    // tmux key-bindings.c: `bind -N 'New floating pane' * { new-pane }` (#767).
+    ("*",       "new-pane"),
 
     // ── Pane resize (Ctrl+Arrow = 1 cell) ──
     ("C-Up",    "resize-pane -U"),
@@ -89,7 +121,14 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
 
     // ── Copy / Paste ──
     ("[",       "copy-mode"),
-    ("]",       "paste-buffer"),
+    // tmux: bind PPage { copy-mode -u } — enter copy mode scrolled up one
+    // page. The root table deliberately has no PageUp binding (issue #488).
+    ("PageUp",  "copy-mode -u"),
+    // tmux: bind -N 'Paste the most recent paste buffer' ] { paste-buffer -p }
+    // (key-bindings.c:422).  The -p is what makes the one keypress bracketed
+    // for a pane that asked for ?2004h; without it the paste arrives as typed
+    // input everywhere, not only on the build from issue #684.
+    ("]",       "paste-buffer -p"),
     ("=",       "choose-buffer"),
     ("#",       "list-buffers"),
 
@@ -98,12 +137,210 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
     ("?",       "list-keys"),
     ("i",       "display-message"),
     ("t",       "clock-mode"),
-    ("s",       "choose-session"),
+    ("s",       "choose-tree -Zs"),
     ("(",       "switch-client -p"),
     (")",       "switch-client -n"),
+    // tmux: bind -N 'Switch to the last client' L { switch-client -l }
+    // (key-bindings.c:419). The server resolves it from this client's own
+    // history (issue #566), so it is sent there, never cycled client side.
+    ("L",       "switch-client -l"),
     ("v",       "rectangle-toggle"),
     ("y",       "copy-yank"),
 ];
+
+/// The keys psmux's built-in copy mode handles, as `list-keys` shows them
+/// (`bind-key -T copy-mode-vi v send-keys -X begin-selection`).
+///
+/// tmux keeps its copy-mode defaults in real key tables (key-bindings.c), so
+/// `list-keys -T copy-mode-vi` prints them and `unbind -T copy-mode-vi <key>`
+/// takes them away. psmux runs these keys through its built-in handlers
+/// (`input.rs`), so these lists record what those handlers do, each written as
+/// the `send-keys -X` command that does the same thing. They describe PSMUX,
+/// not tmux: where the built-in handler differs from tmux's default (`y`
+/// copies, emacs `v` begins a selection) the psmux behaviour is what is listed,
+/// and keys the handlers do not treat (BSpace, the tmux `command-prompt -N`
+/// digit bindings) are left out. Digits still work as a repeat count, and
+/// `i`/`a` still start a text object; neither has a `send-keys -X` spelling,
+/// so neither is listed.
+///
+/// `copy-mode-vi` is used when `mode-keys` is `vi`, `copy-mode` otherwise,
+/// matching the tables tmux picks. Keep these in step with the three copy-mode
+/// matches in `input.rs`.
+pub const COPY_MODE_VI_DEFAULTS: &[(&str, &str)] = &[
+    ("C-b", "send-keys -X page-up"),
+    ("C-c", "send-keys -X cancel"),
+    ("C-d", "send-keys -X halfpage-down"),
+    ("C-e", "send-keys -X scroll-down"),
+    ("C-f", "send-keys -X page-down"),
+    ("C-u", "send-keys -X halfpage-up"),
+    ("C-v", "send-keys -X rectangle-toggle"),
+    ("C-y", "send-keys -X scroll-up"),
+    ("Enter", "send-keys -X copy-pipe-and-cancel"),
+    ("Escape", "send-keys -X clear-selection"),
+    ("Space", "send-keys -X begin-selection"),
+    ("$", "send-keys -X end-of-line"),
+    ("%", "send-keys -X next-matching-bracket"),
+    (",", "send-keys -X jump-reverse"),
+    ("/", "send-keys -X search-forward"),
+    ("0", "send-keys -X start-of-line"),
+    (":", "command-prompt -p'(goto line)' { send -X goto-line -- '%%' }"),
+    (";", "send-keys -X jump-again"),
+    ("?", "send-keys -X search-backward"),
+    ("A", "send-keys -X append-selection-and-cancel"),
+    ("B", "send-keys -X previous-space"),
+    ("D", "send-keys -X copy-pipe-end-of-line-and-cancel"),
+    ("E", "send-keys -X next-space-end"),
+    ("F", "send-keys -X jump-backward"),
+    ("G", "send-keys -X history-bottom"),
+    ("H", "send-keys -X top-line"),
+    ("J", "send-keys -X scroll-down"),
+    ("K", "send-keys -X scroll-up"),
+    ("L", "send-keys -X bottom-line"),
+    ("M", "send-keys -X middle-line"),
+    ("N", "send-keys -X search-reverse"),
+    ("P", "send-keys -X toggle-position"),
+    ("T", "send-keys -X jump-to-backward"),
+    ("V", "send-keys -X select-line"),
+    ("W", "send-keys -X next-space"),
+    ("X", "send-keys -X set-mark"),
+    ("]", "send-keys -X cancel"),
+    ("^", "send-keys -X back-to-indentation"),
+    ("b", "send-keys -X previous-word"),
+    ("e", "send-keys -X next-word-end"),
+    ("f", "send-keys -X jump-forward"),
+    ("g", "send-keys -X history-top"),
+    ("h", "send-keys -X cursor-left"),
+    ("j", "send-keys -X cursor-down"),
+    ("k", "send-keys -X cursor-up"),
+    ("l", "send-keys -X cursor-right"),
+    ("n", "send-keys -X search-again"),
+    ("o", "send-keys -X other-end"),
+    ("q", "send-keys -X cancel"),
+    ("r", "send-keys -X refresh-from-pane"),
+    ("t", "send-keys -X jump-to-forward"),
+    ("v", "send-keys -X rectangle-toggle"),
+    ("w", "send-keys -X next-word"),
+    ("y", "send-keys -X copy-selection-and-cancel"),
+    ("z", "send-keys -X scroll-middle"),
+    ("{", "send-keys -X previous-paragraph"),
+    ("}", "send-keys -X next-paragraph"),
+    ("Home", "send-keys -X start-of-line"),
+    ("End", "send-keys -X end-of-line"),
+    ("NPage", "send-keys -X page-down"),
+    ("PPage", "send-keys -X page-up"),
+    ("Up", "send-keys -X cursor-up"),
+    ("Down", "send-keys -X cursor-down"),
+    ("Left", "send-keys -X cursor-left"),
+    ("Right", "send-keys -X cursor-right"),
+    ("C-Space", "send-keys -X begin-selection"),
+    ("C-a", "send-keys -X start-of-line"),
+    ("C-g", "send-keys -X cancel"),
+    ("C-n", "send-keys -X cursor-down"),
+    ("C-p", "send-keys -X cursor-up"),
+    ("C-r", "send-keys -X search-backward"),
+    ("C-s", "send-keys -X search-forward"),
+    ("M-<", "send-keys -X history-top"),
+    ("M->", "send-keys -X history-bottom"),
+    ("M-b", "send-keys -X previous-word"),
+    ("M-f", "send-keys -X next-word"),
+    ("M-v", "send-keys -X page-up"),
+    ("M-w", "send-keys -X copy-pipe-and-cancel"),
+    ("M-x", "send-keys -X jump-to-mark"),
+    ("C-Up", "send-keys -X scroll-up"),
+    ("C-Down", "send-keys -X scroll-down"),
+];
+
+/// The `copy-mode` table (any `mode-keys` other than `vi`). psmux's built-in
+/// handler shares most keys with the vi one; the differences are the ones
+/// `input.rs` branches on: the emacs meanings of C-b, C-f, C-e and C-v, and no
+/// g, G, J, K or C-y. See `COPY_MODE_VI_DEFAULTS` for what these lists are.
+pub const COPY_MODE_EMACS_DEFAULTS: &[(&str, &str)] = &[
+    ("C-b", "send-keys -X cursor-left"),
+    ("C-c", "send-keys -X cancel"),
+    ("C-d", "send-keys -X halfpage-down"),
+    ("C-e", "send-keys -X end-of-line"),
+    ("C-f", "send-keys -X cursor-right"),
+    ("C-u", "send-keys -X halfpage-up"),
+    ("C-v", "send-keys -X page-down"),
+    ("Enter", "send-keys -X copy-pipe-and-cancel"),
+    ("Escape", "send-keys -X cancel"),
+    ("Space", "send-keys -X begin-selection"),
+    ("$", "send-keys -X end-of-line"),
+    ("%", "send-keys -X next-matching-bracket"),
+    (",", "send-keys -X jump-reverse"),
+    ("/", "send-keys -X search-forward"),
+    ("0", "send-keys -X start-of-line"),
+    (";", "send-keys -X jump-again"),
+    ("?", "send-keys -X search-backward"),
+    ("A", "send-keys -X append-selection-and-cancel"),
+    ("B", "send-keys -X previous-space"),
+    ("D", "send-keys -X copy-pipe-end-of-line-and-cancel"),
+    ("E", "send-keys -X next-space-end"),
+    ("F", "send-keys -X jump-backward"),
+    ("H", "send-keys -X top-line"),
+    ("L", "send-keys -X bottom-line"),
+    ("M", "send-keys -X middle-line"),
+    ("N", "send-keys -X search-reverse"),
+    ("P", "send-keys -X toggle-position"),
+    ("T", "send-keys -X jump-to-backward"),
+    ("V", "send-keys -X select-line"),
+    ("W", "send-keys -X next-space"),
+    ("X", "send-keys -X set-mark"),
+    ("]", "send-keys -X cancel"),
+    ("^", "send-keys -X back-to-indentation"),
+    ("b", "send-keys -X previous-word"),
+    ("e", "send-keys -X next-word-end"),
+    ("f", "send-keys -X jump-forward"),
+    ("h", "send-keys -X cursor-left"),
+    ("j", "send-keys -X cursor-down"),
+    ("k", "send-keys -X cursor-up"),
+    ("l", "send-keys -X cursor-right"),
+    ("n", "send-keys -X search-again"),
+    ("o", "send-keys -X other-end"),
+    ("q", "send-keys -X cancel"),
+    ("r", "send-keys -X refresh-from-pane"),
+    ("t", "send-keys -X jump-to-forward"),
+    ("v", "send-keys -X begin-selection"),
+    ("w", "send-keys -X next-word"),
+    ("y", "send-keys -X copy-selection-and-cancel"),
+    ("z", "send-keys -X scroll-middle"),
+    ("{", "send-keys -X previous-paragraph"),
+    ("}", "send-keys -X next-paragraph"),
+    ("Home", "send-keys -X start-of-line"),
+    ("End", "send-keys -X end-of-line"),
+    ("NPage", "send-keys -X page-down"),
+    ("PPage", "send-keys -X page-up"),
+    ("Up", "send-keys -X cursor-up"),
+    ("Down", "send-keys -X cursor-down"),
+    ("Left", "send-keys -X cursor-left"),
+    ("Right", "send-keys -X cursor-right"),
+    ("C-Space", "send-keys -X begin-selection"),
+    ("C-a", "send-keys -X start-of-line"),
+    ("C-g", "send-keys -X cancel"),
+    ("C-n", "send-keys -X cursor-down"),
+    ("C-p", "send-keys -X cursor-up"),
+    ("C-r", "send-keys -X search-backward"),
+    ("C-s", "send-keys -X search-forward"),
+    ("M-<", "send-keys -X history-top"),
+    ("M->", "send-keys -X history-bottom"),
+    ("M-b", "send-keys -X previous-word"),
+    ("M-f", "send-keys -X next-word"),
+    ("M-v", "send-keys -X page-up"),
+    ("M-w", "send-keys -X copy-pipe-and-cancel"),
+    ("M-x", "send-keys -X jump-to-mark"),
+    ("C-Up", "send-keys -X scroll-up"),
+    ("C-Down", "send-keys -X scroll-down"),
+];
+
+/// The built-in copy-mode defaults for `table`, or an empty list for a table
+/// that is not one of the two copy-mode tables.
+pub fn copy_mode_defaults(table: &str) -> &'static [(&'static str, &'static str)] {
+    match table {
+        "copy-mode-vi" => COPY_MODE_VI_DEFAULTS,
+        "copy-mode" => COPY_MODE_EMACS_DEFAULTS,
+        _ => &[],
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Sections below are used *only* by the overlay — they don't affect
@@ -124,7 +361,7 @@ pub fn copy_mode_vi_lines() -> Vec<String> {
 
 const COPY_MODE_VI: &[(&str, &str)] = &[
     // Exit
-    ("Escape",    "cancel (exit copy mode)"),
+    ("Escape",    "clear-selection (stay in copy mode)"),
     ("q",         "cancel (exit copy mode)"),
     // Cursor movement
     ("h",         "cursor-left"),
@@ -167,10 +404,17 @@ const COPY_MODE_VI: &[(&str, &str)] = &[
     ("F{char}",   "jump-backward"),
     ("t{char}",   "jump-to-forward"),
     ("T{char}",   "jump-to-backward"),
+    (";",         "jump-again"),
+    (",",         "jump-reverse"),
+    // Mark
+    ("X",         "set-mark"),
+    ("M-x",       "jump-to-mark"),
+    ("r",         "refresh-from-pane"),
     // Bracket / paragraph
     ("%",         "next-matching-bracket"),
     ("{",         "previous-paragraph"),
     ("}",         "next-paragraph"),
+    ("z",         "scroll-middle"),
     // Selection
     ("v",         "rectangle-toggle"),
     ("V",         "select-line"),
@@ -187,6 +431,8 @@ const COPY_MODE_VI: &[(&str, &str)] = &[
     ("?",         "search-backward"),
     ("n",         "search-again"),
     ("N",         "search-reverse"),
+    // Goto line
+    (":",         "command-prompt -p'(goto line)' { send -X goto-line -- '%%' }"),
     // Registers / text objects
     ("\"{a-z}",   "set register for next yank"),
     ("aw",        "select-word (a word)"),
@@ -264,7 +510,7 @@ const CLI_COMMANDS: &[(&str, &str, &str)] = &[
     ("attach-session",    "attach",   "Attach to an existing session"),
     ("detach-client",     "detach",   "Detach from the current session"),
     ("has-session",       "has",      "Check if a session exists"),
-    ("kill-server",       "",         "Kill the server and all sessions"),
+    ("kill-server",       "",         "Kill every server on this socket (-a: all)"),
     ("kill-session",      "",         "Destroy a session"),
     ("list-sessions",     "ls",       "List sessions"),
     ("new-session",       "new",      "Create a new session"),
@@ -334,7 +580,6 @@ const CLI_COMMANDS: &[(&str, &str, &str)] = &[
     ("display-message",   "display",  "Display a message / pane info"),
     ("display-popup",     "popup",    "Display a popup window"),
     ("list-commands",     "lscm",     "List available commands"),
-    ("server-info",       "info",     "Show server information"),
     // Misc
     ("confirm-before",    "confirm",  "Confirm before running command"),
     ("if-shell",          "if",       "Conditional command execution"),
@@ -367,13 +612,14 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("prefix",                     "C-b"),
     ("prefix2",                    "none"),
     // Behaviour
-    ("escape-time",                "500"),
+    ("escape-time",                "10"),
     ("base-index",                 "0"),
     ("pane-base-index",            "0"),
     ("history-limit",              "2000"),
     ("mouse",                      "on"),
     ("mode-keys",                  "emacs"),
     ("focus-events",               "off"),
+    ("program-status",             "off"),
     ("remain-on-exit",             "off"),
     ("renumber-windows",           "off"),
     ("aggressive-resize",          "off"),
@@ -382,8 +628,9 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("set-titles",                 "off"),
     ("allow-passthrough",          "off"),
     ("sixel",                      "on"),
+    ("priority",                   "above-normal"),
     ("default-command",            "(system shell)"),
-    ("word-separators",            "\" -_@\""),
+    ("word-separators",            "\"!\\\"#$%&'()*+,-./:;<=>?@[\\\\]^`{|}~\""),
     // Display timing
     ("display-time",               "750"),
     ("display-panes-time",         "1000"),
@@ -412,6 +659,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("pane-border-style",          "\"\""),
     ("pane-active-border-style",   "fg=green"),
     ("pane-border-hover-style",     "fg=yellow"),
+    ("pane-border-indicators",     crate::pane_border::INDICATORS_DEFAULT),
     // Messages / Modes
     ("message-style",              "bg=yellow,fg=black"),
     ("message-command-style",      "bg=black,fg=yellow"),
@@ -423,14 +671,17 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("visual-bell",                "off"),
     ("bell-action",                "any"),
     // Layout
-    ("main-pane-width",            "0 (60% heuristic)"),
-    ("main-pane-height",           "0 (60% heuristic)"),
+    ("main-pane-width",            "80"),
+    ("main-pane-height",           "24"),
     // Copy / Clipboard
     ("copy-command",               "\"\""),
-    ("set-clipboard",              "on"),
+    // Unicode
+    ("codepoint-widths",           "\"\""),
+    ("terminal-overrides",         "\"\""),
+    ("set-clipboard",              "external"),
     ("set-titles-string",          "\"\""),
     // psmux extensions
-    ("cursor-style",               "\"\""),
+    ("cursor-style",               "default"),
     ("cursor-blink",               "off"),
     ("prediction-dimming",         "off"),
     ("allow-predictions",          "off"),
@@ -466,6 +717,7 @@ const FORMAT_GROUPS: &[(&str, &str)] = &[
     ("Client",  "client_width client_height client_name client_session client_prefix client_pid client_termname ..."),
     ("Server",  "pid version host hostname host_short"),
     ("Misc",    "history_limit history_size alternate_on pane_mode pane_in_mode"),
+    ("Mouse",   "mouse_any_flag mouse_standard_flag mouse_button_flag mouse_all_flag mouse_utf8_flag mouse_sgr_flag"),
 ];
 
 /// Section: hooks reference.

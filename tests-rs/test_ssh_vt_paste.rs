@@ -576,3 +576,37 @@ fn esc_printable_still_decodes_as_alt_char() {
     assert_eq!(k.code, KeyCode::Char('x'));
     assert_eq!(k.modifiers, KeyModifiers::ALT);
 }
+
+#[test]
+fn paste_containing_bare_lf_stays_paste_text() {
+    // Issue #642 moved the BARE byte 0x0a from Enter to C-j in `on_ground`.
+    // Pasted text must not follow it there: a terminal sends a multi line paste
+    // as raw LF between the brackets, and the paste states accumulate raw
+    // characters without ever running the ground decoder.  This pins that, so a
+    // later edit cannot route paste bytes through `on_ground` and turn every
+    // newline in a pasted block into a C-j keypress.
+    let payload = "line1\nline2\n";
+    let events = parse(&format!("\x1b[200~{}\x1b[201~", payload));
+    let pastes: Vec<&str> = events.iter().filter_map(paste_text).collect();
+    assert_eq!(pastes, vec![payload], "got {:?}", events);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Key(k) if k.code == KeyCode::Char('j'))),
+        "a bracketed paste must not emit C-j: {:?}",
+        events
+    );
+}
+
+#[test]
+fn paste_containing_crlf_stays_paste_text() {
+    // The CRLF shape of the same payload, for the terminals that send it.
+    let payload = "line1\r\nline2\r\n";
+    let events = parse(&format!("\x1b[200~{}\x1b[201~", payload));
+    let pastes: Vec<&str> = events.iter().filter_map(paste_text).collect();
+    assert_eq!(pastes, vec![payload], "got {:?}", events);
+    assert_eq!(
+        events.iter().filter(|e| matches!(e, Event::Key(_))).count(),
+        0,
+        "a bracketed paste must emit no keys at all: {:?}",
+        events
+    );
+}

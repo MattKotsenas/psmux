@@ -31,6 +31,15 @@ public class Win32Proof {
     public const byte VK_ESCAPE  = 0x1B;
     public const uint KEYEVENTF_KEYUP = 0x0002;
 
+    // C-u clears the prompt line. Like tmux (command-prompt -I'#S' / -I'#W'),
+    // the rename prompts open holding the current name, so typing alone appends.
+    public static void SendCtrlU() {
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
     public static void SendCtrlB() {
         keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
         keybd_event(0x42, 0, 0, UIntPtr.Zero);
@@ -150,10 +159,14 @@ Write-Host "  Original window name: '$origWindowName'" -ForegroundColor DarkGray
 Start-Sleep -Milliseconds 400
 [Win32Proof]::SendDollar()
 Start-Sleep -Milliseconds 600
+[Win32Proof]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
-# Type a new session name
-$newSessName = "provenSession201"
-[Win32Proof]::SendString($newSessName.ToLower())
+# Type a new session name. Typed and checked in the same spelling: session
+# targets are case exact, as in tmux (#774), so the check must ask for the
+# name exactly as it was typed.
+$newSessName = "provensession201"
+[Win32Proof]::SendString($newSessName)
 Start-Sleep -Milliseconds 300
 [Win32Proof]::SendEnter()
 Start-Sleep -Seconds 1
@@ -162,6 +175,9 @@ Start-Sleep -Seconds 1
 $hasSess = & psmux has-session -t $newSessName 2>&1
 $sessRenamed = $LASTEXITCODE -eq 0
 Add-Result "prefix+dollar renamed SESSION" $sessRenamed "has-session '$newSessName' exit=$LASTEXITCODE"
+if (-not $sessRenamed) {
+    Write-Host "  sessions now: $((& psmux ls 2>&1 | Out-String).Trim())" -ForegroundColor DarkGray
+}
 
 # VERIFY: Window name should be UNCHANGED (proves $ triggered session rename, not window rename)
 $afterWindowName = & psmux display-message -t $newSessName -p '#{window_name}' 2>&1 | Out-String
@@ -182,6 +198,8 @@ $beforeSessName = $SESSION
 Start-Sleep -Milliseconds 400
 [Win32Proof]::SendComma()
 Start-Sleep -Milliseconds 600
+[Win32Proof]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
 $newWinName = "provenWindow201"
 [Win32Proof]::SendString($newWinName.ToLower())

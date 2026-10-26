@@ -14,7 +14,9 @@ Write-Host "Stopping any running sessions..."
 $psmuxPath = Join-Path $InstallDir "psmux.exe"
 if (Test-Path $psmuxPath) {
     try {
-        & $psmuxPath kill-server 2>$null
+        # -a: the uninstaller has to free the binary in EVERY namespace, and a
+        # bare kill-server is scoped to the default one since #649.
+        & $psmuxPath kill-server -a 2>$null
     } catch {}
 }
 

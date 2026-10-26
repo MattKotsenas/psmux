@@ -38,6 +38,17 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
             dcs_buf: Vec::new(),
         }
     }
+
+    /// Wrap an existing screen, with no DCS in progress.  Used by
+    /// `Parser::snapshot`, which clones the screen but starts a fresh parser.
+    pub(crate) fn from_screen(screen: crate::screen::Screen, callbacks: CB) -> Self {
+        Self {
+            screen,
+            callbacks,
+            dcs_active: false,
+            dcs_buf: Vec::new(),
+        }
+    }
 }
 
 impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
@@ -104,6 +115,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
+        if let Some(query) = crate::queries::csi_query(params, intermediates, _ignore, c) {
+            self.screen.query(query);
+        }
         let unhandled = |screen: &mut crate::screen::Screen| {
             self.callbacks.unhandled_csi(
                 screen,
@@ -204,6 +218,28 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     );
                 }
             },
+            // XTMODKEYS (`CSI > 4 ; n m`) and its reset (`CSI > 4 n`): the
+            // extended key mode tmux keeps per pane (issue #860).  The
+            // callback still runs, as it did before for every `>` sequence.
+            Some(b'>') if c == 'm' || c == 'n' => {
+                let mut it = params.iter();
+                // tmux input_get(ictx, 0, 0, 0) / (ictx, 1, 0, 0): a missing
+                // parameter reads as 0.
+                let resource = it.next().and_then(|x| x.first().copied()).unwrap_or(0);
+                if c == 'm' {
+                    let level = it.next().and_then(|x| x.first().copied()).unwrap_or(0);
+                    self.screen.xtmodkeys_set(resource, level);
+                } else {
+                    self.screen.xtmodkeys_off(resource);
+                }
+                self.callbacks.unhandled_csi(
+                    &mut self.screen,
+                    Some(b'>'),
+                    intermediates.get(1).copied(),
+                    &params.iter().collect::<Vec<_>>(),
+                    c,
+                );
+            }
             Some(i) => {
                 self.callbacks.unhandled_csi(
                     &mut self.screen,
@@ -217,6 +253,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+        if let Some(query) = crate::queries::osc_query(params, self.screen.program_status_enabled()) {
+            self.screen.query(query);
+            return;
+        }
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
@@ -229,6 +269,50 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
                 self.screen.set_title(s);
+            }
+            // ---- OSC 4 : set one or more palette entries (issue #685) ----
+            // `\e]4;<i>;<colour>[;<i>;<colour>]*\e\\`.  vte splits on ';', so
+            // the pairs arrive as flat params.  tmux parses exactly the same
+            // shape in `input_osc_4` (input.c:2927).  A `?` spec is a QUERY,
+            // which psmux answers on the raw output scan in the pane reader
+            // thread (pane.rs `scan_color_queries`, issue #473), preferring
+            // this pane's own entry when it has one; nothing to do here.
+            [b"4", rest @ ..] if !rest.is_empty() => {
+                let mut i = 0usize;
+                while i + 1 < rest.len() {
+                    let Some(idx) = crate::palette::parse_palette_index(rest[i])
+                    else {
+                        // tmux stops the whole sequence on a bad index
+                        // (input.c:2941 `bad = 1; break;`).
+                        break;
+                    };
+                    let spec = rest[i + 1];
+                    i += 2;
+                    if spec == b"?" {
+                        continue;
+                    }
+                    if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
+                        self.screen.set_palette_entry(idx, Some(rgb));
+                    }
+                    // An unparseable colour is skipped, not fatal
+                    // (input.c:2959 `s = next; continue;`).
+                }
+            }
+            // ---- OSC 104 : reset palette entries (issue #685) ----
+            // Bare `\e]104\e\\` (and `\e]104;\e\\`, which vte hands us as an
+            // empty trailing param) clears everything; `\e]104;<i>[;<i>]*`
+            // clears those indexes.  tmux: `input_osc_104` (input.c:3446).
+            [b"104"] | [b"104", b""] => {
+                self.screen.clear_palette();
+            }
+            [b"104", rest @ ..] => {
+                for raw in rest {
+                    let Some(idx) = crate::palette::parse_palette_index(raw)
+                    else {
+                        break;
+                    };
+                    self.screen.set_palette_entry(idx, None);
+                }
             }
             [b"7", uri] => {
                 self.screen.set_path(uri);
@@ -247,6 +331,30 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     .unwrap_or(0);
                 self.screen.set_progress(s, v);
                 self.callbacks.set_progress(&mut self.screen, s, v);
+            }
+            [b"9", b"9", cwd_rest @ ..] if !cwd_rest.is_empty() => {
+                // OSC 9;9;<cwd> — ConEmu's "set working directory", the form
+                // Windows Terminal documents for shell integration and the one
+                // a WSL shell can emit to tell psmux where it really is
+                // (issue #615).  A Windows path may contain ';' (rare but
+                // legal), which the OSC splitter turned into extra params, so
+                // rejoin them.
+                let mut cwd = Vec::new();
+                for (i, part) in cwd_rest.iter().enumerate() {
+                    if i > 0 {
+                        cwd.push(b';');
+                    }
+                    cwd.extend_from_slice(part);
+                }
+                self.screen.set_path_literal(&cwd);
+            }
+            [b"7501", body @ ..] if self.screen.program_status_enabled() => {
+                // vte excludes OSC/ST and semicolon separators from params.
+                let sequence_len = 2 + params.iter().map(|p| p.len()).sum::<usize>()
+                    + params.len().saturating_sub(1) + if _bel_terminated { 1 } else { 2 };
+                if sequence_len <= 4096 {
+                    self.screen.program_status_mut().report(&body.join(&b';'));
+                }
             }
             [b"9999", ..] => {
                 self.screen.squelch_cleared = true;
@@ -273,8 +381,14 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                         self.callbacks
                             .paste_from_clipboard(&mut self.screen, ty);
                     }
+                    // tmux parity: b64_pton skips ASCII whitespace anywhere
+                    // in an OSC 52 payload, so producers that wrap long
+                    // base64 must still get through this gate. The server
+                    // side decoder applies the same tolerance.
                     (true, data)
-                        if data.iter().all(|c| BASE64.contains(c)) =>
+                        if data.iter().all(|c| {
+                            BASE64.contains(c) || c.is_ascii_whitespace()
+                        }) =>
                     {
                         // Stage the payload on Screen so the psmux server
                         // can drain it and forward an OSC 52 to the host
@@ -292,6 +406,78 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                         self.callbacks
                             .unhandled_osc(&mut self.screen, params);
                     }
+                }
+            }
+            // ---- OSC 133 FinalTerm semantic prompts (issue #299) ----
+            // 133;A (prompt start) — clear any pending command, shell is idle.
+            // Extras (k=i, cl=line, aid=...) are optional kitty/ghostty
+            // parameters; we ignore them via `..`.
+            [b"133", b"A", ..] => {
+                self.screen.program_status_mut().expire();
+                self.screen.set_shell_command(None);
+            }
+            // 133;C with cmdline_url= parameter (kitty's fish integration).
+            // vte splits on ';' so OSC 133;C;cmdline_url=foo arrives as
+            // [b"133", b"C", b"cmdline_url=foo"].
+            [b"133", b"C", param, ..] => {
+                if let Some(cmd) = parse_cmdline_param(param) {
+                    self.screen.set_shell_command(Some(cmd));
+                }
+                // else: bare C with unknown param — leave shell_command alone.
+            }
+            // Bare 133;C — leave whatever's there (latches prior SetUserVar/633E).
+            [b"133", b"C"] => {}
+            // 133;D[;<exit>] — command done. Clear.
+            [b"133", b"D", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 133;B (end of prompt / start of input) — no-op for our purposes.
+            [b"133", b"B", ..] => {}
+            // ---- OSC 1337 SetUserVar (iTerm2 user vars; WezTerm precedent) ----
+            // Form: 1337;SetUserVar=<NAME>=<base64-value>
+            //   * vte presents this as a SINGLE param slot because there's no
+            //     ';' separator between SetUserVar=... and the next field.
+            //   * Only WEZTERM_PROG is recognized as a command-identity source
+            //     for now; other vars (WEZTERM_HOST, WEZTERM_USER, custom)
+            //     are not relevant here.
+            [b"1337", payload] if payload.starts_with(b"SetUserVar=") => {
+                let after = &payload[b"SetUserVar=".len()..];
+                if let Some(eq) = after.iter().position(|&b| b == b'=') {
+                    let name = &after[..eq];
+                    let value_b64 = &after[eq + 1..];
+                    if name == b"WEZTERM_PROG" {
+                        if let Some(decoded) = decode_base64(value_b64) {
+                            if let Ok(s) = String::from_utf8(decoded) {
+                                self.screen.set_shell_command(Some(s));
+                            }
+                        }
+                    }
+                }
+            }
+            // ---- OSC 633 VS Code shell-integration lifecycle (issue #299) ----
+            // VS Code emits 633 rather than 133; mirror the 133 lifecycle so a
+            // finished command doesn't latch.
+            // 633;A (prompt start) — shell idle, clear.
+            [b"633", b"A", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 633;D[;<exit>] — command done, clear.
+            [b"633", b"D", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 633;B (prompt end) / 633;C (pre-exec) — no-op; C keeps the E command.
+            [b"633", b"B", ..] => {}
+            [b"633", b"C", ..] => {}
+            // ---- OSC 633;E (VS Code shellIntegration.ps1) ----
+            // Form: 633;E;<escaped-command>[;<nonce>]
+            // Take the command segment (everything before the next ';' or end).
+            [b"633", b"E", cmd, ..] => {
+                if let Ok(s) = std::str::from_utf8(cmd) {
+                    // VS Code's __VSCode-Escape-Value replaces control chars,
+                    // backslashes, newlines, and ';' with `\x<hex>` sequences.
+                    // Full decode is non-trivial; for the common case (printable
+                    // command text), the value passes through unchanged.
+                    self.screen.set_shell_command(Some(s.to_string()));
                 }
             }
             _ => {
@@ -507,6 +693,97 @@ fn sixel_pixel_dims(buf: &[u8]) -> (u32, u32) {
     }
     max_x = max_x.max(cur_x);
     (max_x.max(1), bands.saturating_mul(6))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for issue #299 OSC parsing.
+// ---------------------------------------------------------------------------
+
+/// Parse a single OSC 133;C parameter slot. Returns the decoded command if the
+/// slot is `cmdline_url=<url-escaped>` (kitty's fish integration). Other
+/// parameter names (`cmdline=`, `aid=`, `redraw=`, etc.) return None.
+fn parse_cmdline_param(param: &[u8]) -> Option<String> {
+    if let Some(value) = param.strip_prefix(b"cmdline_url=") {
+        return percent_decode(value);
+    }
+    None
+}
+
+/// Decode `%xx` percent-encoded sequences. Returns None if the input is not
+/// valid UTF-8 after decode (drops the value rather than mangling it).
+fn percent_decode(input: &[u8]) -> Option<String> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            let hi = hex_digit(input[i + 1])?;
+            let lo = hex_digit(input[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode standard base64. Returns None on malformed input. Inlined to avoid
+/// pulling a base64 dependency into vt100-psmux.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    // Strip trailing '=' padding, count it.
+    let pad = input.iter().rev().take_while(|&&b| b == b'=').count();
+    let body = &input[..input.len().saturating_sub(pad)];
+    if body.iter().any(|&b| val(b).is_none()) {
+        return None;
+    }
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let mut chunk = [0u8; 4];
+    let mut idx = 0;
+    for &b in body {
+        chunk[idx] = val(b)?;
+        idx += 1;
+        if idx == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            idx = 0;
+        }
+    }
+    // Handle remaining 2 or 3 chars (1 or 2 output bytes).
+    match idx {
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        _ => {}
+    }
+    Some(out)
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {

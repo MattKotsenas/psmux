@@ -17,7 +17,7 @@ Write-Host "`n=== Issue #198: Paste Detection Bypass Proof ===" -ForegroundColor
 $injectorExe = "$env:TEMP\psmux_injector.exe"
 if (-not (Test-Path $injectorExe)) {
     $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-    & $csc /nologo /optimize /out:$injectorExe "C:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs" 2>&1 | Out-Null
+    & $csc /nologo /optimize /out:$injectorExe "$PSScriptRoot\injector.cs" 2>&1 | Out-Null
 }
 
 # === TEST A: paste-detection ON + rapid chars = stage2 (control test) ===

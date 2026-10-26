@@ -18,7 +18,12 @@ $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
 if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 if (-not (Test-Path $PSMUX)) { $PSMUX = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
 if (-not $PSMUX -or -not (Test-Path $PSMUX)) { Write-Error "psmux binary not found"; exit 1 }
-$PSMUX_DIR = "$env:USERPROFILE\.psmux"
+# Every session here lives in a namespace of its own, so the suite can never
+# reach a server it did not start. It used to stop every psmux.exe on the
+# machine by name and delete the port and key files of every session in
+# ~/.psmux, which killed whatever the person running it had open.
+$NS = "cursorstyle_$PID"
+function P { & $PSMUX -L $NS @args }
 
 function Add-Result($name, $pass, $detail="") {
     $script:results += [PSCustomObject]@{ Test=$name; Result=if($pass){"PASS"}else{"FAIL"}; Detail=$detail }
@@ -27,33 +32,31 @@ function Add-Result($name, $pass, $detail="") {
 }
 
 function Reset-Psmux {
-    Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force
+    P kill-server 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    Remove-Item "$PSMUX_DIR\*.port" -Force -ErrorAction SilentlyContinue
-    Remove-Item "$PSMUX_DIR\*.key" -Force -ErrorAction SilentlyContinue
 }
 
 function Start-SessionWithConfig {
     param([string]$ConfigPath, [string]$SessionName = "ctest")
     Reset-Psmux
     $env:PSMUX_CONFIG_FILE = $ConfigPath
-    Start-Process -FilePath $PSMUX -ArgumentList "new-session -s $SessionName -d" -WindowStyle Hidden
+    Start-Process -FilePath $PSMUX -ArgumentList "-L $NS new-session -s $SessionName -d" -WindowStyle Hidden
     Start-Sleep -Seconds 3
     $env:PSMUX_CONFIG_FILE = $null
-    & $PSMUX has-session -t $SessionName 2>$null
+    P has-session -t $SessionName 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
 function Get-Opt {
     param([string]$Option, [string]$Session = "ctest")
-    (& $PSMUX show-options -g -v $Option -t $Session 2>&1 | Out-String).Trim()
+    (P show-options -g -v $Option -t $Session 2>&1 | Out-String).Trim()
 }
 
 Write-Host "=== Cursor Style Test ==="
 Write-Host ""
 
 # =====================================================================
-# TEST 1: Default cursor style (bar, blink on)
+# TEST 1: Default cursor style (default, blink on)
 # =====================================================================
 Write-Host "--- Test 1: Default cursor style ---"
 $confDefault = "$env:TEMP\psmux_cursor_default.conf"
@@ -61,7 +64,7 @@ Set-Content -Path $confDefault -Value "# empty config — defaults only" -Encodi
 
 if (Start-SessionWithConfig $confDefault "cdefault") {
     $opt = Get-Opt "cursor-style" "cdefault"
-    Add-Result "Default: cursor-style is bar" ($opt -match 'bar|beam' -or $opt -eq '') "($opt)"
+    Add-Result "Default: cursor-style is default" ($opt -eq 'default') "($opt)"
 
     $blink = Get-Opt "cursor-blink" "cdefault"
     Add-Result "Default: cursor-blink option readable" ($blink -ne '') "($blink)"
@@ -114,12 +117,12 @@ if (Start-SessionWithConfig $conf4 "cruntime") {
     $opt4a = Get-Opt "cursor-style" "cruntime"
     Add-Result "Runtime: starts as block" ($opt4a -eq "block") "($opt4a)"
 
-    & $PSMUX set-option -g -t cruntime cursor-style bar 2>$null
+    P set-option -g -t cruntime cursor-style bar 2>$null
     Start-Sleep -Seconds 1
     $opt4b = Get-Opt "cursor-style" "cruntime"
     Add-Result "Runtime: changed to bar" ($opt4b -eq "bar") "($opt4b)"
 
-    & $PSMUX set-option -g -t cruntime cursor-blink on 2>$null
+    P set-option -g -t cruntime cursor-blink on 2>$null
     Start-Sleep -Seconds 1
     $blink4 = Get-Opt "cursor-blink" "cruntime"
     Add-Result "Runtime: cursor-blink changed to on" ($blink4 -eq "on") "($blink4)"
@@ -145,8 +148,8 @@ if (Start-SessionWithConfig $conf5 "ccode") {
     )
 
     foreach ($c in $combos) {
-        & $PSMUX set-option -g -t ccode cursor-style $c.style 2>$null
-        & $PSMUX set-option -g -t ccode cursor-blink $c.blink 2>$null
+        P set-option -g -t ccode cursor-style $c.style 2>$null
+        P set-option -g -t ccode cursor-blink $c.blink 2>$null
         Start-Sleep -Milliseconds 500
         $s = Get-Opt "cursor-style" "ccode"
         $b = Get-Opt "cursor-blink" "ccode"
@@ -180,7 +183,7 @@ Write-Host -NoNewline "$esc[?1049l"
     $fakeTuiScript = "$env:TEMP\fake_tui_cursor.ps1"
     Set-Content -Path $fakeTuiScript -Value $fakeTui -Encoding UTF8
 
-    & $PSMUX send-keys -t creset "pwsh -NoProfile -File `"$fakeTuiScript`"" Enter
+    P send-keys -t creset "pwsh -NoProfile -File `"$fakeTuiScript`"" Enter
     Start-Sleep -Seconds 4
 
     # After TUI exit, the configured option should still be underline
@@ -211,7 +214,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style block (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style block 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style = $style.Trim()
     if ($style -match "block") {
         Add-Result "TUI: cursor-style = block" $true "($style)"
@@ -223,7 +226,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style underline (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style underline 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style2 = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style2 = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style2 = $style2.Trim()
     if ($style2 -match "underline") {
         Add-Result "TUI: cursor-style = underline" $true "($style2)"
@@ -235,7 +238,7 @@ if ($tuiOk) {
     Write-Host "  [TEST] TUI: Set cursor-style bar (visible TUI proof)" -ForegroundColor White
     & $PSMUX set-option -t $TUI_SESSION_CUR cursor-style bar 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $style3 = & $PSMUX show-options -g -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
+    $style3 = & $PSMUX show-options -v cursor-style -t $TUI_SESSION_CUR 2>&1 | Out-String
     $style3 = $style3.Trim()
     if ($style3 -match "bar") {
         Add-Result "TUI: cursor-style = bar" $true "($style3)"
@@ -252,7 +255,7 @@ if ($tuiOk) {
 # Cleanup
 Remove-Item "$env:TEMP\psmux_cursor_*.conf" -Force -ErrorAction SilentlyContinue
 Remove-Item $fakeTuiScript -Force -ErrorAction SilentlyContinue
-& $PSMUX kill-server 2>$null
+P kill-server 2>$null
 
 # --- Summary ---
 Write-Host "`n=== RESULTS ==="

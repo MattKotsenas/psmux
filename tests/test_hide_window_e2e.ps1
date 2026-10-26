@@ -306,9 +306,11 @@ Test-Case "B3: run-shell nonzero exit" {
 
 # --- B4: run-shell env var propagation ---
 Test-Case "B4: run-shell env propagation" {
-    $env:HIDEWIN_PROOF = "env_proof_42"
+    # A job runs with the SERVER's environment, as tmux does (environ_for_session,
+    # #804), not the calling shell's, so the value goes in with set-environment.
+    & $psmux set-environment -t $SESSION -g HIDEWIN_PROOF env_proof_42 2>&1 | Out-Null
     $out = & $psmux run-shell -t $SESSION '$env:HIDEWIN_PROOF' 2>&1 | Out-String
-    Remove-Item Env:\HIDEWIN_PROOF -ErrorAction SilentlyContinue
+    & $psmux set-environment -t $SESSION -gu HIDEWIN_PROOF 2>&1 | Out-Null
     $out -match "env_proof_42"
 }
 

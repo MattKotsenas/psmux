@@ -277,10 +277,10 @@ Write-Host ("=" * 80) -ForegroundColor Cyan
 
 if ($vp.Count -gt 0) {
     Write-Host "`n  PSMUX:" -ForegroundColor Yellow
-    Write-Host "    Avg render:  $([Math]::Round(($vp | Measure-Object RenderMs -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P50:     $([Math]::Round(($vp | Measure-Object P50 -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P90:     $([Math]::Round(($vp | Measure-Object P90 -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P99:     $([Math]::Round(($vp | Measure-Object P99 -Avg).Average))ms" -ForegroundColor White
+    Write-Host "    Avg render:  $([Math]::Round(($vp | Measure-Object RenderMs -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P50:     $([Math]::Round(($vp | Measure-Object P50 -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P90:     $([Math]::Round(($vp | Measure-Object P90 -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P99:     $([Math]::Round(($vp | Measure-Object P99 -Average).Average))ms" -ForegroundColor White
     Write-Host "    Worst gap:   $(($vp | Measure-Object Max -Maximum).Maximum)ms" -ForegroundColor $(if (($vp | Measure-Object Max -Max).Maximum -gt 200) {"Red"} else {"Green"})
     Write-Host "    Total stalls (>200ms): $(($vp | Measure-Object Stalls -Sum).Sum)" -ForegroundColor $(if (($vp | Measure-Object Stalls -Sum).Sum -gt 0) {"Red"} else {"Green"})
     Write-Host "    Total bursts (>10ch):  $(($vp | Measure-Object Bursts -Sum).Sum)" -ForegroundColor $(if (($vp | Measure-Object Bursts -Sum).Sum -gt 0) {"Yellow"} else {"Green"})
@@ -289,21 +289,21 @@ if ($vp.Count -gt 0) {
 }
 if ($vd.Count -gt 0) {
     Write-Host "`n  DIRECT POWERSHELL:" -ForegroundColor Yellow
-    Write-Host "    Avg render:  $([Math]::Round(($vd | Measure-Object RenderMs -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P50:     $([Math]::Round(($vd | Measure-Object P50 -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P90:     $([Math]::Round(($vd | Measure-Object P90 -Avg).Average))ms" -ForegroundColor White
-    Write-Host "    Avg P99:     $([Math]::Round(($vd | Measure-Object P99 -Avg).Average))ms" -ForegroundColor White
+    Write-Host "    Avg render:  $([Math]::Round(($vd | Measure-Object RenderMs -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P50:     $([Math]::Round(($vd | Measure-Object P50 -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P90:     $([Math]::Round(($vd | Measure-Object P90 -Average).Average))ms" -ForegroundColor White
+    Write-Host "    Avg P99:     $([Math]::Round(($vd | Measure-Object P99 -Average).Average))ms" -ForegroundColor White
     Write-Host "    Worst gap:   $(($vd | Measure-Object Max -Maximum).Maximum)ms" -ForegroundColor $(if (($vd | Measure-Object Max -Max).Maximum -gt 200) {"Red"} else {"Green"})
     Write-Host "    Total stalls: $(($vd | Measure-Object Stalls -Sum).Sum)" -ForegroundColor $(if (($vd | Measure-Object Stalls -Sum).Sum -gt 0) {"Red"} else {"Green"})
 }
 
 if ($vp.Count -gt 0 -and $vd.Count -gt 0) {
-    $pR = [Math]::Round(($vp | Measure-Object RenderMs -Avg).Average)
-    $dR = [Math]::Round(($vd | Measure-Object RenderMs -Avg).Average)
-    $pP90 = [Math]::Round(($vp | Measure-Object P90 -Avg).Average)
-    $dP90 = [Math]::Round(($vd | Measure-Object P90 -Avg).Average)
-    $pP99 = [Math]::Round(($vp | Measure-Object P99 -Avg).Average)
-    $dP99 = [Math]::Round(($vd | Measure-Object P99 -Avg).Average)
+    $pR = [Math]::Round(($vp | Measure-Object RenderMs -Average).Average)
+    $dR = [Math]::Round(($vd | Measure-Object RenderMs -Average).Average)
+    $pP90 = [Math]::Round(($vp | Measure-Object P90 -Average).Average)
+    $dP90 = [Math]::Round(($vd | Measure-Object P90 -Average).Average)
+    $pP99 = [Math]::Round(($vp | Measure-Object P99 -Average).Average)
+    $dP99 = [Math]::Round(($vd | Measure-Object P99 -Average).Average)
     $pMax = ($vp | Measure-Object Max -Max).Maximum
     $dMax = ($vd | Measure-Object Max -Max).Maximum
     $pStalls = ($vp | Measure-Object Stalls -Sum).Sum

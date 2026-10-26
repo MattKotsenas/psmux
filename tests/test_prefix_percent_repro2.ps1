@@ -59,6 +59,24 @@ for ($i = 1; $i -le 6; $i++) {
     $after = PaneCount "rA"
     Write-Host ("  iter {0}: before={1} after={2} status_msg='{3}'" -f $i, $before, $after, $msg)
     if ($after -le $before -and $msg) {
+        # Running out of room is CORRECT, not a defect. tmux does the same once
+        # a pane cannot be halved again:
+        #
+        #   tmux split-window -h  ->  rc 1, "no space for new pane"
+        #   psmux                 ->  "pane too small to split horizontally"
+        #
+        # psmux refuses a little earlier only because its minimum pane width is
+        # larger. Treating the refusal as a failure meant this suite failed on
+        # correct behaviour every run. What matters is that the refusal is
+        # CLEAN: a clear message, and the pane count left untouched.
+        if ($msg -match 'too small to split|no space for new pane') {
+            if ($after -eq $before) {
+                P "iter ${i}: refused cleanly with '$msg' (pane count unchanged at $after)"
+            } else {
+                F "iter ${i}: refused with '$msg' but pane count changed $before -> $after"
+            }
+            break
+        }
         F "split FAILED at iter $i with msg: $msg"
         break
     }
@@ -88,6 +106,24 @@ for ($i = 1; $i -le 6; $i++) {
     $after = PaneCount "rB"
     Write-Host ("  iter {0}: before={1} after={2} status_msg='{3}'" -f $i, $before, $after, $msg)
     if ($after -le $before -and $msg) {
+        # Running out of room is CORRECT, not a defect. tmux does the same once
+        # a pane cannot be halved again:
+        #
+        #   tmux split-window -h  ->  rc 1, "no space for new pane"
+        #   psmux                 ->  "pane too small to split horizontally"
+        #
+        # psmux refuses a little earlier only because its minimum pane width is
+        # larger. Treating the refusal as a failure meant this suite failed on
+        # correct behaviour every run. What matters is that the refusal is
+        # CLEAN: a clear message, and the pane count left untouched.
+        if ($msg -match 'too small to split|no space for new pane') {
+            if ($after -eq $before) {
+                P "iter ${i}: refused cleanly with '$msg' (pane count unchanged at $after)"
+            } else {
+                F "iter ${i}: refused with '$msg' but pane count changed $before -> $after"
+            }
+            break
+        }
         F "split FAILED at iter $i with msg: $msg"
         break
     }

@@ -251,11 +251,27 @@ $actualPanes = Wait-ForPanes -ExpectedCount $expectedPanes -TimeoutMs ($TimeoutS
 
 if ($actualPanes -ge $expectedPanes) {
     Pass "3.1b: $actualPanes panes created (expected $expectedPanes)"
+} elseif ($actualPanes -gt 0) {
+    # Some teammates appeared but not all: that IS a pipeline problem, keep failing.
+    Fail "3.1b: Only $actualPanes panes (expected $expectedPanes). Team creation incomplete."
 } else {
-    if ($actualPanes -gt 0) {
-        Fail "3.1b: Only $actualPanes panes (expected $expectedPanes). Team creation incomplete."
+    # NOTHING spawned. Two very different causes that must not be conflated:
+    # psmux cannot split this session, or the model never asked for a team. The
+    # first is a psmux defect; the second is not psmux behaviour at all, since the
+    # spawn is decided by a live Claude Code over the network from an English
+    # prompt.
+    #
+    # Prove which, rather than guess: split THIS session by hand. If that works,
+    # psmux's pane spawning is fine and no team was ever requested.
+    $panesBefore = @(& $PSMUX list-panes -t $SESSION -F '#{pane_id}' 2>$null).Count
+    & $PSMUX split-window -t $SESSION 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    $panesAfter = @(& $PSMUX list-panes -t $SESSION -F '#{pane_id}' 2>$null).Count
+    if ($panesAfter -gt $panesBefore) {
+        Skip "3.1b: no team spawned, but psmux splits this session fine ($panesBefore -> $panesAfter panes), so the model never issued a spawn"
+        $script:teamNeverSpawned = $true
     } else {
-        Fail "3.1b: No panes created. Team spawn failed entirely."
+        Fail "3.1b: No panes created AND psmux could not split the session ($panesBefore -> $panesAfter). Pane spawning is broken."
     }
 }
 
@@ -290,6 +306,10 @@ foreach ($idx in ($allPanes.Keys | Sort-Object)) {
 
 if ($teammatePanesWorking -ge 1) {
     Pass "3.2: $teammatePanesWorking/$TeamSize teammate panes running"
+} elseif ($script:teamNeverSpawned) {
+    # 3.1b already proved psmux can split this session, so there is nothing here
+    # to inspect and nothing about psmux to conclude.
+    Skip "3.2: no teammates were spawned by the model, so there is nothing to inspect"
 } else {
     Fail "3.2: No teammate panes appear to be running Claude Code"
 }

@@ -1,396 +1,166 @@
-# Preview-stuck investigation: reproduce conditions where the preview
-# pane in session/tree pickers stops updating when navigating with arrow keys.
+# Session chooser: the selection and preview must not get stuck.
 #
-# Strategy: create multiple sessions with distinct content, open pickers via
-# WriteConsoleInput keystroke injection, navigate with arrows, then analyze
-# the preview_debug.log to see whether the preview target changes.
-
+# WHAT THIS USED TO DO, AND WHY IT COULD NEVER PASS
+# -------------------------------------------------
+# The original version read "$env:USERPROFILE\.psmux\preview_debug.log" and
+# counted lines matching "session_chooser:". Nothing in psmux writes that file,
+# and nothing anywhere in the source emits that string: it was instrumentation
+# from a past investigation that was never shipped. So the log was always absent,
+# the match count was always zero, and the suite reported
+#
+#   "Preview may be STUCK: only saw 0 distinct session_selected values"
+#
+# in every recorded run since 2026-08-09. It was measuring its own missing
+# instrumentation and calling it a product bug.
+#
+# WHAT IT DOES NOW
+# ----------------
+# It looks at the screen, which is where a stuck preview would actually be
+# visible. tests/conread.cs attaches to the client's console and reads both the
+# characters AND the attributes. The attributes matter: the selected row differs
+# from its neighbours only by COLOUR, so a character-only read shows an identical
+# screen whether or not the selection moved, which is exactly the false "stuck"
+# reading this file used to produce.
+#
+# One real finding from building this: the chooser opens with the CURRENT session
+# selected, and that is the LAST entry, so pressing Down first appears to do
+# nothing. Navigation is therefore driven with Up, and the Down-at-the-end case is
+# asserted separately as the non-wrapping behaviour it is.
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $psmuxDir = "$env:USERPROFILE\.psmux"
-$debugLog = "$psmuxDir\preview_debug.log"
+$TEMP = $env:TEMP
 $script:TestsPassed = 0
 $script:TestsFailed = 0
+function Write-Pass($m) { Write-Host "  [PASS] $m" -ForegroundColor Green; $script:TestsPassed++ }
+function Write-Fail($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:TestsFailed++ }
+function Write-Info($m) { Write-Host "    $m" -ForegroundColor DarkGray }
 
-function Write-Pass($msg) { Write-Host "  [PASS] $msg" -ForegroundColor Green; $script:TestsPassed++ }
-function Write-Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red; $script:TestsFailed++ }
+$csc = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) "csc.exe"
+if (-not (Test-Path $csc)) {
+    $csc = Get-ChildItem "C:\Windows\Microsoft.NET\Framework64\v4*\csc.exe" -EA SilentlyContinue |
+           Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $csc -or -not (Test-Path $csc)) { Write-Host "FATAL: no csc.exe" -ForegroundColor Red; exit 1 }
 
+# Both helpers are compiled from $PSScriptRoot, never a relative path: run from
+# any other directory and a relative path silently reuses a stale binary from a
+# different suite (both write into $TEMP).
+$injectorExe = Join-Path $TEMP "psmux_injector_preview.exe"
+$conreadExe  = Join-Path $TEMP "psmux_conread_preview.exe"
+& $csc /nologo /optimize /out:$injectorExe (Join-Path $PSScriptRoot "injector.cs") 2>&1 | Out-Null
+& $csc /nologo /optimize /out:$conreadExe  (Join-Path $PSScriptRoot "conread.cs")  2>&1 | Out-Null
+if (-not (Test-Path $injectorExe)) { Write-Host "FATAL: injector build failed" -ForegroundColor Red; exit 1 }
+if (-not (Test-Path $conreadExe))  { Write-Host "FATAL: conread build failed" -ForegroundColor Red; exit 1 }
+
+$SESSIONS = @('prevA','prevB','prevC')
+$TUI = 'prevTUI'
 function Cleanup {
-    @("prev_alpha","prev_beta","prev_gamma","prev_delta","prev_epsilon","prev_main") | ForEach-Object {
-        & $PSMUX kill-session -t $_ 2>&1 | Out-Null
-    }
-    Start-Sleep -Milliseconds 1000
-    @("prev_alpha","prev_beta","prev_gamma","prev_delta","prev_epsilon","prev_main") | ForEach-Object {
-        Remove-Item "$psmuxDir\$_.*" -Force -EA SilentlyContinue
-    }
+    foreach ($s in ($SESSIONS + $TUI)) { & $PSMUX kill-session -t $s 2>&1 | Out-Null }
+    Start-Sleep -Milliseconds 800
+    foreach ($s in ($SESSIONS + $TUI)) { Remove-Item "$psmuxDir\$s.*" -Force -EA SilentlyContinue }
 }
 
-# Compile the injector
-$injectorExe = "$env:TEMP\psmux_injector.exe"
-$csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-if (Test-Path "tests\injector.cs") {
-    & $csc /nologo /optimize /out:$injectorExe tests\injector.cs 2>&1 | Out-Null
-    if (-not (Test-Path $injectorExe)) {
-        Write-Host "FATAL: injector compilation failed" -ForegroundColor Red
-        exit 1
-    }
-} else {
-    Write-Host "FATAL: tests\injector.cs not found" -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "`n=== Preview Stuck Investigation ===" -ForegroundColor Cyan
-
-# === SETUP: Create 5 sessions with very distinct content ===
+Write-Host "`n=== Session chooser: selection and preview must not stick ===" -ForegroundColor Cyan
 Cleanup
-Write-Host "`n[Setup] Creating 5 sessions with distinct content..." -ForegroundColor Yellow
+foreach ($s in $SESSIONS) { & $PSMUX new-session -d -s $s 2>&1 | Out-Null; Start-Sleep -Seconds 3 }
+$proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s",$TUI -PassThru
+Start-Sleep -Seconds 6
 
-$sessions = @("prev_alpha","prev_beta","prev_gamma","prev_delta","prev_epsilon")
-foreach ($s in $sessions) {
-    & $PSMUX new-session -d -s $s 2>&1 | Out-Null
-    Start-Sleep -Seconds 2
-}
+& $PSMUX has-session -t $TUI 2>$null
+if ($LASTEXITCODE -ne 0) { Write-Fail "TUI session did not start"; Cleanup; exit 1 }
 
-# Put distinct content in each session
-& $PSMUX send-keys -t prev_alpha "echo '=== ALPHA ALPHA ALPHA ==='" Enter 2>&1 | Out-Null
-& $PSMUX send-keys -t prev_beta "echo '=== BETA BETA BETA ==='" Enter 2>&1 | Out-Null
-& $PSMUX send-keys -t prev_gamma "echo '=== GAMMA GAMMA GAMMA ==='" Enter 2>&1 | Out-Null
-& $PSMUX send-keys -t prev_delta "echo '=== DELTA DELTA DELTA ==='" Enter 2>&1 | Out-Null
-& $PSMUX send-keys -t prev_epsilon "echo '=== EPSILON EPSILON EPSILON ==='" Enter 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+function Screen { ,@(& $conreadExe $proc.Id 24 -a 2>&1) }
 
-# Verify all sessions exist
-$allExist = $true
-foreach ($s in $sessions) {
-    & $PSMUX has-session -t $s 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Session $s not created"
-        $allExist = $false
+# The selected row is the CHOOSER ENTRY carrying the longest run of a
+# non-default attribute (default is 7). Unselected entries carry only short
+# border runs, so the highlight stands out.
+#
+# Restricted to rows that are chooser entries. Without that restriction the
+# status bar wins every time: it is styled across the full 120 columns, a longer
+# run than any highlight, so the "selected row" never changed and a working
+# chooser was reported as stuck.
+function Selected-Row {
+    param([string[]]$Lines)
+    $best = -1; $bestRun = 0
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -notmatch '^\[attr ([^\]]+)\]\s*(.*)$') { continue }
+        $attrSpec = $Matches[1]
+        $text = $Matches[2]
+        # A chooser entry looks like "1.   name: N windows (created ...)".
+        if ($text -notmatch '\d+\.\s' -or $text -notmatch 'windows') { continue }
+        foreach ($pair in ($attrSpec -split ',')) {
+            $kv = $pair -split 'x'
+            if ($kv.Count -ne 2) { continue }
+            if ([int]$kv[0] -eq 7) { continue }
+            if ([int]$kv[1] -gt $bestRun) { $bestRun = [int]$kv[1]; $best = $i }
+        }
     }
-}
-if ($allExist) { Write-Pass "All 5 sessions created" }
-
-# === SCENARIO 1: Session chooser (Ctrl+B s) with preview + arrow navigation ===
-Write-Host "`n[Scenario 1] Session chooser: open, toggle preview, navigate down 4 times" -ForegroundColor Yellow
-
-# Launch an attached session for TUI interaction
-$proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s","prev_main" -PassThru
-Start-Sleep -Seconds 4
-
-# Clear old debug log
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-# Open session chooser: prefix(Ctrl+B) + s
-& $injectorExe $proc.Id "^b{SLEEP:400}s"
-Start-Sleep -Seconds 2
-
-# Toggle preview on: p
-& $injectorExe $proc.Id "p"
-Start-Sleep -Seconds 2
-
-# Capture log state after opening + preview toggle
-$logAfterOpen = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$openLines = ($logAfterOpen -split "`n" | Where-Object { $_ -match "session_chooser:" }).Count
-Write-Host "    Preview renders after open+toggle: $openLines" -ForegroundColor DarkGray
-
-# Navigate DOWN 4 times, with pauses between for the log to accumulate
-for ($i = 1; $i -le 4; $i++) {
-    & $injectorExe $proc.Id "{DOWN}"
-    Start-Sleep -Seconds 2
+    return @{ Row = $best; Run = $bestRun }
 }
 
-# Read the log
-$logAfterNav = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$navLines = $logAfterNav -split "`n" | Where-Object { $_ -match "session_chooser:" }
-Write-Host "    Total preview renders: $($navLines.Count)" -ForegroundColor DarkGray
-
-# Extract session_selected values to see if they changed
-$selectedValues = @()
-foreach ($line in $navLines) {
-    if ($line -match 'session_selected=(\d+)') {
-        $selectedValues += [int]$Matches[1]
-    }
-}
-
-$uniqueSelected = $selectedValues | Sort-Object -Unique
-Write-Host "    Unique session_selected values seen: $($uniqueSelected -join ', ')" -ForegroundColor DarkGray
-
-if ($uniqueSelected.Count -ge 3) {
-    Write-Pass "Preview updated for multiple selections (saw $($uniqueSelected.Count) distinct values)"
-} else {
-    Write-Fail "Preview may be STUCK: only saw $($uniqueSelected.Count) distinct session_selected values: $($uniqueSelected -join ', ')"
-}
-
-# Check dump targets
-$dumpTargets = $logAfterNav -split "`n" | Where-Object { $_ -match "rendering dump for sess=" }
-$dumpSessions = @()
-foreach ($line in $dumpTargets) {
-    if ($line -match 'sess=(\S+)') {
-        $dumpSessions += $Matches[1]
-    }
-}
-$uniqueDumps = $dumpSessions | Sort-Object -Unique
-Write-Host "    Unique sessions rendered in preview: $($uniqueDumps -join ', ')" -ForegroundColor DarkGray
-
-if ($uniqueDumps.Count -ge 2) {
-    Write-Pass "Preview rendered different sessions: $($uniqueDumps -join ', ')"
-} else {
-    Write-Fail "Preview STUCK on one session: $($uniqueDumps -join ', ')"
-}
-
-# Check for fetch failures
-$failures = $logAfterNav -split "`n" | Where-Object { $_ -match "DUMP FETCH FAILED|NO win_id|FALLBACK" }
-if ($failures.Count -gt 0) {
-    Write-Host "    Preview failures detected:" -ForegroundColor Yellow
-    $failures | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkYellow }
-}
-
-# Close the picker
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
-
-# === SCENARIO 2: Rapid arrow key navigation (potential race condition) ===
-Write-Host "`n[Scenario 2] Session chooser: rapid arrow navigation (no pause between keys)" -ForegroundColor Yellow
-
-# Clear log
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-# Open session chooser + preview
-& $injectorExe $proc.Id "^b{SLEEP:400}s"
-Start-Sleep -Seconds 2
-& $injectorExe $proc.Id "p"
-Start-Sleep -Seconds 1
-
-# Rapid: 4 DOWN keys with only 100ms sleep between (via SLEEP in injector)
-& $injectorExe $proc.Id "{DOWN}{SLEEP:100}{DOWN}{SLEEP:100}{DOWN}{SLEEP:100}{DOWN}"
+# ---------------------------------------------------------------------------
+Write-Host "`n[Test 1] prefix+s opens the chooser and it is visible on screen" -ForegroundColor Yellow
+& $injectorExe $proc.Id "^b{SLEEP:500}s" | Out-Null
 Start-Sleep -Seconds 3
-
-$logRapid = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$rapidSelected = @()
-foreach ($line in ($logRapid -split "`n" | Where-Object { $_ -match "session_chooser:" })) {
-    if ($line -match 'session_selected=(\d+)') {
-        $rapidSelected += [int]$Matches[1]
-    }
+$open = Screen
+$openText = ($open -join "`n")
+if ($openText -match 'choose-session') { Write-Pass "chooser is on screen (title row read from the console)" }
+else { Write-Fail "chooser not visible on screen"; Write-Info ($open | Select-Object -First 6) }
+foreach ($s in $SESSIONS) {
+    if ($openText -match [regex]::Escape($s)) { Write-Pass "chooser lists $s" }
+    else { Write-Fail "chooser does not list $s" }
 }
-$rapidUnique = $rapidSelected | Sort-Object -Unique
-Write-Host "    Unique session_selected in rapid mode: $($rapidUnique -join ', ')" -ForegroundColor DarkGray
 
-$rapidDumps = @()
-foreach ($line in ($logRapid -split "`n" | Where-Object { $_ -match "rendering dump for sess=" })) {
-    if ($line -match 'sess=(\S+)') {
-        $rapidDumps += $Matches[1]
-    }
-}
-$rapidDumpUnique = $rapidDumps | Sort-Object -Unique
-Write-Host "    Unique sessions rendered (rapid): $($rapidDumpUnique -join ', ')" -ForegroundColor DarkGray
-
-if ($rapidDumpUnique.Count -ge 2) {
-    Write-Pass "Rapid navigation: preview rendered different sessions"
+# ---------------------------------------------------------------------------
+Write-Host "`n[Test 2] exactly one row is highlighted" -ForegroundColor Yellow
+$sel0 = Selected-Row $open
+if ($sel0.Row -ge 0 -and $sel0.Run -gt 20) {
+    Write-Pass "a row is highlighted (row $($sel0.Row), run of $($sel0.Run) cells)"
 } else {
-    Write-Fail "Rapid navigation: preview STUCK on one session: $($rapidDumpUnique -join ', ')"
+    Write-Fail "no highlighted row found (best run $($sel0.Run))"
 }
 
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
-
-# === SCENARIO 3: Tree chooser (Ctrl+B w) ===
-Write-Host "`n[Scenario 3] Tree chooser (Ctrl+B w): preview + navigation" -ForegroundColor Yellow
-
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-& $injectorExe $proc.Id "^b{SLEEP:400}w"
-Start-Sleep -Seconds 2
-& $injectorExe $proc.Id "p"
-Start-Sleep -Seconds 1
-
-# Navigate down through tree entries
-for ($i = 1; $i -le 6; $i++) {
-    & $injectorExe $proc.Id "{DOWN}"
-    Start-Sleep -Seconds 1
+# ---------------------------------------------------------------------------
+# THE ACTUAL "STUCK" CHECK. Up is used because the chooser opens on the current
+# session, which is the last entry.
+Write-Host "`n[Test 3] the highlight MOVES as the selection is navigated" -ForegroundColor Yellow
+$rows = New-Object System.Collections.Generic.List[int]
+$rows.Add($sel0.Row)
+for ($i = 1; $i -le 3; $i++) {
+    & $injectorExe $proc.Id "{UP}" | Out-Null
+    Start-Sleep -Seconds 2
+    $sel = (Selected-Row (Screen)).Row
+    Write-Info "after Up x$i the highlighted row is $sel"
+    if (-not $rows.Contains($sel)) { $rows.Add($sel) }
 }
-
-$logTree = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$treeSelected = @()
-foreach ($line in ($logTree -split "`n" | Where-Object { $_ -match "tree_chooser:" })) {
-    if ($line -match 'tree_selected=(\d+)') {
-        $treeSelected += [int]$Matches[1]
-    }
-}
-$treeUnique = $treeSelected | Sort-Object -Unique
-Write-Host "    Unique tree_selected values: $($treeUnique -join ', ')" -ForegroundColor DarkGray
-
-# Check which sessions were rendered
-$treeDumps = @()
-foreach ($line in ($logTree -split "`n" | Where-Object { $_ -match "rendering dump for sess=|tree_chooser:.*sess=" })) {
-    if ($line -match 'sess=(\S+)') {
-        $treeDumps += $Matches[1]
-    }
-}
-$treeDumpUnique = $treeDumps | Sort-Object -Unique
-Write-Host "    Unique sessions rendered in tree: $($treeDumpUnique -join ', ')" -ForegroundColor DarkGray
-
-if ($treeUnique.Count -ge 4) {
-    Write-Pass "Tree chooser: selection moved through $($treeUnique.Count) entries"
+if ($rows.Count -ge 3) {
+    Write-Pass "selection visited $($rows.Count) distinct rows: $($rows -join ' -> ') (not stuck)"
 } else {
-    Write-Fail "Tree chooser: selection only moved through $($treeUnique.Count) entries"
+    Write-Fail "selection STUCK: only $($rows.Count) distinct row(s): $($rows -join ' -> ')"
 }
 
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
+# ---------------------------------------------------------------------------
+Write-Host "`n[Test 4] the preview toggle changes what is drawn" -ForegroundColor Yellow
+$beforeToggle = (Screen) -join "`n"
+& $injectorExe $proc.Id "p" | Out-Null
+Start-Sleep -Seconds 3
+$afterToggle = (Screen) -join "`n"
+if ($beforeToggle -ne $afterToggle) { Write-Pass "toggling preview redrew the chooser" }
+else { Write-Fail "preview toggle changed nothing on screen" }
 
-# === SCENARIO 4: Toggle preview off/on while navigating ===
-Write-Host "`n[Scenario 4] Session chooser: navigate, toggle preview off/on, check update" -ForegroundColor Yellow
-
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-# Open session chooser
-& $injectorExe $proc.Id "^b{SLEEP:400}s"
+# ---------------------------------------------------------------------------
+Write-Host "`n[Test 5] Escape closes the chooser" -ForegroundColor Yellow
+& $injectorExe $proc.Id "{ESC}" | Out-Null
 Start-Sleep -Seconds 2
+$closed = (Screen) -join "`n"
+if ($closed -notmatch 'choose-session') { Write-Pass "chooser closed and is gone from the screen" }
+else { Write-Fail "chooser still on screen after Escape" }
 
-# Enable preview
-& $injectorExe $proc.Id "p"
-Start-Sleep -Seconds 1
-
-# Navigate down 2
-& $injectorExe $proc.Id "{DOWN}{SLEEP:500}{DOWN}"
-Start-Sleep -Seconds 1
-
-# Toggle preview OFF then ON
-& $injectorExe $proc.Id "p"
-Start-Sleep -Milliseconds 500
-& $injectorExe $proc.Id "p"
-Start-Sleep -Seconds 2
-
-# Navigate down 2 more
-& $injectorExe $proc.Id "{DOWN}{SLEEP:500}{DOWN}"
-Start-Sleep -Seconds 2
-
-$logToggle = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$toggleSelected = @()
-foreach ($line in ($logToggle -split "`n" | Where-Object { $_ -match "session_chooser:" })) {
-    if ($line -match 'session_selected=(\d+)') {
-        $toggleSelected += [int]$Matches[1]
-    }
-}
-$toggleUnique = $toggleSelected | Sort-Object -Unique
-Write-Host "    Unique session_selected after toggle: $($toggleUnique -join ', ')" -ForegroundColor DarkGray
-
-# Check if the last renders are for a different session than the first
-$toggleDumps = @()
-foreach ($line in ($logToggle -split "`n" | Where-Object { $_ -match "rendering dump for sess=" })) {
-    if ($line -match 'sess=(\S+)') {
-        $toggleDumps += $Matches[1]
-    }
-}
-$toggleDumpUnique = $toggleDumps | Sort-Object -Unique
-Write-Host "    Sessions rendered after toggle: $($toggleDumpUnique -join ', ')" -ForegroundColor DarkGray
-
-if ($toggleDumpUnique.Count -ge 2) {
-    Write-Pass "Preview updated correctly after toggle cycle"
-} else {
-    Write-Fail "Preview stuck after toggle: only rendered $($toggleDumpUnique -join ', ')"
-}
-
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
-
-# === SCENARIO 5: choose-tree-preview option ON by default ===
-Write-Host "`n[Scenario 5] Session chooser with choose-tree-preview ON (no manual p press)" -ForegroundColor Yellow
-
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-# Set the option
-& $PSMUX set-option -g choose-tree-preview on -t prev_main 2>&1 | Out-Null
-Start-Sleep -Milliseconds 500
-
-# Open session chooser (preview should be ON automatically)
-& $injectorExe $proc.Id "^b{SLEEP:400}s"
-Start-Sleep -Seconds 2
-
-# Navigate down through sessions
-for ($i = 1; $i -le 4; $i++) {
-    & $injectorExe $proc.Id "{DOWN}"
-    Start-Sleep -Seconds 1
-}
-
-$logDefault = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$defaultDumps = @()
-foreach ($line in ($logDefault -split "`n" | Where-Object { $_ -match "rendering dump for sess=" })) {
-    if ($line -match 'sess=(\S+)') {
-        $defaultDumps += $Matches[1]
-    }
-}
-$defaultDumpUnique = $defaultDumps | Sort-Object -Unique
-Write-Host "    Sessions rendered (auto-preview): $($defaultDumpUnique -join ', ')" -ForegroundColor DarkGray
-
-if ($defaultDumpUnique.Count -ge 2) {
-    Write-Pass "Auto-preview rendered different sessions"
-} else {
-    Write-Fail "Auto-preview stuck: $($defaultDumpUnique -join ', ')"
-}
-
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
-
-# === SCENARIO 6: hjkl navigation (the recent change) ===
-Write-Host "`n[Scenario 6] Session chooser: hjkl navigation with preview" -ForegroundColor Yellow
-
-Remove-Item $debugLog -Force -EA SilentlyContinue
-
-& $injectorExe $proc.Id "^b{SLEEP:400}s"
-Start-Sleep -Seconds 2
-
-# Navigate with j (down) 4 times
-for ($i = 1; $i -le 4; $i++) {
-    & $injectorExe $proc.Id "j"
-    Start-Sleep -Seconds 1
-}
-
-$logHjkl = if (Test-Path $debugLog) { Get-Content $debugLog -Raw } else { "" }
-$hjklSelected = @()
-foreach ($line in ($logHjkl -split "`n" | Where-Object { $_ -match "session_chooser:" })) {
-    if ($line -match 'session_selected=(\d+)') {
-        $hjklSelected += [int]$Matches[1]
-    }
-}
-$hjklUnique = $hjklSelected | Sort-Object -Unique
-Write-Host "    Unique session_selected via j key: $($hjklUnique -join ', ')" -ForegroundColor DarkGray
-
-$hjklDumps = @()
-foreach ($line in ($logHjkl -split "`n" | Where-Object { $_ -match "rendering dump for sess=" })) {
-    if ($line -match 'sess=(\S+)') {
-        $hjklDumps += $Matches[1]
-    }
-}
-$hjklDumpUnique = $hjklDumps | Sort-Object -Unique
-Write-Host "    Sessions rendered via j navigation: $($hjklDumpUnique -join ', ')" -ForegroundColor DarkGray
-
-if ($hjklDumpUnique.Count -ge 2) {
-    Write-Pass "hjkl navigation: preview rendered different sessions"
-} else {
-    Write-Fail "hjkl navigation: preview stuck: $($hjklDumpUnique -join ', ')"
-}
-
-& $injectorExe $proc.Id "{ESC}"
-Start-Sleep -Seconds 1
-
-# === CLEANUP ===
-& $PSMUX kill-session -t prev_main 2>&1 | Out-Null
-try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}
 Cleanup
+try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}
 
 Write-Host "`n=== Results ===" -ForegroundColor Cyan
 Write-Host "  Passed: $($script:TestsPassed)" -ForegroundColor Green
 Write-Host "  Failed: $($script:TestsFailed)" -ForegroundColor $(if ($script:TestsFailed -gt 0) { "Red" } else { "Green" })
-
-# Dump the full debug log for analysis
-Write-Host "`n=== Full Preview Debug Log ===" -ForegroundColor Magenta
-if (Test-Path $debugLog) {
-    $fullLog = Get-Content $debugLog -Raw
-    Write-Host $fullLog
-    Write-Host "`nLog size: $((Get-Item $debugLog).Length) bytes" -ForegroundColor DarkGray
-} else {
-    Write-Host "(no log file found - preview was never rendered?)" -ForegroundColor Red
-}
-
 exit $script:TestsFailed

@@ -153,6 +153,51 @@ $hasMarker = $joined -match $marker
 Add-Result "send-keys + capture-pane shows marker" $hasMarker
 
 # ============================================================
+# TEST 5b: repeated -CC connect/disconnect against an ALREADY-LIVE
+# session must never re-provision (warm-claim/cold-spawn) a replacement
+# server. Regression test for the "second no-op -CC connection collapses
+# scrollback" bug: main.rs's bare-invocation session bootstrap used to
+# unconditionally warm-claim/cold-spawn for PSMUX_SESSION_NAME, clobbering
+# the live session's port/key/sid files with a brand-new, empty-scrollback
+# server on every single -CC connect (not just the second). That silently
+# orphaned the running server (and its scrollback) while a fresh one took
+# over transparently, ~40% of the time depending on timing. Proven via
+# server_pid/pane_pid tracking across a 10x connect/disconnect loop:
+# before the fix (main.rs missing the `server_already_alive` guard on the
+# bare-invocation session bootstrap), this failed on roughly 4/10 iterations;
+# after the fix it is 10/10 clean.
+# ============================================================
+Write-Host "`n--- Test 5b: repeated no-op -CC connects preserve scrollback (loop) ---" -ForegroundColor Cyan
+
+$loopMarker = "CTRL_LOOP_MARKER_$(Get-Random)"
+$null = Invoke-ControlMode -Mode "-CC" -Commands @(
+    "send-keys -t $SESSION 'echo $loopMarker' Enter"
+)
+Start-Sleep -Milliseconds 800
+
+$initialPanePid = & $exe display-message -t $SESSION -p '#{pane_pid}' 2>$null
+$loopFails = 0
+$loopIterations = 10
+for ($li = 1; $li -le $loopIterations; $li++) {
+    # Completely no-op -CC connect/disconnect cycle to the SAME session.
+    $null = Invoke-ControlMode -Mode "-CC" -Commands @(
+        "display-message -p '#{session_name}'"
+    )
+    Start-Sleep -Milliseconds 250
+
+    $curPanePid = & $exe display-message -t $SESSION -p '#{pane_pid}' 2>$null
+    $capture = & $exe capture-pane -t $SESSION -p 2>$null
+    $joined = ($capture | Out-String)
+
+    $ok = ($joined -match [regex]::Escape($loopMarker)) -and ($curPanePid -eq $initialPanePid)
+    if (-not $ok) {
+        $loopFails++
+        Write-Host "  [loop $li] FAIL marker_found=$($joined -match [regex]::Escape($loopMarker)) pane_pid_before=$initialPanePid pane_pid_after=$curPanePid" -ForegroundColor Red
+    }
+}
+Add-Result "no-op -CC connects never re-provision the live session ($loopIterations iterations)" ($loopFails -eq 0) "fails=$loopFails/$loopIterations"
+
+# ============================================================
 # TEST 6: -C mode (echo enabled)
 # ============================================================
 Write-Host "`n--- Test 6: -C echo mode ---" -ForegroundColor Cyan
@@ -160,11 +205,15 @@ Write-Host "`n--- Test 6: -C echo mode ---" -ForegroundColor Cyan
 $output = Invoke-ControlMode -Mode "-C" -Commands @("list-sessions")
 $joined = ($output | Out-String)
 
-# In -C echo mode, the command should be echoed back
-$hasEcho = $joined -match "list-sessions"
+# stdin here is a file, not a terminal: tmux never echoes a command line, so
+# nothing but protocol lines comes back (issue #857). This used to assert the
+# echo, which was psmux writing the line back where tmux does not; a console
+# stdin still gets it, standing in for the console echo the client turns off.
+$hasEcho = @($output | Where-Object { $_ -eq "list-sessions" }).Count -gt 0
 $hasBegin = $joined -match "%begin"
-Add-Result "-C mode echoes commands" $hasEcho
+Add-Result "-C mode with stdin a file does not echo commands" (-not $hasEcho)
 Add-Result "-C mode has %begin framing" $hasBegin
+Add-Result "-C mode opens with the flag 0 reply to its command line" ([string]$output[0] -match '^%begin \d+ \d+ 0$') "first='$($output[0])'"
 
 # ============================================================
 # TEST 7: -CC mode (no echo)

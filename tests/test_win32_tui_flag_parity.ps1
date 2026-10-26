@@ -2,9 +2,27 @@
 # PSMUX Win32 TUI Flag Parity Test Suite
 # =============================================================================
 #
-# Tests flag-level feature parity via REAL Win32 keybd_event keystrokes to a
-# live PSMUX window, exactly as a real user would interact.
-# Uses Ctrl+B prefix, : for command prompt, and real key combos.
+# Tests flag-level feature parity by driving a live PSMUX session with REAL
+# keystrokes, exactly as a user would: Ctrl+B prefix, : for the command prompt,
+# then the command and Enter.
+#
+# Keys go in with WriteConsoleInput (tests/injector.cs), not keybd_event.
+#
+# This suite used to call keybd_event after focusing the window, and it could
+# never run: it aborted at "FATAL: Cannot find psmux window" in every recorded
+# run. Two independent reasons, both fatal on their own:
+#
+#   1. There is no window to find. A console app's window belongs to conhost, not
+#      to the app, so the psmux process reports MainWindowHandle = 0 and an empty
+#      MainWindowTitle. FindWindow(null, <session>) and the MainWindowTitle scan
+#      both fail by construction.
+#   2. keybd_event posts to the HARDWARE input queue, which feeds the foreground
+#      window. A console app reads from its console INPUT BUFFER. Even with a
+#      window and focus, the keys are not guaranteed to arrive.
+#
+# WriteConsoleInput writes to that input buffer directly through
+# AttachConsole(pid), so it needs no window, no handle and no focus, and works
+# with the window minimised or in the background.
 #
 # Usage: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_win32_tui_flag_parity.ps1
 # =============================================================================
@@ -227,10 +245,9 @@ function Send-TcpCommand {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()
@@ -238,32 +255,21 @@ function Send-TcpCommand {
     } catch { return @{ ok=$false; err=$_.Exception.Message } }
 }
 
+# WriteConsoleInput needs no window and no focus, only the target pid. What has
+# to be true is simply that the process is alive and owns a console.
 function Focus-PsmuxWindow {
-    $hwnd = [Win32Flag]::FindWindow($null, $SESSION)
-    if ($hwnd -eq [IntPtr]::Zero) {
-        # Try finding by partial title
-        $proc = Get-Process psmux -EA SilentlyContinue | Where-Object { $_.MainWindowTitle -match $SESSION } | Select-Object -First 1
-        if ($proc) { $hwnd = $proc.MainWindowHandle }
-    }
-    if ($hwnd -ne [IntPtr]::Zero) {
-        [Win32Flag]::ShowWindow($hwnd, 9) | Out-Null
-        [Win32Flag]::SetForegroundWindow($hwnd) | Out-Null
-        Start-Sleep -Milliseconds 300
-        return $true
-    }
-    return $false
+    if (-not $script:TuiPid) { return $false }
+    $p = Get-Process -Id $script:TuiPid -EA SilentlyContinue
+    return [bool]$p
 }
 
-# Type a command into psmux command prompt (Ctrl+B : <cmd> Enter)
+# Type a command into the psmux command prompt: Ctrl+B, then :, then the command,
+# then Enter. The sleeps are inside the injected sequence so they happen between
+# the keystrokes at the far end, not merely in this script.
 function Send-PsmuxCommand {
     param([string]$Command)
-    [Win32Flag]::SendCtrlB()
-    Start-Sleep -Milliseconds 200
-    [Win32Flag]::SendColon()
-    Start-Sleep -Milliseconds 300
-    [Win32Flag]::SendString($Command)
-    Start-Sleep -Milliseconds 200
-    [Win32Flag]::SendEnter()
+    if (-not $script:TuiPid) { return }
+    & $script:InjectorExe $script:TuiPid "^b{SLEEP:250}:{SLEEP:350}$Command{ENTER}" | Out-Null
     Start-Sleep -Milliseconds 500
 }
 
@@ -280,7 +286,24 @@ Cleanup-Session $SESSION
 Start-Sleep -Seconds 1
 
 Write-Info "Launching attached psmux window '$SESSION'..."
+# Build the keystroke injector. Compiled from $PSScriptRoot and to a suite
+# specific name: a relative path breaks when the runner is invoked from another
+# directory, and a shared output name lets suites clobber each other's binary in
+# $TEMP.
+$script:InjectorExe = Join-Path $env:TEMP "psmux_injector_flagparity.exe"
+$cscPath = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) "csc.exe"
+if (-not (Test-Path $cscPath)) {
+    $cscPath = Get-ChildItem "C:\Windows\Microsoft.NET\Framework64\v4*\csc.exe" -EA SilentlyContinue |
+               Select-Object -First 1 -ExpandProperty FullName
+}
+& $cscPath /nologo /optimize /out:$script:InjectorExe (Join-Path $PSScriptRoot "injector.cs") 2>&1 | Out-Null
+if (-not (Test-Path $script:InjectorExe)) {
+    Write-Fail "FATAL: could not build the keystroke injector"
+    exit 1
+}
+
 $proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s",$SESSION -PassThru -WindowStyle Normal
+$script:TuiPid = $proc.Id
 Start-Sleep -Seconds 2
 
 if (-not (Wait-SessionReady $SESSION 20000)) {

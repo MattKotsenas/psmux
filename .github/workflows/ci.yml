@@ -31,7 +31,7 @@ jobs:
             label: Windows ARM64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,12 +41,27 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+  clippy-portable-pty:
+    name: Clippy portable-pty
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy -p portable-pty-psmux --all-targets --no-deps -- -D warnings
+
   test:
     name: Test Windows x64
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,3 +80,95 @@ jobs:
           $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
           $env:PSMUX_EXE = $exe
           .\tests\run_smoke_integration.ps1
+
+      - name: Verify console Unicode and caller encoding
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
+          .\tests\test_console_unicode.ps1 -PsmuxExe $exe
+
+      - name: Run raw SSH pipe mouse integration
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
+          .\tests\test_windows10_ssh_pipe_mouse.ps1 -Psmux $exe
+
+  test-monitor:
+    name: Build test monitor
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # tests/monitor is its own workspace and is not covered by the build or
+      # test jobs above, so nothing caught it when a dependency bump broke its
+      # API. Build it and render one headless frame so a break shows up here
+      # instead of the next time someone tries to watch a test run.
+      - name: Build monitor
+        working-directory: tests/monitor
+        run: cargo build --release
+
+      - name: Render one headless frame
+        shell: pwsh
+        working-directory: tests/monitor
+        run: |
+          $exe = (Resolve-Path "target\release\psmux-test-monitor.exe").Path
+          $out = & $exe --snapshot 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "monitor --snapshot exited $LASTEXITCODE" }
+          if ($out -notmatch 'psmux test monitor') {
+            Write-Host $out
+            throw "snapshot frame did not render the monitor header"
+          }
+          $lineCount = ($out -split "`r?`n").Count
+          Write-Host "monitor rendered $lineCount lines"
+          if ($lineCount -lt 20) { throw "frame too short ($lineCount lines), expected a full 40-row render" }
+
+  audit:
+    name: Security advisories
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # `--deny warnings` is deliberate, and the softer `|| cargo audit` fallback
+      # is deliberately absent. RUSTSEC classifies plenty of real problems as
+      # informational rather than as vulnerabilities, and plain `cargo audit`
+      # exits 0 on those. The lru advisory that prompted this job
+      # (GHSA-rhfx-m35p-ff5j, which Dependabot did report as a vulnerability) is
+      # RUSTSEC-classified "unsound", so a lenient gate would have stayed green
+      # through exactly the issue it exists to catch.
+      #
+      # Consequence to accept: an upstream advisory with no fix released yet will
+      # block PRs. Resolve it, or add a scoped `--ignore RUSTSEC-YYYY-NNNN` here
+      # with a comment saying why, rather than weakening the gate for everything.
+      - name: Audit workspace lockfile
+        run: cargo audit --deny warnings
+
+      - name: Audit test monitor lockfile
+        run: cargo audit --file tests/monitor/Cargo.lock --deny warnings
+
+  posix-helper-tests:
+    name: POSIX helper tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test SSH wrapper cleanup
+        run: sh tests/test_psmux_ssh_wrapper.sh
+
+      - name: Test helper installation
+        run: sh tests/test_install_psmux_win.sh

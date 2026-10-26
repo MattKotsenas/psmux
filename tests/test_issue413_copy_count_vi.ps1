@@ -19,7 +19,7 @@ function Write-Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:
 # Compile injector if missing
 if (-not (Test-Path $INJ)) {
   $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-  & $csc /nologo /optimize /out:$INJ "C:\Users\godwin\Documents\workspace\psmux\tests\injector.cs" 2>&1 | Out-Null
+  & $csc /nologo /optimize /out:$INJ "$PSScriptRoot\injector.cs" 2>&1 | Out-Null
 }
 
 & $PSMUX kill-session -t $S 2>&1 | Out-Null

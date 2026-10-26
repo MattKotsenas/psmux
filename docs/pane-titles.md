@@ -13,6 +13,15 @@ Programs running inside a pane can change its title by sending **OSC (Operating 
 
 When psmux receives one of these from a child process, it updates `pane_title` so that format variables, status bar, and border labels all reflect the new value.
 
+Two more OSC sequences are understood, and they never touch the title. They tell psmux where the shell is:
+
+| Sequence | Name | Effect |
+|----------|------|--------|
+| `ESC ] 7 ; file://host/path ESC \` | OSC 7 | Announces the shell's working directory. Feeds `#{pane_current_path}` for panes whose directory Windows cannot see (WSL, SSH) |
+| `ESC ] 9 ; 9 ; path ESC \` | OSC 9;9 | ConEmu's form of the same announcement |
+
+A POSIX path in either form is translated to a native Windows one (`/mnt/c/Users` to `C:\Users`, `/home/you` to `\\wsl.localhost\<distro>\home\you`). PowerShell, cmd, Git Bash and Cygwin panes do not need it, since their `cd` moves the Win32 working directory and psmux reads that directly. See the WSL section of [multi-shell.md](multi-shell.md#wsl-panes).
+
 ## PowerShell and OSC Titles
 
 Here is the important part for Windows users: **PowerShell 7 sends OSC 0 automatically on every single prompt**. It sets the terminal title to the current working directory (e.g. `C:\Users\you\Projects\myapp`).
@@ -31,7 +40,9 @@ instead of:
 
 This is not a bug. It is the expected behavior: PowerShell tells the terminal "my title is this path" and psmux faithfully applies it. On Linux, bash and zsh do not send OSC title sequences by default, so tmux users on Linux almost always see the hostname in that position.
 
-**psmux's own default `status-right`** uses `"#H"` (the `#H` hostname shorthand) instead of `"#{=21:pane_title}"`, and **`allow-set-title` defaults to `off`**, so the default psmux experience avoids this issue entirely. You will only encounter this if you set `allow-set-title on` in your config, or if you use a tmux config or theme that enables it and references `#{pane_title}` or `#T` in the status bar.
+**The default psmux experience avoids this issue, but not because of the format string.** psmux's default `status-right` does reference `"#{=21:pane_title}"`, exactly as tmux's does. What protects you is that **`allow-set-title` defaults to `off`**, so PowerShell's OSC title sequence is ignored, `pane_title` keeps its fallback value of the machine hostname, and the status bar shows the hostname. You will only encounter the path in your status bar if you set `allow-set-title on` in your config, or if you use a tmux config or theme that enables it and references `#{pane_title}` or `#T` in the status bar.
+
+> **Note:** `show-options -g status-right` reports the live value, and resetting `status-right` from `customize-mode` restores exactly that same value.
 
 ## Options That Control This Behavior
 
@@ -173,9 +184,8 @@ Many tmux themes (Catppuccin, Dracula, Tokyo Night, etc.) use `#{pane_title}` in
 | Goal | Config |
 |------|--------|
 | Keep hostname in status bar (default) | `allow-set-title` is already `off` by default |
-| Let programs set titles dynamically | `set -g allow-set-title on` |
+| Let programs set titles dynamically (not the default) | `set -g allow-set-title on` |
 | Always show hostname (regardless of config) | Use `#H` instead of `#{pane_title}` |
 | Stop pwsh from setting title | Add `$PSStyle.WindowTitle = ''` to `$PROFILE` |
 | Lock a specific pane's title | `select-pane -T "my title"` |
 | Show CWD in pane borders (useful!) | `set -g pane-border-format " #{pane_index}: #{pane_title} "` |
-| Let programs set titles (default) | `set -g allow-set-title on` |

@@ -170,6 +170,9 @@ Write-Host "COPY-MODE SPACE/ENTER KEY TESTS"
 Write-Host ("=" * 60)
 
 Ensure-Session -Name "feat5"
+# These are vi keys, and the copies below are vi's: emacs keys leave the
+# cell under the cursor out of a selection, as tmux does.
+Psmux set -g mode-keys vi
 
 Write-Test "Space begins selection, Enter copies and exits"
 # Put known text in pane
@@ -221,7 +224,7 @@ Start-Sleep -Milliseconds 100
 Psmux send-keys -t feat5 0
 Start-Sleep -Milliseconds 100
 # At col 0, select with v and E to end of WORD
-Psmux send-keys -t feat5 v
+Psmux send-keys -t feat5 space
 Start-Sleep -Milliseconds 100
 # Move to end of WORD (E): should reach end of "hello-world" (the 'd' at col 10)
 Psmux send-keys -t feat5 E
@@ -229,8 +232,8 @@ Start-Sleep -Milliseconds 100
 Psmux send-keys -t feat5 y
 Start-Sleep -Milliseconds 300
 $buf = Psmux show-buffer -t feat5
-if ($buf -match "hello-world") { Write-Pass "v+E captured WORD: $buf" }
-else { Write-Fail "v+E WORD motion unexpected: $buf" }
+if ($buf -match "hello-world") { Write-Pass "Space+E captured WORD: $buf" }
+else { Write-Fail "Space+E WORD motion unexpected: $buf" }
 
 # ============================================================
 # 7. COPY-MODE H/M/L (SCREEN POSITION) TESTS
@@ -283,7 +286,7 @@ Start-Sleep -Milliseconds 100
 Psmux send-keys -t feat5 f X
 Start-Sleep -Milliseconds 100
 # Start selection
-Psmux send-keys -t feat5 v
+Psmux send-keys -t feat5 space
 Start-Sleep -Milliseconds 100
 # Move right 2 to select XYZ
 Psmux send-keys -t feat5 l l

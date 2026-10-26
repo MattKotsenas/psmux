@@ -18,6 +18,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -28,6 +31,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -69,36 +74,35 @@ fn list_buffers_empty_says_no_buffers() {
 #[test]
 fn list_buffers_shows_all_buffer_details() {
     let mut app = mock_app_with_window();
-    app.paste_buffers.push("hello world".to_string());
-    app.paste_buffers.push("short".to_string());
-    app.paste_buffers.push("a longer buffer with more text for preview".to_string());
+    // Newest first. Each buffer keeps the name it was added with, so the
+    // oldest is buffer0 (issue #818, paste.c:178).
+    app.paste_set_stack(&["hello world", "short", "a longer buffer with more text for preview"]);
     execute_command_string(&mut app, "list-buffers").unwrap();
     let (_, out) = extract_popup(&app);
     let lines: Vec<&str> = out.lines().collect();
     // Must have exactly 3 lines (one per buffer)
     assert_eq!(lines.len(), 3, "should list all 3 buffers, got:\n{}", out);
-    // Buffer 0: verify index, byte count, content
-    assert!(lines[0].starts_with("buffer0:"), "first line should start with buffer0");
-    assert!(lines[0].contains("11 bytes"), "buffer0 should show 11 bytes for 'hello world'");
-    assert!(lines[0].contains("hello world"), "buffer0 should show content preview");
-    // Buffer 1
+    // The newest: its name, byte count, content
+    assert!(lines[0].starts_with("buffer2:"), "first line should be the newest, buffer2");
+    assert!(lines[0].contains("11 bytes"), "buffer2 should show 11 bytes for 'hello world'");
+    assert!(lines[0].contains("hello world"), "buffer2 should show content preview");
     assert!(lines[1].starts_with("buffer1:"), "second line should start with buffer1");
     assert!(lines[1].contains("5 bytes"), "buffer1 should show 5 bytes for 'short'");
-    // Buffer 2
-    assert!(lines[2].starts_with("buffer2:"), "third line should start with buffer2");
-    assert!(lines[2].contains("42 bytes"), "buffer2 should show 42 bytes");
+    // The oldest
+    assert!(lines[2].starts_with("buffer0:"), "third line should be the oldest, buffer0");
+    assert!(lines[2].contains("42 bytes"), "buffer0 should show 42 bytes");
 }
 
 #[test]
 fn lsb_alias_produces_identical_output_to_list_buffers() {
     let mut app1 = mock_app_with_window();
-    app1.paste_buffers.push("test data".to_string());
+    app1.paste_add("test data".to_string());
     execute_command_string(&mut app1, "list-buffers").unwrap();
     let (_, out1) = extract_popup(&app1);
     let out1 = out1.to_string();
 
     let mut app2 = mock_app_with_window();
-    app2.paste_buffers.push("test data".to_string());
+    app2.paste_add("test data".to_string());
     execute_command_string(&mut app2, "lsb").unwrap();
     let (cmd2, out2) = extract_popup(&app2);
     assert_eq!(cmd2, "list-buffers", "lsb should report command as list-buffers");
@@ -112,8 +116,7 @@ fn lsb_alias_produces_identical_output_to_list_buffers() {
 #[test]
 fn show_buffer_displays_first_buffer_content_verbatim() {
     let mut app = mock_app_with_window();
-    app.paste_buffers.push("line1\nline2\nline3".to_string());
-    app.paste_buffers.push("this should NOT appear".to_string());
+    app.paste_set_stack(&["line1\nline2\nline3", "this should NOT appear"]);
     execute_command_string(&mut app, "show-buffer").unwrap();
     let (cmd, out) = extract_popup(&app);
     assert_eq!(cmd, "show-buffer");
@@ -131,7 +134,7 @@ fn show_buffer_empty_does_not_crash() {
 #[test]
 fn showb_alias_same_as_show_buffer() {
     let mut app = mock_app_with_window();
-    app.paste_buffers.push("alias test".to_string());
+    app.paste_add("alias test".to_string());
     execute_command_string(&mut app, "showb").unwrap();
     let (_, out) = extract_popup(&app);
     assert_eq!(out, "alias test");
@@ -142,12 +145,21 @@ fn showb_alias_same_as_show_buffer() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn list_keys_empty_says_no_bindings() {
+fn list_keys_with_empty_tables_lists_only_the_copy_mode_keys() {
+    // The built-in copy-mode keys are listed like tmux lists its copy-mode
+    // tables (key-bindings.c), so empty key tables leave just those, plus the
+    // built-in root mouse bindings (WheelUpPane, WheelUp/DownStatus), which tmux lists too.
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "list-keys").unwrap();
     let (cmd, out) = extract_popup(&app);
     assert_eq!(cmd, "list-keys");
-    assert_eq!(out.trim(), "(no bindings)");
+    assert!(!out.trim().is_empty());
+    assert!(
+        out.lines().all(|l| l.starts_with("bind-key -T copy-mode ")
+            || l.starts_with("bind-key -T copy-mode-vi ")
+            || crate::mouse_keys::ROOT_MOUSE_DEFAULTS.iter().any(|(k, _)| l.starts_with(&format!("bind-key -T root {} ", k)))),
+        "only copy-mode tables and the built-in root mouse defaults expected, got:\n{}", out
+    );
 }
 
 #[test]
@@ -159,22 +171,26 @@ fn list_keys_shows_bound_keys_with_table_key_command() {
             key: (KeyCode::Char('c'), KeyModifiers::NONE),
             action: Action::NewWindow,
             repeat: false,
+            note: None,
         },
         crate::types::Bind {
             key: (KeyCode::Char('x'), KeyModifiers::CONTROL),
             action: Action::KillPane,
             repeat: false,
+            note: None,
         },
         crate::types::Bind {
             key: (KeyCode::Up, KeyModifiers::NONE),
             action: Action::MoveFocus(FocusDir::Up),
             repeat: false,
+            note: None,
         },
     ];
     app.key_tables.insert("prefix".to_string(), binds);
     execute_command_string(&mut app, "list-keys").unwrap();
     let (_, out) = extract_popup(&app);
-    let lines: Vec<&str> = out.lines().collect();
+    // The copy-mode tables are listed as well; count the prefix table only.
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("bind-key -T prefix ")).collect();
     assert_eq!(lines.len(), 3, "should list 3 bindings");
     // Verify table name, key format, and command string for each binding
     assert!(lines.iter().any(|l| l.contains("prefix") && l.contains("c") && l.contains("new-window")),
@@ -189,10 +205,10 @@ fn list_keys_shows_bound_keys_with_table_key_command() {
 fn list_keys_shows_multiple_tables() {
     let mut app = mock_app_with_window();
     app.key_tables.insert("prefix".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::Char('n'), KeyModifiers::NONE), action: Action::NextWindow, repeat: false },
+        crate::types::Bind { key: (KeyCode::Char('n'), KeyModifiers::NONE), action: Action::NextWindow, repeat: false, note: None },
     ]);
     app.key_tables.insert("copy-mode".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::Char('q'), KeyModifiers::NONE), action: Action::Command("cancel".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::Char('q'), KeyModifiers::NONE), action: Action::Command("cancel".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app, "list-keys").unwrap();
     let (_, out) = extract_popup(&app);
@@ -206,14 +222,14 @@ fn list_keys_shows_multiple_tables() {
 fn lsk_alias_produces_same_output() {
     let mut app1 = mock_app_with_window();
     app1.key_tables.insert("root".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app1, "list-keys").unwrap();
     let out1 = extract_popup(&app1).1.to_string();
 
     let mut app2 = mock_app_with_window();
     app2.key_tables.insert("root".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app2, "lsk").unwrap();
     let out2 = extract_popup(&app2).1.to_string();
@@ -299,19 +315,22 @@ fn list_clients_output_has_session_and_window_info() {
     let mut app = mock_app_with_windows(&["editor", "term"]);
     app.active_idx = 1;
     app.session_name = "my_project".to_string();
+    app.register_client(1, false);
     execute_command_string(&mut app, "list-clients").unwrap();
     let (cmd, out) = extract_popup(&app);
     assert_eq!(cmd, "list-clients");
+    // tmux's LIST_CLIENTS_TEMPLATE: client name, session, size, terminal and
+    // flags. It has no window name and no "(utf8)"; those came from the made
+    // up row this used to print (discussion #776).
     assert!(out.contains("my_project"), "must contain session name");
-    assert!(out.contains("term"), "must contain active window name");
-    assert!(out.contains("(utf8)"), "must contain encoding marker");
-    assert!(out.contains("/dev/pts/"), "must contain pseudo-terminal path");
+    assert!(out.contains("/dev/pts/1:"), "must name the registered client");
 }
 
 #[test]
 fn lsc_alias_matches_list_clients() {
     let mut app = mock_app_with_window();
     app.session_name = "s1".to_string();
+    app.register_client(1, false);
     execute_command_string(&mut app, "lsc").unwrap();
     let (_, out) = extract_popup(&app);
     assert!(out.contains("s1"), "lsc should show session name");
@@ -406,8 +425,8 @@ fn set_buffer_caps_at_10_evicts_oldest() {
     assert_eq!(app.paste_buffers[0], "item11", "latest should be first");
     assert_eq!(app.paste_buffers[9], "item2", "oldest surviving should be item2");
     // item0 and item1 should have been evicted
-    assert!(!app.paste_buffers.contains(&"item0".to_string()), "item0 should be evicted");
-    assert!(!app.paste_buffers.contains(&"item1".to_string()), "item1 should be evicted");
+    assert!(!app.paste_buffers.iter().any(|b| b.data == "item0"), "item0 should be evicted");
+    assert!(!app.paste_buffers.iter().any(|b| b.data == "item1"), "item1 should be evicted");
 }
 
 #[test]
@@ -420,7 +439,7 @@ fn setb_alias_inserts_same_as_set_buffer() {
 #[test]
 fn delete_buffer_removes_first_buffer() {
     let mut app = mock_app_with_window();
-    app.paste_buffers = vec!["a".into(), "b".into(), "c".into()];
+    app.paste_set_stack(&["a", "b", "c"]);
     execute_command_string(&mut app, "delete-buffer").unwrap();
     assert_eq!(app.paste_buffers, vec!["b", "c"], "delete-buffer should remove index 0");
 }
@@ -428,7 +447,7 @@ fn delete_buffer_removes_first_buffer() {
 #[test]
 fn deleteb_alias_works() {
     let mut app = mock_app_with_window();
-    app.paste_buffers = vec!["only".into()];
+    app.paste_set_stack(&["only"]);
     execute_command_string(&mut app, "deleteb").unwrap();
     assert!(app.paste_buffers.is_empty());
 }
@@ -614,6 +633,7 @@ fn rename_session_changes_session_name() {
     execute_command_string(&mut app, "rename-session production").unwrap();
     assert_eq!(app.session_name, "production");
     // Verify list-clients reflects the new name
+    app.register_client(1, false);
     execute_command_string(&mut app, "list-clients").unwrap();
     let (_, out) = extract_popup(&app);
     assert!(out.contains("production"), "list-clients should use new session name");
@@ -639,43 +659,36 @@ fn toggle_sync_flips_state_correctly() {
 //  13. choose-tree: verify tree data contains correct window info
 // ════════════════════════════════════════════════════════════════════════════
 
+/// The chooser directives `run` sends to the client the server last heard
+/// from. The choosers are drawn by the client, so a choose-tree run inside
+/// the server asks that client to open one. Each call registers its own
+/// client id, and only CHOOSE- lines are kept, since other tests may
+/// broadcast to every client at the same time.
+fn chooser_directives(app: &mut AppState, run: impl FnOnce(&mut AppState)) -> Vec<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x00c4_0000_0000);
+    let cid = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let rx = crate::types::register_directive_channel(cid);
+    app.latest_client_id = Some(cid);
+    run(app);
+    crate::types::remove_directive_channel(cid);
+    rx.try_iter().filter(|d| d.starts_with("CHOOSE-")).collect()
+}
+
 #[test]
-fn choose_tree_enters_window_chooser_mode() {
+fn choose_tree_asks_the_client_for_its_tree() {
     let mut app = mock_app_with_windows(&["editor", "server"]);
-    app.session_name = "dev".to_string();
-    app.active_idx = 0;
-    execute_command_string(&mut app, "choose-tree").unwrap();
-    match &app.mode {
-        Mode::WindowChooser { tree, selected } => {
-            // Tree is built from filesystem (.psmux dir); in tests it may be empty.
-            // Verify selected is valid (0 for empty tree, or within bounds).
-            if !tree.is_empty() {
-                assert!(*selected < tree.len(), "selected index should be in range");
-                // If our session exists in the tree, verify window entries match
-                let current: Vec<_> = tree.iter().filter(|e| e.is_current_session).collect();
-                for entry in &current {
-                    assert_eq!(entry.session_name, "dev", "session name mismatch in tree entry");
-                }
-                let win_entries: Vec<_> = tree.iter()
-                    .filter(|e| e.is_current_session && !e.is_session_header)
-                    .collect();
-                if !win_entries.is_empty() {
-                    let win_names: Vec<&str> = win_entries.iter().map(|e| e.window_name.as_str()).collect();
-                    assert!(win_names.contains(&"editor"), "tree should contain 'editor' window");
-                    assert!(win_names.contains(&"server"), "tree should contain 'server' window");
-                }
-            }
-        }
-        other => panic!("expected WindowChooser, got {:?}", std::mem::discriminant(other)),
-    }
+    let sent = chooser_directives(&mut app, |app| execute_command_string(app, "choose-tree").unwrap());
+    assert_eq!(sent, vec!["CHOOSE-TREE"]);
+    // The server keeps no chooser of its own: none was ever drawn.
+    assert!(!matches!(app.mode, Mode::WindowChooser { .. }));
 }
 
 #[test]
 fn choose_tree_builds_correct_tree_from_list_all_sessions() {
     // Directly test list_all_sessions_tree with known data
     let windows = vec![
-        ("editor".to_string(), 1usize, "120x30".to_string(), true),
-        ("server".to_string(), 2, "120x30".to_string(), false),
+        ("editor".to_string(), 1usize, "120x30".to_string(), true, 0usize),
+        ("server".to_string(), 2, "120x30".to_string(), false, 1usize),
     ];
     // Create a fake port file for our session so the tree builder can find it
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap();
@@ -707,12 +720,36 @@ fn choose_tree_builds_correct_tree_from_list_all_sessions() {
 }
 
 #[test]
-fn choose_window_and_choose_session_all_enter_window_chooser() {
-    // All three commands should enter WindowChooser mode
-    for cmd in &["choose-tree", "choose-window", "choose-session"] {
+fn choose_tree_s_opens_the_session_list_and_w_the_tree() {
+    // tmux's default aliases: choose-window is `choose-tree -w`, and
+    // choose-session is `choose-tree -s`. `-s` wins over `-w`
+    // (window-tree.c), so `choose-window -s` lists the sessions.
+    for (cmd, want) in [
+        ("choose-tree", "CHOOSE-TREE"),
+        ("choose-tree -w", "CHOOSE-TREE"),
+        ("choose-tree -Zw", "CHOOSE-TREE"),
+        ("choose-tree -s", "CHOOSE-SESSION"),
+        ("choose-tree -Zs", "CHOOSE-SESSION"),
+        ("choose-tree -w -s", "CHOOSE-SESSION"),
+        ("choose-tree -F '#{session_name}'", "CHOOSE-TREE"),
+        ("choose-window", "CHOOSE-TREE"),
+        ("choose-window -s", "CHOOSE-SESSION"),
+        ("choose-session", "CHOOSE-SESSION"),
+        ("choose-session -w", "CHOOSE-SESSION"),
+    ] {
         let mut app = mock_app_with_windows(&["a", "b"]);
-        execute_command_string(&mut app, cmd).unwrap();
-        assert!(matches!(app.mode, Mode::WindowChooser { .. }), "{} should enter WindowChooser", cmd);
+        let sent = chooser_directives(&mut app, |app| execute_command_string(app, cmd).unwrap());
+        assert_eq!(sent, vec![want], "{}", cmd);
+    }
+}
+
+#[test]
+fn chooser_actions_ask_the_client() {
+    // A copy mode table binding runs its action through execute_action.
+    for (action, want) in [(Action::WindowChooser, "CHOOSE-TREE"), (Action::SessionChooser, "CHOOSE-SESSION")] {
+        let mut app = mock_app_with_windows(&["a"]);
+        let sent = chooser_directives(&mut app, |app| { execute_action(app, &action).unwrap(); });
+        assert_eq!(sent, vec![want]);
     }
 }
 
@@ -955,10 +992,10 @@ fn has_session_is_noop() {
 }
 
 #[test]
-fn choose_client_is_noop() {
+fn choose_client_opens_the_client_list() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "choose-client").unwrap();
-    assert!(matches!(app.mode, Mode::Passthrough));
+    assert!(matches!(&app.mode, Mode::PopupMode { command, .. } if command == "choose-client"));
 }
 
 #[test]
@@ -973,13 +1010,62 @@ fn customize_mode_shows_options_popup() {
 //  21. Server-forwarded commands: no-crash without port; no state mutation
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Run one server-forwarded command with no control port and assert it left the
+/// state alone.
+///
+/// Every command here runs its REAL implementation, and a real implementation
+/// may reach the data directory whether or not there is a port to forward to.
+/// `kill-server` does exactly that: `commands.rs` calls
+/// `kill_servers_in_scope(paths::psmux_dir(), Namespace(app.socket_name), ..)`,
+/// and `socket_name` is `None` on a mock app, so on a developer's machine this
+/// test ended every server in the default namespace of their live data
+/// directory, taking the session they were sitting in with it. Measured three
+/// times: the suite killed a live session, and the `killed/default-...` marker
+/// the kill writes was there afterwards with the timestamp to prove it.
+///
+/// So the data directory moves for the duration. The lock is the shared one
+/// because `PSMUX_DATA_DIR` is process wide, the same reason
+/// test_session_id_alloc_race and the #698 tests hold it. Isolating here rather
+/// than in the one test that bites means a command added to the lists below
+/// cannot reintroduce this.
 fn assert_server_forward_noop(cmd: &str) {
+    // The restore is a Drop guard, declared after the lock so it runs before
+    // the lock is released, and it runs on a panic inside the command too: a
+    // command that panics instead of returning Err must not leave every later
+    // test in this binary pointed at a deleted temporary directory.
+    struct RestoreDataDir(Option<std::ffi::OsString>, std::path::PathBuf);
+    impl Drop for RestoreDataDir {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PSMUX_DATA_DIR", v),
+                None => std::env::remove_var("PSMUX_DATA_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _env = crate::util::lock_test_env();
+    let dir = std::env::temp_dir().join(format!(
+        "psmux_fwd_noop_{}_{}",
+        std::process::id(),
+        cmd.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let restore = RestoreDataDir(std::env::var_os("PSMUX_DATA_DIR"), dir.clone());
+    std::env::set_var("PSMUX_DATA_DIR", &dir);
+
     let mut app = mock_app_with_window();
     app.control_port = None;
     let original_len = app.windows.len();
     let original_name = app.session_name.clone();
     let original_sync = app.sync_input;
-    execute_command_string(&mut app, cmd).unwrap();
+    let result = execute_command_string(&mut app, cmd);
+
+    // Put the directory back before asserting, so the assertions below run
+    // against the caller's data directory again.
+    drop(restore);
+
+    result.unwrap();
     assert_eq!(app.windows.len(), original_len, "'{}' must not add/remove windows", cmd);
     assert_eq!(app.session_name, original_name, "'{}' must not change session name", cmd);
     assert_eq!(app.sync_input, original_sync, "'{}' must not change sync state", cmd);
@@ -1038,12 +1124,16 @@ fn server_forwarded_link_window() {
     app.control_port = None;
     execute_command_string(&mut app, "link-window -s 0 -t 1").unwrap();
     // May or may not add a window depending on PTY availability in test env
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 #[test]
 fn server_forwarded_linkw() {
     let mut app = mock_app_with_window();
     app.control_port = None;
     execute_command_string(&mut app, "linkw -s 0 -t 1").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 #[test]
 fn server_forwarded_unlink_window() { assert_server_forward_noop("unlink-window"); }
@@ -1160,8 +1250,8 @@ fn prompt_delegates_set_buffer_then_list_shows_it() {
 #[test]
 fn prompt_delegates_choose_tree() {
     let mut app = mock_app_with_window();
-    run_via_prompt(&mut app, "choose-tree");
-    assert!(matches!(app.mode, Mode::WindowChooser { .. }));
+    let sent = chooser_directives(&mut app, |app| run_via_prompt(app, "choose-tree -s"));
+    assert_eq!(sent, vec!["CHOOSE-SESSION"]);
 }
 
 #[test]
@@ -1212,8 +1302,11 @@ fn parse_action_direct_commands() {
     assert!(matches!(parse_command_to_action("rename-window"), Some(Action::RenameWindow)));
     assert!(matches!(parse_command_to_action("renamew"), Some(Action::RenameWindow)));
     assert!(matches!(parse_command_to_action("choose-tree"), Some(Action::WindowChooser)));
-    assert!(matches!(parse_command_to_action("choose-window"), Some(Action::WindowChooser)));
-    assert!(matches!(parse_command_to_action("choose-session"), Some(Action::SessionChooser)));
+    // tmux's default prefix+s and prefix+w: `choose-tree -Zs` and `-Zw`.
+    assert!(matches!(parse_command_to_action("choose-tree -Zs"), Some(Action::SessionChooser)));
+    assert!(matches!(parse_command_to_action("choose-tree -sZ"), Some(Action::SessionChooser)));
+    assert!(matches!(parse_command_to_action("choose-tree -Zw"), Some(Action::WindowChooser)));
+    assert!(matches!(parse_command_to_action("choose-tree -F '#{s}'"), Some(Action::WindowChooser)));
     assert!(matches!(parse_command_to_action("zoom-pane"), Some(Action::ZoomPane)));
     assert!(matches!(parse_command_to_action("resize-pane -Z"), Some(Action::ZoomPane)));
 }
@@ -1313,7 +1406,8 @@ fn format_action_roundtrips() {
         (Action::Paste, "paste-buffer"),
         (Action::Detach, "detach-client"),
         (Action::RenameWindow, "rename-window"),
-        (Action::WindowChooser, "choose-window"),
+        (Action::WindowChooser, "choose-tree"),
+        (Action::SessionChooser, "choose-tree -s"),
         (Action::ZoomPane, "resize-pane -Z"),
         (Action::MoveFocus(FocusDir::Up), "select-pane -U"),
         (Action::MoveFocus(FocusDir::Down), "select-pane -D"),
@@ -1403,11 +1497,12 @@ fn workflow_complex_command_sequence_via_prompt() {
     // Rename session via prompt
     run_via_prompt(&mut app, "rename-session my_project");
     assert_eq!(app.session_name, "my_project");
-    // Verify list-clients shows updated session and window
+    // Verify list-clients shows the updated session (tmux's client row has
+    // no window name, so the renamed window is checked above instead)
+    app.register_client(1, false);
     run_via_prompt(&mut app, "list-clients");
     let (_, out) = extract_popup(&app);
     assert!(out.contains("my_project"), "should show renamed session");
-    assert!(out.contains("renamed_aux"), "should show current (renamed) window");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1602,6 +1697,14 @@ fn window_index_prompt_accepts_digits_only() {
 //  Issue #170: run-shell output display
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Ceiling for a run-shell result to arrive. recv_timeout returns the moment it
+/// does, so this only bounds a starved spawn: unit tests share one process, on
+/// Windows process creation in a process is serialized, and with some twenty
+/// tests in `cargo test -- shell` starting Store PowerShell at once a single
+/// spawn() was measured blocked for 5.8 s. 10 s timed out in that run; the
+/// assertions are about the output text, not how fast it came.
+const RUN_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[test]
 fn run_shell_captures_and_displays_output() {
     let mut app = mock_app();
@@ -1616,7 +1719,7 @@ fn run_shell_captures_and_displays_output() {
     // run-shell is now async: the command runs in a background thread
     // and sends output via run_shell_rx. We need to recv the result.
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run-shell output within 10s");
     assert_eq!(title, "run-shell");
     assert!(
@@ -1656,7 +1759,7 @@ fn run_shell_alias_captures_output() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (_title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run alias output within 10s");
     assert!(
         text.contains("alias-test"),
@@ -1677,7 +1780,7 @@ fn run_shell_stderr_is_captured() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (_title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run-shell stderr output within 10s");
     assert!(
         text.contains("error-output") || text.contains("error"),

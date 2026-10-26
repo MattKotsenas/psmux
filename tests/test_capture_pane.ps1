@@ -66,9 +66,20 @@ foreach ($line in $lines2) {
 }
 Check "No trailing whitespace on non-empty lines" (-not $has_trailing_spaces)
 
-# Check that empty lines are preserved (tmux behavior)
-$empty_lines_exist = ($lines2 | Where-Object { $_.Trim() -eq "" }).Count -gt 0
-Check "Empty lines are preserved" $empty_lines_exist
+# Interior empty lines must be preserved (tmux parity). psmux intentionally
+# trims TRAILING blank lines from the default (no-range) capture so iTerm2 does
+# not advance its cursor past the content on initial attach, so the meaningful
+# property to assert is that a blank line BETWEEN two non-blank lines survives.
+& $exe send-keys -t $SESSION "Write-Host 'IBLANKA'; Write-Host ''; Write-Host 'IBLANKB'" Enter
+Start-Sleep -Seconds 1
+$capIB = (& $exe capture-pane -t $SESSION -p 2>&1) -split "`n"
+$idxA = -1; $idxB = -1
+for ($i = 0; $i -lt $capIB.Count; $i++) {
+    if ($capIB[$i].Trim() -eq "IBLANKA") { $idxA = $i }
+    elseif ($capIB[$i].Trim() -eq "IBLANKB") { $idxB = $i }
+}
+$interior_blank_preserved = ($idxA -ge 0 -and $idxB -eq ($idxA + 2) -and $capIB[$idxA + 1].Trim() -eq "")
+Check "Interior empty lines are preserved" $interior_blank_preserved
 
 # =============================================================================
 # TEST 3: capture-pane without -p (stores in paste buffer)
@@ -89,8 +100,12 @@ Write-Host "`n--- TEST 4: Range capture -S 0 -E 5 ---" -ForegroundColor Yellow
 $lines4 = (& $exe capture-pane -t $SESSION -p -S 0 -E 5 2>&1) -split "`n"
 # Filter out truly empty trailing entries from split
 $non_null4 = $lines4 | Where-Object { $_ -ne $null }
-# Should have at most 6 lines (0 through 5) plus possibly a trailing empty from final newline
-Check "-S 0 -E 5 returns ~6 lines" ($non_null4.Count -ge 4 -and $non_null4.Count -le 7)
+# An explicit range is honored line for line (tmux parity): 6 rows requested
+# (0 through 5), and trailing blank rows INSIDE the range are preserved rather
+# than collapsed. So the count is the 6 requested lines (a trailing newline may
+# add one empty split entry). Before the fix this returned only the ~3 non-blank
+# lines because the range path wrongly reused the attach path's trailing-blank trim.
+Check "-S 0 -E 5 returns the 6 requested lines" ($non_null4.Count -ge 6 -and $non_null4.Count -le 7)
 
 # =============================================================================
 # TEST 5: capture-pane -S -3 (3 lines of scrollback above visible top, per tmux)
@@ -148,23 +163,18 @@ $lines8 = $out8 -split "`n"
 Check "-e -S -E returns reasonable lines" ($lines8.Count -le 15)
 
 # =============================================================================
-# TEST 9: capture-pane -J (join lines / trim whitespace)
+# TEST 9: capture-pane -J (join wrapped lines)
 # =============================================================================
 Write-Host "`n--- TEST 9: Join lines -J ---" -ForegroundColor Yellow
 
 $out9 = & $exe capture-pane -t $SESSION -p -J 2>&1 | Out-String
 Check "-J flag returns content" ($out9.Length -gt 0)
-# -J should produce output with no trailing whitespace on any line
-$lines9 = $out9 -split "`n"
-$j_trailing = $false
-foreach ($line in $lines9) {
-    # Check for trailing spaces/tabs (not newlines) on lines that have visible content
-    if ($line.TrimEnd("`r") -match "[ `t]+$" -and $line.Trim().Length -gt 0) {
-        $j_trailing = $true
-        break
-    }
-}
-Check "-J has no trailing whitespace" (-not $j_trailing)
+# -J joins wrapped rows and, like tmux, keeps the spaces the program printed
+# (cmd-capture-pane.c leaves GRID_STRING_TRIM_SPACES off for -J), so it never
+# has more lines than the plain capture. tests/test_capture_pane_join.ps1
+# checks the joined text itself.
+$plain9 = & $exe capture-pane -t $SESSION -p 2>&1 | Out-String
+Check "-J has no more lines than the plain capture" (($out9 -split "`n").Count -le ($plain9 -split "`n").Count)
 
 # =============================================================================
 # TEST 10: capture-pane -S - (all history)

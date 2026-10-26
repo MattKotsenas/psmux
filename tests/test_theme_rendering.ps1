@@ -522,7 +522,7 @@ if ($tuiOk) {
     Write-Test "TUI: Set status-style via CLI (visible TUI proof)"
     & $script:TUI_PSMUX set-option -t $TUI_SESSION_THM status-style "bg=red,fg=white" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $statusStyle = & $script:TUI_PSMUX show-options -g -v status-style -t $TUI_SESSION_THM 2>&1 | Out-String
+    $statusStyle = & $script:TUI_PSMUX show-options -v status-style -t $TUI_SESSION_THM 2>&1 | Out-String
     $statusStyle = $statusStyle.Trim()
     if ($statusStyle -match "red") {
         Write-Pass "TUI: status-style contains 'red' after CLI command ($statusStyle)"

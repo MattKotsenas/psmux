@@ -6,7 +6,7 @@
 # Both must complete WITHOUT killing the server (panes/shells preserved).
 
 $ErrorActionPreference = "Continue"
-$PSMUX = (Resolve-Path '.\target\release\psmux.exe').Path
+$PSMUX = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe").Path
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $injectorExe = "$env:TEMP\psmux_injector.exe"
 $script:Passed = 0

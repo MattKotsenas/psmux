@@ -27,13 +27,13 @@ function Write-Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red;   $
 $injector = "$env:TEMP\psmux_injector.exe"
 if (-not (Test-Path $injector)) {
     $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-    & $csc /nologo /optimize /out:$injector "c:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs" 2>&1 | Out-Null
+    & $csc /nologo /optimize /out:$injector "$PSScriptRoot\injector.cs" 2>&1 | Out-Null
 }
 
 # --- Build key_diag if missing ---
-$diag = "c:\Users\uniqu\Documents\workspace\psmux\target\debug\examples\key_diag.exe"
+$diag = "$PSScriptRoot\..\target\debug\examples\key_diag.exe"
 if (-not (Test-Path $diag)) {
-    Push-Location "c:\Users\uniqu\Documents\workspace\psmux"
+    Push-Location "$PSScriptRoot\.."
     cargo build --example key_diag 2>&1 | Out-Null
     Pop-Location
 }

@@ -62,9 +62,16 @@ Write-Host "Testing fixes since v3.3.4`n" -ForegroundColor Gray
 # TEST 1: Version output (#318 libtmux compat)
 # ────────────────────────────────────────────────
 Write-Host "--- #318: Version output for libtmux ---" -ForegroundColor Yellow
+# NOTE: this suite pins its title to the v3.3.5 release candidate, but the
+# actual fix under test (#318) is the "tmux <ver>" PREFIX for libtmux/tmuxp
+# compat (see src/cli.rs print_version()), not any specific patch version.
+# The version was hardcoded to 3.3.5 at authoring time; every subsequent
+# version bump (now 3.3.6, per Cargo.toml) made this go stale for a reason
+# unrelated to #318. Match the compat contract generically instead of
+# pinning a patch version (task #7 batch A bug 5 DECIDE item).
 Test-Case "psmux -V outputs 'tmux' prefix" {
     $ver = & $PSMUX -V 2>&1
-    $ver -match "^tmux 3\.3\.5"
+    $ver -match "^tmux \d+\.\d+\.\d+"
 }
 
 # ────────────────────────────────────────────────
@@ -164,20 +171,40 @@ Test-Case "show-options -w returns window options" {
 # TEST 7: set-buffer -w clipboard (#298)
 # ────────────────────────────────────────────────
 Write-Host "--- #298: set-buffer -w clipboard ---" -ForegroundColor Yellow
+# Another process holding the clipboard makes a bare Set-Clipboard or
+# Get-Clipboard fail silently (an empty read, a value that never landed), so
+# both cases set a verified sentinel and read with retries.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value) { return $true }
+    }
+    return $false
+}
+function Read-Clipboard {
+    for ($i = 0; $i -lt 20; $i++) {
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now -ne '') { return $now.TrimEnd("`r", "`n") }
+        Start-Sleep -Milliseconds 100
+    }
+    return ''
+}
 Test-Case "set-buffer -w propagates to system clipboard" {
     $marker = "PSMUX_CLIP_TEST_$(Get-Random)"
-    Set-Clipboard "ORIGINAL"
+    $null = Set-ClipboardVerified "ORIGINAL"
     & $PSMUX set-buffer -w $marker 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    $clip = Get-Clipboard
-    $clip -eq $marker
+    (Read-Clipboard) -eq $marker
 }
 
 Test-Case "set-buffer without -w does NOT touch clipboard" {
-    Set-Clipboard "SHOULD_STAY"
+    $null = Set-ClipboardVerified "SHOULD_STAY"
     & $PSMUX set-buffer "NO_CLIPBOARD" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
-    (Get-Clipboard) -eq "SHOULD_STAY"
+    (Read-Clipboard) -eq "SHOULD_STAY"
 }
 
 # ────────────────────────────────────────────────

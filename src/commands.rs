@@ -7,10 +7,10 @@ use std::io::Write;
 use crate::types::{AppState, Mode, Action, FocusDir, LayoutKind, MenuItem, Menu, Node};
 use crate::tree::{compute_rects, kill_all_children, get_active_pane_id};
 use crate::pane::{create_window, split_active, kill_active_pane};
-use crate::copy_mode::{enter_copy_mode, scroll_copy_up, switch_with_copy_save, paste_latest,
+use crate::copy_mode::{enter_copy_mode, switch_with_copy_save, paste_latest,
     capture_active_pane, save_latest_buffer};
 use crate::session::{send_control_to_port, list_all_sessions_tree};
-use crate::window_ops::toggle_zoom;
+use crate::window_ops::{toggle_zoom, unzoom_if_zoomed};
 
 /// Parse a popup dimension spec: "80" (absolute) or "95%" (percentage of term_dim).
 pub(crate) fn parse_popup_dim_local(spec: &str, term_dim: u16, default: u16) -> u16 {
@@ -132,6 +132,348 @@ fn find_file_in_command(cmd: &str) -> Option<(String, String)> {
     }
 }
 
+/// Give a run-shell child a `PATH` on which the running psmux binary is
+/// resolvable.
+///
+/// A run-shell child inherits the **server's** environment, and a server is
+/// not necessarily started by something whose `PATH` contains the psmux
+/// install directory: a parked warm server keeps the environment of whatever
+/// spawned it, even after a later session claims it. Plugin scripts and user
+/// bindings that shell out to `psmux` then fail with "not recognized as the
+/// name of a cmdlet" although psmux is demonstrably running, and psmux
+/// surfaces that output in a modal popup.
+///
+/// So do not trust the inherited `PATH`: prepend the directory the running
+/// binary lives in. `psmux.exe`, `pmux.exe` and `tmux.exe` always sit in the
+/// same directory, so one entry covers every name a child may use.
+#[cfg(windows)]
+pub(crate) fn ensure_psmux_on_path(c: &mut std::process::Command) {
+    apply_own_dir_to_path(c, &std::env::var("PATH").unwrap_or_default());
+}
+
+/// Implementation of `ensure_psmux_on_path` with the inherited `PATH` passed
+/// in, so the decision is testable without touching the process environment.
+#[cfg(windows)]
+fn apply_own_dir_to_path(c: &mut std::process::Command, inherited: &str) {
+    let dir = match std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.to_owned())) {
+        Some(dir) => dir.to_string_lossy().into_owned(),
+        None => return,
+    };
+    if let Some(path) = prepend_if_absent(inherited, &dir) {
+        c.env("PATH", path);
+    }
+}
+
+/// `old` with `dir` prepended, or `None` when `dir` is already on it - in both
+/// cases the result is a `PATH` on which `dir` appears exactly once, so an
+/// environment that already knows about psmux is left as the caller set it up.
+#[cfg(windows)]
+fn prepend_if_absent(old: &str, dir: &str) -> Option<String> {
+    fn norm(s: &str) -> &str {
+        s.trim_end_matches(|c| c == '\\' || c == '/')
+    }
+    if old.split(';').any(|entry| norm(entry).eq_ignore_ascii_case(norm(dir))) {
+        return None;
+    }
+    Some(if old.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{dir};{old}")
+    })
+}
+
+/// Git for Windows' `bin\bash.exe`, which runs a tmux plugin's `.tmux` entry
+/// script the way tmux's `/bin/sh -c` runs it there (cmd-run-shell.c,
+/// job.c:127). Found from `git.exe` on `PATH` or the usual install
+/// directories, never as `bash` on `PATH`: that is often WSL's `bash.exe`
+/// (System32, WindowsApps), whose `tmux` is a Linux tmux, not this server.
+#[cfg(windows)]
+pub(crate) fn git_bash() -> Option<&'static std::path::Path> {
+    static GIT_BASH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    GIT_BASH
+        .get_or_init(|| {
+            let env_dir = |var: &str, sub: &[&str]| {
+                std::env::var_os(var).filter(|v| !v.is_empty()).map(|v| {
+                    let mut p = PathBuf::from(v);
+                    p.extend(sub);
+                    p
+                })
+            };
+            let roots: Vec<PathBuf> = [
+                env_dir("ProgramFiles", &["Git"]),
+                env_dir("ProgramW6432", &["Git"]),
+                env_dir("LOCALAPPDATA", &["Programs", "Git"]),
+                env_dir("USERPROFILE", &["scoop", "apps", "git", "current"]),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            find_git_bash(which::which("git").ok().as_deref(), &roots)
+        })
+        .as_deref()
+}
+
+/// The `bin\bash.exe` of the Git for Windows install that `git_exe` belongs
+/// to (`cmd\git.exe`, `bin\git.exe` or `mingw64\bin\git.exe`), else of the
+/// first of `roots` that holds one. A root counts only with its MSYS
+/// `usr\bin\bash.exe` beside it, so a stray `bin\bash.exe` is not taken.
+#[cfg(windows)]
+fn find_git_bash(git_exe: Option<&std::path::Path>, roots: &[PathBuf]) -> Option<PathBuf> {
+    let from_git = git_exe
+        .into_iter()
+        .flat_map(|exe| exe.ancestors().skip(1).take(3))
+        .map(|dir| dir.to_path_buf());
+    from_git.chain(roots.iter().cloned()).find_map(|root| {
+        let bash = root.join("bin").join("bash.exe");
+        (bash.is_file() && root.join("usr").join("bin").join("bash.exe").is_file()).then_some(bash)
+    })
+}
+
+/// Whether this platform can run a `.tmux` entry script as tmux does. On
+/// Windows that takes Git Bash; elsewhere `sh` runs it by its `#!` line.
+pub(crate) fn can_run_tmux_scripts() -> bool {
+    #[cfg(windows)]
+    {
+        git_bash().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// The flags of a run-shell line that psmux acts on, and the words of its
+/// shell command.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RunShellArgs {
+    /// `-b`: start the command and do not wait for it.
+    pub background: bool,
+    /// `-d delay`: wait this long before starting the command.
+    pub delay: Option<std::time::Duration>,
+    /// The shell command, one word per element.
+    pub command: Vec<String>,
+}
+
+/// Read run-shell's `-b` and `-d delay` from the front of `args` (the words
+/// after the command name), the way tmux's getopt reads its flags
+/// (cmd-run-shell.c:47, `bd:Ct:Es:c:`): one word may carry several flags
+/// (`-bd 2`), `-d` takes the rest of its word or the next one (`-d2`,
+/// `-d 2`), and the flags end at `--` or at the first word that is not one.
+///
+/// The delay is in seconds and may be fractional, as tmux reads it with
+/// strtod (cmd-run-shell.c:125 to :131); anything else is tmux's
+/// `invalid delay time: <value>`. A word holding a flag psmux does not act on
+/// (`-C`, `-c`, `-E`, `-s`, `-t`) ends the flags and goes to the shell with
+/// the rest, as it always has. A `-b` word after the command is still taken
+/// as the flag, as before, unless a `--` ended the flags.
+pub(crate) fn parse_run_shell_args<S: AsRef<str>>(args: &[S]) -> Result<RunShellArgs, String> {
+    let mut out = RunShellArgs::default();
+    let mut i = 0;
+    let mut dash_dash = false;
+    while i < args.len() {
+        let word = args[i].as_ref();
+        if word == "--" {
+            dash_dash = true;
+            i += 1;
+            break;
+        }
+        let Some(flags) = word.strip_prefix('-').filter(|f| !f.is_empty()) else { break };
+        let mut background = false;
+        let mut delay: Option<&str> = None;
+        let mut takes_next = false;
+        let mut ours = true;
+        for (at, c) in flags.char_indices() {
+            match c {
+                'b' => background = true,
+                'd' => {
+                    let rest = &flags[at + 1..];
+                    if rest.is_empty() {
+                        takes_next = true;
+                    } else {
+                        delay = Some(rest);
+                    }
+                    break;
+                }
+                _ => {
+                    ours = false;
+                    break;
+                }
+            }
+        }
+        if !ours {
+            break;
+        }
+        if takes_next {
+            match args.get(i + 1) {
+                Some(v) => {
+                    delay = Some(v.as_ref());
+                    i += 1;
+                }
+                None => return Err("-d expects an argument".to_string()),
+            }
+        }
+        out.background |= background;
+        if let Some(v) = delay {
+            let secs: f64 = v
+                .trim()
+                .parse()
+                .ok()
+                .filter(|s: &f64| s.is_finite())
+                .ok_or_else(|| format!("invalid delay time: {}", v))?;
+            // A delay too long for a Duration (2^64 seconds and up, say
+            // `1e20`) is the longest one there is. from_secs_f64 panics on
+            // it, and this runs on the server thread for a config line, so
+            // `run-shell -d 1e20` in a sourced file used to end the server.
+            // tmux casts it to time_t (cmd-run-shell.c:181) and waits.
+            out.delay = Some(
+                std::time::Duration::try_from_secs_f64(secs.max(0.0))
+                    .unwrap_or(std::time::Duration::MAX),
+            );
+        }
+        i += 1;
+    }
+    for word in &args[i.min(args.len())..] {
+        let word = word.as_ref();
+        if word == "-b" && !dash_dash {
+            out.background = true;
+        } else {
+            out.command.push(word.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Build a `std::process::Command` for a run-shell invocation.
+///
+/// Wrapper around `build_run_shell_command_inner` that also makes the psmux
+/// binary reachable from the child process (`ensure_psmux_on_path`). Every
+/// run-shell path funnels through here: hooks, key bindings, `run` config
+/// lines, client-forwarded commands and the CLI fallback.
+///
+/// stdin is the null device. A job never reads the server's stdin in tmux
+/// (job.c:156 gives it the job socket), and in psmux that slot holds a dead
+/// console handle once a C-c relay has detached the server, so inheriting
+/// it fails CreateProcess with os error 6 (#819). Callers that spawn
+/// without capturing output must null stdout and stderr too
+/// ([`null_job_output`]).
+pub fn build_run_shell_command(shell_cmd: &str) -> std::process::Command {
+    let mut c = build_run_shell_command_inner(shell_cmd);
+    #[cfg(windows)]
+    ensure_psmux_on_path(&mut c);
+    apply_job_env(&mut c);
+    c.stdin(std::process::Stdio::null());
+    c
+}
+
+/// stdout and stderr for a job whose output nobody reads (`run-shell -b`, an
+/// if-shell condition). Inheriting the server's would fail after a C-c relay
+/// for the reason in [`build_run_shell_command`] (#819); `output()` callers
+/// need nothing, it pipes both itself.
+pub fn null_job_output(c: &mut std::process::Command) {
+    c.stdout(std::process::Stdio::null());
+    c.stderr(std::process::Stdio::null());
+}
+
+/// The session identity this server adds to every job child (#804): run-shell,
+/// if-shell, `#()` and popup commands.
+///
+/// tmux runs each of these through job_run (job.c:92), whose environment is
+/// environ_for_session (environ.c:253): the global environment, the session
+/// environment over it, then `TMUX=<socket>,<pid>,<session>` (environ.c:282).
+/// TMUX_PANE is set for a pane only (spawn.c:394), never for a job; a job
+/// reaches its pane through `#{pane_id}`. Here the global and session
+/// environment already ARE the server process environment (environ.rs), which
+/// a job inherits, so what is missing is `TMUX` itself.
+///
+/// `PSMUX_SESSION` stays a pane marker: the nested session guard reads it
+/// (util::inside_psmux_pane), and tmux does not call a job nested either (its
+/// check walks the pane ttys, server-client.c server_client_check_nested).
+///
+/// Empty in a client process, so a command built there is left as it was.
+static JOB_ENV: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// The variables [`JOB_ENV`] holds for this server identity.
+pub fn job_env_vars(control_port: Option<u16>, socket_name: Option<&str>) -> Vec<(String, String)> {
+    vec![
+        ("TMUX".to_string(), crate::pane::tmux_env_value(control_port, socket_name)),
+        // Git Bash would rewrite the /tmp/ path in TMUX otherwise (as for panes).
+        ("MSYS2_ENV_CONV_EXCL".to_string(), "TMUX".to_string()),
+    ]
+}
+
+/// Record this server's identity for its job children, once its port is
+/// bound and again on a warm claim.
+pub fn publish_job_env(control_port: Option<u16>, socket_name: Option<&str>) {
+    if let Ok(mut g) = JOB_ENV.write() {
+        *g = job_env_vars(control_port, socket_name);
+    }
+}
+
+/// What [`JOB_ENV`] holds now (empty in a client process).
+pub fn job_env() -> Vec<(String, String)> {
+    JOB_ENV.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Give a job child this server's identity (see [`JOB_ENV`]).
+pub fn apply_job_env(c: &mut std::process::Command) {
+    let vars = job_env();
+    if vars.is_empty() {
+        return;
+    }
+    for (k, v) in &vars {
+        c.env(k, v);
+    }
+    // TMUX names the server now; the path that told this server who it is
+    // must not leak into the child (as for panes, pane.rs set_tmux_env).
+    c.env_remove(crate::socket_path::SOCKET_PATH_ENV);
+}
+
+/// The whole environment a job of this server runs with: the server process
+/// environment plus [`JOB_ENV`]. The server answers `job-environ` with it, so
+/// a run-shell or if-shell the CLI runs in its own process gets the same
+/// environment as one the server runs (tmux runs every job in the server).
+pub fn job_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let extra = job_env();
+    let mut out: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| {
+            let ks = k.to_string_lossy();
+            !ks.eq_ignore_ascii_case(crate::socket_path::SOCKET_PATH_ENV)
+                && !extra.iter().any(|(e, _)| e.eq_ignore_ascii_case(&ks))
+        })
+        .collect();
+    out.extend(extra.into_iter().map(|(k, v)| (k.into(), v.into())));
+    out
+}
+
+/// Run a job built in the CLI process with the server's job environment
+/// (`env`, from [`job_environment`] over `job-environ`) instead of the CLI's
+/// own. psmux stays reachable on the child's PATH (#660).
+pub fn apply_server_job_environment(c: &mut std::process::Command, env: &[(std::ffi::OsString, std::ffi::OsString)]) {
+    c.env_clear();
+    c.envs(env.iter().map(|(k, v)| (k, v)));
+    #[cfg(windows)]
+    {
+        let path = env.iter()
+            .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        apply_own_dir_to_path(c, &path);
+    }
+}
+
+/// Ask the server this CLI targets for its job environment. `None` when no
+/// server answers, and the job then runs with the CLI's environment as before.
+pub fn fetch_server_job_environment() -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    use base64::Engine;
+    let resp = crate::session::send_control_with_response("job-environ\n".to_string()).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(resp.trim().as_bytes()).ok()?;
+    let env = crate::client_env::decode_env_block(&bytes)?;
+    if !crate::client_env::is_sane(&env) {
+        return None;
+    }
+    Some(env)
+}
+
 /// Build a `std::process::Command` for a run-shell invocation.
 ///
 /// Avoids double-wrapping when the command already starts with a shell binary
@@ -139,7 +481,7 @@ fn find_file_in_command(cmd: &str) -> Option<(String, String)> {
 /// (including those with spaces) and uses the appropriate execution strategy:
 /// `-File` for `.ps1`, direct `Command::new` for `.exe`/`.cmd`/`.bat`,
 /// and PowerShell call operator `& 'path'` for other files with spaces.
-pub fn build_run_shell_command(shell_cmd: &str) -> std::process::Command {
+fn build_run_shell_command_inner(shell_cmd: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use crate::platform::HideWindowCommandExt;
@@ -179,6 +521,21 @@ pub fn build_run_shell_command(shell_cmd: &str) -> std::process::Command {
         };
         if let Some((file_path, rest_args)) = find_file_in_command(trimmed) {
             let lower_path = file_path.to_lowercase();
+
+            // A tmux plugin's .tmux entry script is a bash script: run it with
+            // Git Bash. Its path goes with `/` only, so the script's own
+            // `dirname "${BASH_SOURCE[0]}"` finds its directory.
+            if lower_path.ends_with(".tmux") {
+                if let Some(bash) = git_bash() {
+                    let mut c = std::process::Command::new(bash);
+                    c.arg(file_path.replace('\\', "/"));
+                    if !rest_args.is_empty() {
+                        for a in &parse_command_line(&rest_args) { c.arg(a); }
+                    }
+                    c.hide_window();
+                    return c;
+                }
+            }
 
             // .ps1 scripts: use -File which never splits paths at whitespace
             if lower_path.ends_with(".ps1") {
@@ -273,12 +630,30 @@ pub fn build_run_shell_command(shell_cmd: &str) -> std::process::Command {
     }
 }
 
+/// What server-info prints, and show-messages with it. tmux's default command
+/// aliases make info and server-info `show-messages -JT` (options-table.c),
+/// so the two give the same text here. psmux keeps no message log and has no
+/// terminfo or job table to list, so show-messages prints this summary of the
+/// server whatever its -J, -T and -t say.
+pub fn server_info_text(app: &AppState) -> String {
+    format!(
+        "psmux {} (Windows)\npid: {}\nsession: {}\nwindows: {}\nuptime: {}s\nsocket: {}",
+        crate::types::VERSION,
+        std::process::id(),
+        app.session_name,
+        app.windows.len(),
+        (chrono::Local::now() - app.created_at).num_seconds(),
+        crate::paths::port_file(app.port_file_base())
+    )
+}
+
 /// Show text output in a popup overlay (used by list-* commands inside a session).
 fn show_output_popup(app: &mut AppState, title: &str, output: String) {
     let lines: Vec<&str> = output.lines().collect();
     let width = lines.iter().map(|l| l.len()).max().unwrap_or(40).max(20) as u16 + 4;
     let height = (lines.len() as u16 + 2).max(5);
     app.mode = Mode::PopupMode {
+        look: crate::popup::PopupLook::titled(title),
         command: title.to_string(),
         output,
         process: None,
@@ -298,9 +673,19 @@ fn generate_list_windows(app: &AppState) -> String {
 /// Generate list-panes output from AppState.
 fn generate_list_panes(app: &AppState) -> String {
     let win = &app.windows[app.active_idx];
-    fn collect(node: &Node, panes: &mut Vec<(usize, u16, u16)>) {
+    fn collect(node: &Node, panes: &mut Vec<(usize, u16, u16, usize, usize)>) {
         match node {
-            Node::Leaf(p) => { panes.push((p.id, p.last_cols, p.last_rows)); }
+            Node::Leaf(p) => {
+                // Retained rows and the bytes they actually cost, like tmux.
+                // Both were faked before (the limit, and a literal 0), which
+                // hid the scrollback growth behind issue #641.
+                let (hist_rows, hist_bytes) = p
+                    .term
+                    .lock()
+                    .map(|t| (t.screen().scrollback_filled(), t.screen().history_bytes()))
+                    .unwrap_or((0, 0));
+                panes.push((p.id, p.last_cols, p.last_rows, hist_rows, hist_bytes));
+            }
             Node::Split { children, .. } => { for c in children { collect(c, panes); } }
         }
     }
@@ -308,22 +693,21 @@ fn generate_list_panes(app: &AppState) -> String {
     collect(&win.root, &mut panes);
     let active_id = get_active_pane_id(&win.root, &win.active_path);
     let mut output = String::new();
-    for (pos, (id, cols, rows)) in panes.iter().enumerate() {
-        let idx = pos + app.pane_base_index;
+    for (pos, (id, cols, rows, hist_rows, hist_bytes)) in panes.iter().enumerate() {
+        let idx = pos + app.pane_base_index_of(app.active_idx);
         let marker = if active_id == Some(*id) { " (active)" } else { "" };
-        output.push_str(&format!("{}: [{}x{}] [history {}/{}, 0 bytes] %{}{}\n",
-            idx, cols, rows, app.history_limit, app.history_limit, id, marker));
+        output.push_str(&format!("{}: [{}x{}] [history {}/{}, {} bytes] %{}{}\n",
+            idx, cols, rows, hist_rows, app.history_limit, hist_bytes, id, marker));
     }
     output
 }
 
-/// Generate list-clients output from AppState.
+/// Generate list-clients output from AppState: one row per registered client,
+/// the same rows `CtrlReq::ListClients` answers over the wire (#724). This used
+/// to print a single made up `/dev/pts/0` row whatever was attached
+/// (discussion #776).
 fn generate_list_clients(app: &AppState) -> String {
-    format!("/dev/pts/0: {}: {} [{}x{}] (utf8)\n",
-        app.session_name,
-        app.windows[app.active_idx].name,
-        app.last_window_area.width,
-        app.last_window_area.height)
+    crate::format::format_list_clients(app, crate::format::default_list_clients_format(), None)
 }
 
 /// Generate show-hooks output from AppState.
@@ -347,12 +731,14 @@ fn generate_show_hooks(app: &AppState) -> String {
 /// Generate show-options output locally (embedded mode fallback).
 fn generate_show_options(app: &AppState) -> String {
     let mut output = String::new();
-    output.push_str(&format!("prefix {}\n", crate::config::format_key_binding(&app.prefix_key)));
+    output.push_str(&format!("prefix {}\n", crate::config::format_option_key(&app.prefix_key)));
     output.push_str(&format!("base-index {}\n", app.window_base_index));
     output.push_str(&format!("pane-base-index {}\n", app.pane_base_index));
     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
     output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
     output.push_str(&format!("scroll-enter-copy-mode {}\n", if app.scroll_enter_copy_mode { "on" } else { "off" }));
+    output.push_str(&format!("mouse-drag-enter-copy-mode {}\n", if app.mouse_drag_enter_copy_mode { "on" } else { "off" }));
+    output.push_str(&format!("ctrl-wheel-zoom {}\n", if app.ctrl_wheel_zoom { "on" } else { "off" }));
     output.push_str(&format!("choose-tree-preview {}\n", if app.choose_tree_preview { "on" } else { "off" }));
     output.push_str(&format!("status {}\n", if app.status_visible { "on" } else { "off" }));
     output.push_str(&format!("status-position {}\n", app.status_position));
@@ -360,8 +746,10 @@ fn generate_show_options(app: &AppState) -> String {
     output.push_str(&format!("status-right \"{}\"\n", app.status_right));
     output.push_str(&format!("history-limit {}\n", app.history_limit));
     output.push_str(&format!("display-time {}\n", app.display_time_ms));
+    output.push_str(&format!("priority {}\n", app.priority));
     output.push_str(&format!("mode-keys {}\n", app.mode_keys));
     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
+    output.push_str(&format!("program-status {}\n", if app.program_status { "on" } else { "off" }));
     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
     output.push_str(&format!("automatic-rename {}\n", if app.automatic_rename { "on" } else { "off" }));
     output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
@@ -375,63 +763,309 @@ fn generate_show_options(app: &AppState) -> String {
     output
 }
 
-/// Local join-pane: extract source pane and graft into target window.
-fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pane: Option<usize>,
-                   target_win: Option<usize>, target_pane: Option<usize>, horizontal: bool) {
-    let src_idx = src_win.unwrap_or(app.active_idx);
-    let raw_target_win = target_win.unwrap_or(app.active_idx);
-    if src_idx < app.windows.len() && raw_target_win < app.windows.len() && src_idx != raw_target_win {
-        // Resolve source pane path
-        let src_path = if let Some(pidx) = src_pane {
+/// The session a raw `sess:win.pane` spec names, when that is a live session
+/// other than the one `app` serves.
+///
+/// psmux runs one server per session, so a server that is handed a source in
+/// another session can only act on its own windows. Every server side command
+/// that takes a `-s` used to drop the session half and act on its own window
+/// or pane of the same number, at exit 0. This is the check that turns that
+/// silent wrong action into an error. A session half that names no live
+/// server is left alone (the command keeps its old reading of the spec), so a
+/// name the CLI resolved by prefix can never be refused here.
+pub(crate) fn foreign_session_in_spec(app: &AppState, spec: &str) -> Option<String> {
+    let (s, _) = spec.split_once(':')?;
+    let s = crate::cli::strip_exact_match_prefix(s);
+    if s.is_empty() { return None; }
+    let own = app.port_file_base();
+    let ns = app.socket_name.as_deref();
+    let base = match s.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        Some(id) => crate::session::resolve_session_by_id(id)?,
+        None => crate::session::namespaced_session_base(ns, s),
+    };
+    if crate::session::same_session_identity(ns, &base, &own) { return None; }
+    if std::path::Path::new(&crate::paths::port_file(&base)).exists() {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// The error a server answers for a command whose source lives in another
+/// session it cannot reach. `what` says why the command cannot be carried
+/// across two servers.
+pub(crate) fn cross_session_refusal(cmd: &str, session: &str) -> String {
+    let why = match cmd {
+        "swap-pane" => "each session runs in its own psmux server; use join-pane to move a pane between sessions",
+        "link-window" => "a window cannot be shared by two psmux servers",
+        "move-window" | "swap-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
+        _ => "each session runs in its own psmux server",
+    };
+    format!("{}: source is in session {} (cross-session {} is not supported: {})", cmd, session, cmd, why)
+}
+
+/// Resolve one end of a join-pane (`-s` or `-t`) to a window position and the
+/// pane's position in that window's pane order (None: the window's active
+/// pane). A `%id` pane names its own window, whatever window the spec names,
+/// as it does in tmux. Err carries tmux's message.
+pub(crate) fn resolve_join_end(app: &AppState, t: &crate::types::TempTarget) -> Result<(usize, Option<usize>), String> {
+    if let (Some(id), true) = (t.pane, t.pane_is_id) {
+        return crate::tree::find_pane_by_id_global(app, id)
+            .map(|(w, p)| (w, Some(p)))
+            .ok_or_else(|| format!("can't find pane: %{}", id));
+    }
+    let pos = if let Some(w) = t.win {
+        if t.win_is_id { app.windows.iter().position(|x| x.id == w) } else { app.win_pos(w) }
+            .ok_or_else(|| format!("can't find window: {}{}", if t.win_is_id { "@" } else { "" }, w))?
+    } else if let Some(ref n) = t.win_name {
+        app.windows.iter().position(|x| x.name == *n)
+            .ok_or_else(|| format!("can't find window: {}", n))?
+    } else if app.active_idx < app.windows.len() {
+        app.active_idx
+    } else {
+        return Err("no current window".to_string());
+    };
+    let Some(p) = t.pane else { return Ok((pos, None)) };
+    // The pane index as #{pane_index} shows it: pane-base-index comes off
+    // before it is a position in the window's pane order.
+    let pane_pos = p.checked_sub(app.pane_base_index_of(pos))
+        .filter(|pane_pos| *pane_pos < crate::tree::pane_paths(&app.windows[pos].root).len())
+        .ok_or_else(|| format!("can't find pane: {}", p))?;
+    Ok((pos, Some(pane_pos)))
+}
+
+/// join-pane / move-pane `-l size` (cells, or `N%` of the target pane) and the
+/// older `-p percentage`, read the way split-window reads them.
+pub(crate) fn join_size_arg(args: &[&str]) -> Option<(u16, bool)> {
+    args.windows(2).find(|w| w[0] == "-p")
+        .and_then(|w| w[1].trim_end_matches('%').parse::<u16>().ok())
+        .map(|v| (v, true))
+        .or_else(|| args.windows(2).find(|w| w[0] == "-l").and_then(|w| {
+            let is_pct = w[1].ends_with('%');
+            w[1].trim_end_matches('%').parse::<u16>().ok().map(|v| (v, is_pct))
+        }))
+}
+
+/// The server's join-pane / move-pane: resolve both ends strictly (pane ids
+/// included, the `-s %id` form used to be read as a pane INDEX of the active
+/// window), refuse a join into the source's own window with tmux's message,
+/// then run `join_pane_local`. move-pane (`same_window`) may move a pane
+/// inside its window instead (`move_pane_in_window`). With no `-s` the
+/// source is the marked pane when one is set (CMD_FIND_DEFAULT_MARKED), else
+/// the current pane. `size` is `-l` (cells, or a share of the target pane
+/// with the flag set). Err is what the CLI prints at exit 1.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_pane_request(app: &mut AppState, src_raw: Option<&str>, src: &crate::types::TempTarget,
+                   dst: &crate::types::TempTarget, horizontal: bool, detach: bool, before: bool,
+                   same_window: bool, size: Option<(u16, bool)>) -> Result<(), String> {
+    if let Some(s) = src_raw.and_then(|r| foreign_session_in_spec(app, r)) {
+        // The CLI carries a cross session join itself; a server can only
+        // reach its own windows, so it must not act on the same numbers here.
+        return Err(format!("join-pane: source is in session {} (run join-pane from the command line to move a pane between sessions)", s));
+    }
+    let marked = if src_raw.is_none() && *src == crate::types::TempTarget::default() {
+        app.marked_pane
+            .filter(|&(_, id)| crate::tree::find_pane_by_id_global(app, id).is_some())
+            .map(|(_, id)| crate::types::TempTarget { pane: Some(id), pane_is_id: true, ..Default::default() })
+    } else { None };
+    let (spos, spane) = resolve_join_end(app, marked.as_ref().unwrap_or(src))?;
+    let (dpos, dpane) = resolve_join_end(app, dst)?;
+    if spos == dpos {
+        if !same_window {
+            return Err("can't join a pane to its own window".to_string());
+        }
+        return move_pane_in_window(app, spos, spane, dpane, horizontal, detach, before, size);
+    }
+    let sw = app.win_display_index(spos);
+    let dw = app.win_display_index(dpos);
+    if join_pane_local(app, Some(sw), spane, Some(dw), dpane, horizontal, detach, before, size) {
+        Ok(())
+    } else {
+        Err(app.status_message.as_ref()
+            .map(|(m, _, _)| m.trim_start_matches("join-pane: ").to_string())
+            .unwrap_or_else(|| "join-pane failed".to_string()))
+    }
+}
+
+/// move-pane with both panes in window `pos` (a pane order index, None: the
+/// active pane). tmux allows it (cmd-join-pane.c: only `src_wp == dst_wp` is
+/// refused); the source leaves the tree and is grafted next to the target,
+/// found again by id because the source's removal can shift its path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn move_pane_in_window(app: &mut AppState, pos: usize, src_pane: Option<usize>,
+                   dst_pane: Option<usize>, horizontal: bool, detach: bool, before: bool,
+                   size: Option<(u16, bool)>) -> Result<(), String> {
+    let path_of = |app: &AppState, pane: Option<usize>| -> Vec<usize> {
+        let win = &app.windows[pos];
+        pane.and_then(|i| {
             let mut leaves = Vec::new();
-            crate::tree::collect_leaf_paths_pub(&app.windows[src_idx].root, &mut Vec::new(), &mut leaves);
-            if let Some((_, p)) = leaves.get(pidx) {
-                p.clone()
-            } else {
-                app.windows[src_idx].active_path.clone()
-            }
-        } else {
-            app.windows[src_idx].active_path.clone()
-        };
-        let src_root = std::mem::replace(&mut app.windows[src_idx].root,
-            Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
-        let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);
-        if let Some(pane_node) = extracted {
-            let src_empty = remaining.is_none();
-            if let Some(rem) = remaining {
-                app.windows[src_idx].root = rem;
-                app.windows[src_idx].active_path = crate::tree::first_leaf_path(&app.windows[src_idx].root);
-            }
-            let tgt = if src_empty && raw_target_win > src_idx { raw_target_win - 1 } else { raw_target_win };
-            if src_empty {
-                app.windows.remove(src_idx);
-                if app.active_idx >= app.windows.len() {
-                    app.active_idx = app.windows.len().saturating_sub(1);
-                }
-            }
-            if tgt < app.windows.len() {
-                // Resolve target pane path
-                let tgt_path = if let Some(tpidx) = target_pane {
-                    let mut leaves = Vec::new();
-                    crate::tree::collect_leaf_paths_pub(&app.windows[tgt].root, &mut Vec::new(), &mut leaves);
-                    if let Some((_, p)) = leaves.get(tpidx) {
-                        p.clone()
-                    } else {
-                        app.windows[tgt].active_path.clone()
-                    }
-                } else {
-                    app.windows[tgt].active_path.clone()
-                };
-                let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                crate::tree::replace_leaf_with_split(&mut app.windows[tgt].root, &tgt_path, split_kind, pane_node);
-                app.active_idx = tgt;
-            }
-        } else {
-            if let Some(rem) = remaining {
-                app.windows[src_idx].root = rem;
-            }
+            crate::tree::collect_leaf_paths_pub(&win.root, &mut Vec::new(), &mut leaves);
+            leaves.get(i).map(|(_, p)| p.clone())
+        }).unwrap_or_else(|| win.active_path.clone())
+    };
+    let src_path = path_of(app, src_pane);
+    let dst_path = path_of(app, dst_pane);
+    let src_id = crate::tree::get_active_pane_id(&app.windows[pos].root, &src_path);
+    let dst_id = crate::tree::get_active_pane_id(&app.windows[pos].root, &dst_path)
+        .ok_or_else(|| "can't find target pane".to_string())?;
+    if src_id == Some(dst_id) {
+        return Err("source and target panes must be different".to_string());
+    }
+    if let Some(saved) = app.windows[pos].zoom_saved.take() {
+        let win = &mut app.windows[pos];
+        for (p, sz) in saved.into_iter() {
+            if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
         }
     }
+    crate::tree::normalize_window_sizes(&mut app.windows[pos]);
+    let win = &mut app.windows[pos];
+    // -d leaves the active pane as it was (cmd-join-pane.c sets it only
+    // without -d), the moved pane included.
+    let prev_active_id = crate::tree::get_active_pane_id(&win.root, &win.active_path);
+    let root = std::mem::replace(&mut win.root,
+        Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
+    let (remaining, extracted) = crate::tree::extract_node(root, &src_path);
+    let (rem, pane_node) = match (remaining, extracted) {
+        (Some(rem), Some(node)) => (rem, node),
+        // Nothing came out (or nothing is left): put back what there is so
+        // no pane is dropped with the placeholder root.
+        (Some(rem), None) | (None, Some(rem)) => {
+            win.root = rem;
+            win.active_path = crate::tree::first_leaf_path(&win.root);
+            return Err("move-pane failed".to_string());
+        }
+        (None, None) => return Err("move-pane failed".to_string()),
+    };
+    win.root = rem;
+    // The target is a different leaf, so it survives the source's removal.
+    let tgt_path = crate::tree::find_path_by_id(&win.root, dst_id)
+        .unwrap_or_else(|| crate::tree::first_leaf_path(&win.root));
+    win.active_path = tgt_path.clone();
+    let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+    let grafted = crate::tree::graft_pane_sized(win, &tgt_path, split_kind, pane_node, size, before, !detach);
+    if detach {
+        if let Some(p) = prev_active_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
+            win.active_path = p;
+        }
+    } else {
+        app.active_idx = pos;
+        if let Some(prev) = grafted.and_then(|g| g.prev_active_path) {
+            app.last_pane_path = prev;
+        }
+    }
+    Ok(())
+}
+
+/// join-pane / move-pane: extract the source pane and graft it into the target
+/// window. The ONE implementation behind both the server request
+/// (`CtrlReq::JoinPane` / `CtrlReq::MovePane`) and the embedded fallback, so
+/// the two can no longer drift apart (#725 was present in both copies).
+///
+/// Returns true when a pane was moved; errors land in `status_message`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pane: Option<usize>,
+                   target_win: Option<usize>, target_pane: Option<usize>, horizontal: bool,
+                   detach: bool, before: bool, size: Option<(u16, bool)>) -> bool {
+    // Resolve source/target display indices to Vec positions (default: active
+    // window). win_pos honors gapped indices left by renumber-windows off.
+    let src_pos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+    let tgt_pos = match target_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+    // tmux surfaces an explicit error rather than silently doing nothing when the
+    // target cannot be resolved (issue #437). Without this, `join-pane -t :N`
+    // where window N does not exist (common when a user assumes base-index 1)
+    // fails with no feedback.
+    let src_idx = match src_pos {
+        Some(p) => p,
+        None => {
+            app.status_message = Some((format!("join-pane: can't find source window: {}", src_win.unwrap_or(0)), Instant::now(), None));
+            return false;
+        }
+    };
+    let raw_target_win = match tgt_pos {
+        Some(p) => p,
+        None => {
+            app.status_message = Some((format!("join-pane: can't find window: {}", target_win.unwrap_or(0)), Instant::now(), None));
+            return false;
+        }
+    };
+    if src_idx == raw_target_win {
+        app.status_message = Some(("join-pane: can't join a pane to its own window".to_string(), Instant::now(), None));
+        return false;
+    }
+    // Resolve source pane path (Nth pane in DFS order)
+    let src_path = if let Some(pidx) = src_pane {
+        let mut leaves = Vec::new();
+        crate::tree::collect_leaf_paths_pub(&app.windows[src_idx].root, &mut Vec::new(), &mut leaves);
+        if let Some((_, p)) = leaves.get(pidx) {
+            p.clone()
+        } else {
+            app.windows[src_idx].active_path.clone()
+        }
+    } else {
+        app.windows[src_idx].active_path.clone()
+    };
+    // Unzoom the source window if needed
+    if let Some(saved) = app.windows[src_idx].zoom_saved.take() {
+        let win = &mut app.windows[src_idx];
+        for (p, sz) in saved.into_iter() {
+            if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
+        }
+    }
+    crate::tree::normalize_window_sizes(&mut app.windows[src_idx]);
+    let src_root = std::mem::replace(&mut app.windows[src_idx].root,
+        Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
+    let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);
+    let Some(pane_node) = extracted else {
+        // Extraction failed: restore
+        if let Some(rem) = remaining {
+            app.windows[src_idx].root = rem;
+        }
+        return false;
+    };
+    let src_empty = remaining.is_none();
+    if let Some(rem) = remaining {
+        app.windows[src_idx].root = rem;
+        app.windows[src_idx].active_path = crate::tree::first_leaf_path(&app.windows[src_idx].root);
+    }
+    // Adjust target index if the source window is removed and the target is after it
+    let tgt = if src_empty && raw_target_win > src_idx { raw_target_win - 1 } else { raw_target_win };
+    if src_empty {
+        app.windows.remove(src_idx);
+        app.on_window_removed(src_idx);
+        if app.active_idx >= app.windows.len() {
+            app.active_idx = app.windows.len().saturating_sub(1);
+        }
+    }
+    if tgt < app.windows.len() {
+        // Resolve target pane path
+        let tgt_path = if let Some(tpidx) = target_pane {
+            let mut leaves = Vec::new();
+            crate::tree::collect_leaf_paths_pub(&app.windows[tgt].root, &mut Vec::new(), &mut leaves);
+            if let Some((_, p)) = leaves.get(tpidx) {
+                p.clone()
+            } else {
+                app.windows[tgt].active_path.clone()
+            }
+        } else {
+            app.windows[tgt].active_path.clone()
+        };
+        let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+        // The graft turns the target leaf into a split. graft_pane re-anchors
+        // active_path on a leaf, the joined pane unless -d (#725): it used to
+        // be left on the new split, where every input path found no pane.
+        let grafted = crate::tree::graft_pane_sized(&mut app.windows[tgt], &tgt_path, split_kind, pane_node, size, before, !detach);
+        // -d grafts without switching (cmd-join-pane.c:515 to 521: the
+        // window_set_active_pane and session_select are inside `if (!d)`).
+        if !detach {
+            app.active_idx = tgt;
+            if let Some(prev) = grafted.and_then(|g| g.prev_active_path) {
+                app.last_pane_path = prev;
+            }
+        } else if app.active_idx >= app.windows.len() {
+            app.active_idx = app.windows.len() - 1;
+        }
+    }
+    true
 }
 
 /// Generate list-commands output.
@@ -441,10 +1075,10 @@ fn generate_list_commands() -> String {
 
 /// Build the choose-tree data for the WindowChooser mode.
 pub fn build_choose_tree(app: &AppState) -> Vec<crate::session::TreeEntry> {
-    let current_windows: Vec<(String, usize, String, bool)> = app.windows.iter().enumerate().map(|(i, w)| {
+    let current_windows: Vec<(String, usize, String, bool, usize)> = app.windows.iter().enumerate().map(|(i, w)| {
         let panes = crate::tree::count_panes(&w.root);
-        let size = format!("{}x{}", app.last_window_area.width, app.last_window_area.height);
-        (w.name.clone(), panes, size, i == app.active_idx)
+        let size = format!("{}x{}", w.area.width, w.area.height);
+        (w.name.clone(), panes, size, i == app.active_idx, app.win_display_index(i))
     }).collect();
     list_all_sessions_tree(&app.session_name, &current_windows)
 }
@@ -473,11 +1107,11 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::NewWindow)
             }
         }
-        "split-window" | "splitw" | "split-pane" | "splitp" => {
+        "split-window" | "splitw" => {
             // If extra flags like -c, -d, -p, -F, or a shell command are present,
             // store as Command to preserve the full argument string.
             let has_extra = parts.iter().any(|p| matches!(*p, "-c" | "-d" | "-p" | "-l" | "-F" | "-P" | "-b" | "-f" | "-I" | "-Z" | "-e"))
-                || parts.iter().any(|p| !p.starts_with('-') && *p != "split-window" && *p != "splitw" && *p != "split-pane" && *p != "splitp");
+                || parts[1..].iter().any(|p| !p.starts_with('-'));
             if has_extra {
                 Some(Action::Command(cmd.to_string()))
             } else if parts.iter().any(|p| *p == "-h") {
@@ -486,25 +1120,55 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::SplitVertical)
             }
         }
+        // A bare command is the simple Action; with arguments (a `-t` above
+        // all) the whole line is kept, or `kill-pane -t %3` bound to a key
+        // killed the ACTIVE pane and `rename-window -t w x` opened the rename
+        // prompt for the current window instead.
+        "kill-pane" | "killp" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "kill-pane" | "killp" => Some(Action::KillPane),
         "next-window" | "next" => Some(Action::NextWindow),
         "previous-window" | "prev" => Some(Action::PrevWindow),
         "copy-mode" => {
-            if parts.iter().any(|p| *p == "-u") {
+            // Any flag that changes what the command does keeps the whole
+            // command line, or a binding such as tmux's own
+            // `DoubleClick1Pane { copy-mode -H; ... }` or a menu's
+            // `copy-mode -q` would lose it and become a plain entry (#704).
+            if crate::copy_mode::CopyModeFlags::parse(&parts[1..]) != crate::copy_mode::CopyModeFlags::default() {
                 Some(Action::Command(cmd.to_string()))
             } else {
                 Some(Action::CopyMode)
             }
         }
-        "paste-buffer" | "pasteb" => Some(Action::Paste),
+        // Issue #684: a bare `paste-buffer` is the simple Action; anything with
+        // a flag keeps its whole command line so -p, -b, -d, -s and -t survive
+        // to the dispatch, the same shape copy-mode and split-window use above.
+        "paste-buffer" | "pasteb" => {
+            if parts.len() > 1 {
+                Some(Action::Command(cmd.to_string()))
+            } else {
+                Some(Action::Paste)
+            }
+        }
         "detach-client" | "detach" => Some(Action::Detach),
+        "rename-window" | "renamew" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "rename-window" | "renamew" => Some(Action::RenameWindow),
-        "choose-window" | "choose-tree" => Some(Action::WindowChooser),
-        "choose-session" => Some(Action::SessionChooser),
-        "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") => Some(Action::ZoomPane),
+        "choose-tree" => {
+            let words = parse_command_line(cmd);
+            // A template has to reach the chooser, which the two bare
+            // actions cannot carry, so that command stays whole and runs
+            // through execute_command_string like any other (#912).
+            if crate::choose_tree::chooser_template(words.get(1..).unwrap_or(&[])).is_some() {
+                return Some(Action::Command(cmd.to_string()));
+            }
+            match crate::choose_tree::chooser_kind(words.get(1..).unwrap_or(&[])) {
+                crate::choose_tree::ChooserKind::Session => Some(Action::SessionChooser),
+                crate::choose_tree::ChooserKind::Tree => Some(Action::WindowChooser),
+            }
+        }
+        "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") && !parts.contains(&"-t") => Some(Action::ZoomPane),
         "zoom-pane" => Some(Action::ZoomPane),
         "select-pane" | "selectp" => {
-            if parts.iter().any(|p| *p == "-Z") {
+            if parts.iter().any(|p| *p == "-Z" || *p == "-t") {
                 Some(Action::Command(cmd.to_string()))
             } else if parts.iter().any(|p| *p == "-U") {
                 Some(Action::MoveFocus(FocusDir::Up))
@@ -519,6 +1183,8 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
             }
         }
         "last-window" | "last" => Some(Action::Command("last-window".to_string())),
+        // Keep the flags: `last-pane -d` / `-e` toggle input, not select.
+        "last-pane" | "lastp" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "last-pane" | "lastp" => Some(Action::Command("last-pane".to_string())),
         "swap-pane" | "swapp" => Some(Action::Command(cmd.to_string())),
         "resize-pane" | "resizep" => Some(Action::Command(cmd.to_string())),
@@ -534,10 +1200,13 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "send-keys" | "send" => Some(Action::Command(cmd.to_string())),
         "send-prefix" => Some(Action::Command(cmd.to_string())),
         "set-option" | "set" | "setw" | "set-window-option" => Some(Action::Command(cmd.to_string())),
-        "show-options" | "show" | "show-window-options" | "showw" => Some(Action::Command(cmd.to_string())),
+        "show-options" | "show" | "show-window-options" | "showw"
+        | "show-option" | "show-window-option" => Some(Action::Command(cmd.to_string())),
         "source-file" | "source" => Some(Action::Command(cmd.to_string())),
         "select-layout" | "selectl" => Some(Action::Command(cmd.to_string())),
+        "next-layout" | "nextl" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "next-layout" | "nextl" => Some(Action::Command("next-layout".to_string())),
+        "previous-layout" | "prevl" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "previous-layout" | "prevl" => Some(Action::Command("previous-layout".to_string())),
         "confirm-before" | "confirm" => Some(Action::Command(cmd.to_string())),
         "display-menu" | "menu" => Some(Action::Command(cmd.to_string())),
@@ -545,8 +1214,10 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "display-message" | "display" => Some(Action::Command(cmd.to_string())),
         "pipe-pane" | "pipep" => Some(Action::Command(cmd.to_string())),
         "rename-session" | "rename" => Some(Action::Command(cmd.to_string())),
+        "clear-history" | "clearhist" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "clear-history" | "clearhist" => Some(Action::Command("clear-history".to_string())),
         "set-buffer" | "setb" => Some(Action::Command(cmd.to_string())),
+        "delete-buffer" | "deleteb" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "delete-buffer" | "deleteb" => Some(Action::Command("delete-buffer".to_string())),
         "list-buffers" | "lsb" => Some(Action::Command(cmd.to_string())),
         "show-buffer" | "showb" => Some(Action::Command(cmd.to_string())),
@@ -583,7 +1254,6 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "unbind-key" | "unbind" => Some(Action::Command(cmd.to_string())),
         "attach-session" | "attach" | "a" | "at" => Some(Action::Command(cmd.to_string())),
         "new-session" | "new" => Some(Action::Command(cmd.to_string())),
-        "server-info" | "info" => Some(Action::Command(cmd.to_string())),
         "start-server" | "start" => Some(Action::Command(cmd.to_string())),
         "lock-client" | "lockc" => Some(Action::Command(cmd.to_string())),
         "lock-server" | "lock" => Some(Action::Command(cmd.to_string())),
@@ -620,8 +1290,8 @@ pub fn format_action(action: &Action) -> String {
         Action::Paste => "paste-buffer".to_string(),
         Action::Detach => "detach-client".to_string(),
         Action::RenameWindow => "rename-window".to_string(),
-        Action::WindowChooser => "choose-window".to_string(),
-        Action::SessionChooser => "choose-session".to_string(),
+        Action::WindowChooser => "choose-tree".to_string(),
+        Action::SessionChooser => "choose-tree -s".to_string(),
         Action::ZoomPane => "resize-pane -Z".to_string(),
         Action::MoveFocus(dir) => {
             let flag = match dir {
@@ -638,10 +1308,112 @@ pub fn format_action(action: &Action) -> String {
     }
 }
 
+/// Open a chooser on a client, the one prefix+w or prefix+s opens. The
+/// choosers are drawn by the client, so a choose-tree run inside the server
+/// (a hook, a menu item, a copy mode binding) asks the client to open one, as
+/// switch-client asks it to switch. The client that last sent input gets it,
+/// as with switch-client; with none known, every attached client does.
+///
+/// `template` is choose-tree's template argument (#912): the chooser runs it
+/// for the chosen row in place of its own switch.
+pub fn open_client_chooser(app: &AppState, kind: crate::choose_tree::ChooserKind, template: Option<&str>) {
+    let directive = crate::choose_tree::directive_line(kind, template);
+    if let Some(cid) = app.latest_client_id {
+        if crate::types::send_directive_to_client(cid, &directive) {
+            return;
+        }
+    }
+    crate::types::send_directive_to_all_clients(&directive);
+}
+
 /// Parse a command line string, respecting quoted arguments
+///
+/// Used by config files, `source-file`, the command prompt, key bindings and
+/// the CLI wire. Inside double quotes only `\"` and `\\` are decoded: every
+/// other backslash stays literal, because double quoted Windows paths such as
+/// `set -g default-shell "C:\Program Files\Git\bin\bash.exe"` are documented
+/// and common, and tmux's full escape set would turn `\b`, `\t`, `\n` in them
+/// into control characters. Control mode, whose clients escape the tmux way,
+/// uses [`parse_command_line_tmux`] instead.
 pub fn parse_command_line(line: &str) -> Vec<String> {
+    parse_command_line_impl(line, false)
+}
+
+/// Parse a control mode command line with tmux's escape rules inside double
+/// quotes (cmd-parse.y yylex_token_escape): `\n \r \t \e \a \b \f \v \s`,
+/// octal `\NNN`, `\uXXXX`, `\UXXXXXXXX`, and any other `\c` is `c` (so `\\`,
+/// `\"`, `\$`, `\~`). A control client is a program that escapes text the
+/// tmux way, so a buffer can carry a newline (issue #823). Single quoted and
+/// unquoted text follow the same rules as [`parse_command_line`].
+pub fn parse_command_line_tmux(line: &str) -> Vec<String> {
+    parse_command_line_impl(line, true)
+}
+
+/// Decode one tmux escape inside double quotes. `chars[i]` is the backslash.
+/// Pushes the decoded bytes and returns how many chars after the backslash
+/// were consumed, or `None` when tmux would reject the escape (bad octal,
+/// bad `\u`, backslash at the end); the caller then keeps the backslash
+/// literal instead of failing the whole command.
+fn decode_tmux_escape(chars: &[char], i: usize, out: &mut Vec<u8>) -> Option<usize> {
+    let c = *chars.get(i + 1)?;
+    let simple = match c {
+        'a' => Some(0x07u8),
+        'b' => Some(0x08),
+        'e' => Some(0x1b),
+        'f' => Some(0x0c),
+        's' => Some(b' '),
+        'v' => Some(0x0b),
+        'r' => Some(b'\r'),
+        'n' => Some(b'\n'),
+        't' => Some(b'\t'),
+        _ => None,
+    };
+    if let Some(b) = simple {
+        out.push(b);
+        return Some(1);
+    }
+    match c {
+        // Octal: exactly three digits, the first 0 to 3 (one byte).
+        '0'..='3' => {
+            let o2 = chars.get(i + 2)?.to_digit(8)?;
+            let o3 = chars.get(i + 3)?.to_digit(8)?;
+            let v = c.to_digit(8)? * 64 + o2 * 8 + o3;
+            out.push(v as u8);
+            Some(3)
+        }
+        '4'..='7' => None,
+        'u' | 'U' => {
+            let size = if c == 'u' { 4 } else { 8 };
+            let hex: String = chars.get(i + 2..i + 2 + size)?.iter().collect();
+            if !hex.chars().all(|h| h.is_ascii_hexdigit()) {
+                return None;
+            }
+            let ch = char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?;
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            Some(1 + size)
+        }
+        other => {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            Some(1)
+        }
+    }
+}
+
+fn parse_command_line_impl(line: &str, tmux_escapes: bool) -> Vec<String> {
     let mut args = Vec::new();
-    let mut current = String::new();
+    // Bytes, so an octal escape can add one byte of a UTF-8 sequence.
+    let mut current: Vec<u8> = Vec::new();
+    let push = |cur: &mut Vec<u8>, c: char| {
+        let mut buf = [0u8; 4];
+        cur.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
+    let finish = |cur: &mut Vec<u8>| -> String {
+        let s = String::from_utf8_lossy(cur).into_owned();
+        cur.clear();
+        s
+    };
     let mut in_double_quotes = false;
     let mut in_single_quotes = false;
     // Track whether the current token contained an explicit quote, so an
@@ -661,7 +1433,12 @@ pub fn parse_command_line(line: &str) -> Vec<String> {
             if c == '\'' {
                 in_single_quotes = false;
             } else {
-                current.push(c);
+                push(&mut current, c);
+            }
+        } else if c == '\\' && in_double_quotes && tmux_escapes {
+            match decode_tmux_escape(&chars, i, &mut current) {
+                Some(n) => i += n,
+                None => push(&mut current, c),
             }
         } else if c == '\\' && in_double_quotes {
             // Inside double quotes, recognise two escape sequences:
@@ -671,14 +1448,22 @@ pub fn parse_command_line(line: &str) -> Vec<String> {
             // Windows-native tool where backslash is the normal path
             // separator (e.g. "C:\Program Files\Git\bin\bash.exe").
             if i + 1 < chars.len() && chars[i + 1] == '"' {
-                current.push('"');
+                push(&mut current, '"');
                 i += 1; // skip the quote
             } else if i + 1 < chars.len() && chars[i + 1] == '\\' {
-                current.push('\\');
+                push(&mut current, '\\');
                 i += 1; // skip the second backslash
             } else {
-                current.push(c); // literal backslash
+                push(&mut current, c); // literal backslash
             }
+        } else if c == '\\' && matches!(chars.get(i + 1), Some('\'') | Some('"')) {
+            // Outside quotes `\'` and `\"` are a literal quote that joins the
+            // token, as in tmux (cmd-parse.y yylex_token: a `\` outside
+            // single quotes is an escape), so the POSIX idiom 'a'\''b' is
+            // one argument a'b (issue #823). Every other unquoted backslash
+            // stays literal for Windows paths (C:\Users\x, \\server\share).
+            push(&mut current, chars[i + 1]);
+            i += 1;
         } else if c == '"' {
             in_double_quotes = !in_double_quotes;
             had_quote = true;
@@ -687,18 +1472,17 @@ pub fn parse_command_line(line: &str) -> Vec<String> {
             had_quote = true;
         } else if c.is_whitespace() && !in_double_quotes {
             if !current.is_empty() || had_quote {
-                args.push(current.clone());
-                current.clear();
+                args.push(finish(&mut current));
             }
             had_quote = false;
         } else {
-            current.push(c);
+            push(&mut current, c);
         }
         i += 1;
     }
 
     if !current.is_empty() || had_quote {
-        args.push(current);
+        args.push(finish(&mut current));
     }
 
     args
@@ -788,10 +1572,49 @@ pub fn ensure_background(cmd: &str) -> String {
     cmd.to_string()
 }
 
+/// Hook firing trace, off unless `PSMUX_HOOK_DEBUG` names a file.
+///
+/// Issue #690 was one `select-window` running `after-select-window` twice, and
+/// the thing that settled it was a line per firing naming the control request
+/// that carried it (`FocusWindow` and then `SelectWindow`, one command, two
+/// slots).  Counting buffers proves a hook ran twice; only this says who ran it,
+/// so it stays, gated, for the next hook that fires the wrong number of times.
+/// Each line is `=== FIRE <event> [req=<tag>] pid=<pid> ===` followed by the
+/// psmux frames of the backtrace.
+pub fn hook_debug_path() -> Option<&'static str> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var("PSMUX_HOOK_DEBUG").ok().filter(|p| !p.is_empty()))
+        .as_deref()
+}
+
+/// Whether the trace is on, so a caller that has to build its event string can
+/// skip the allocation on the normal path.
+pub fn hook_debug_enabled() -> bool {
+    hook_debug_path().is_some()
+}
+
+pub fn hook_debug_trace(event: &str) {
+    let path = match hook_debug_path() {
+        Some(p) => p,
+        None => return,
+    };
+    use std::io::Write as _;
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "=== FIRE {} pid={} ===", event, std::process::id());
+        for line in bt.lines() {
+            if line.contains("psmux") && !line.contains("hook_debug_trace") {
+                let _ = writeln!(f, "    {}", line.trim());
+            }
+        }
+    }
+}
+
 /// Fire hooks for a given event.
 /// All run-shell commands from hooks are forced into background mode
 /// to avoid "running: ..." status bar noise and output popups.
 pub fn fire_hooks(app: &mut AppState, event: &str) {
+    hook_debug_trace(event);
     if let Some(commands) = app.hooks.get(event).cloned() {
         for cmd in commands {
             let bg_cmd = ensure_background(&cmd);
@@ -810,7 +1633,7 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
             app.display_map.clear();
             for (i, (path, _)) in rects.into_iter().enumerate() {
                 if i >= 10 { break; }
-                let digit = (i + app.pane_base_index) % 10;
+                let digit = (i + app.pane_base_index_of(app.active_idx)) % 10;
                 app.display_map.push((digit, path));
             }
             app.mode = Mode::PaneChooser { opened_at: Instant::now() };
@@ -821,7 +1644,7 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
         }
         Action::NewWindow => {
             let pty_system = portable_pty::native_pty_system();
-            create_window(&*pty_system, app, None, None)?;
+            create_window(&*pty_system, app, None, None, false)?;
         }
         Action::SplitHorizontal => {
             split_active(app, LayoutKind::Horizontal)?;
@@ -860,11 +1683,8 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
         Action::RenameWindow => {
             app.mode = Mode::RenamePrompt { input: String::new() };
         }
-        Action::WindowChooser | Action::SessionChooser => {
-            let tree = build_choose_tree(app);
-            let selected = tree.iter().position(|e| e.is_current_session && e.is_active_window && !e.is_session_header).unwrap_or(0);
-            app.mode = Mode::WindowChooser { selected, tree };
-        }
+        Action::WindowChooser => open_client_chooser(app, crate::choose_tree::ChooserKind::Tree, None),
+        Action::SessionChooser => open_client_chooser(app, crate::choose_tree::ChooserKind::Session, None),
         Action::ZoomPane => {
             toggle_zoom(app);
         }
@@ -898,17 +1718,28 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
 
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     if parts.is_empty() { return Ok(()); }
+    // A `command-alias` runs what it stands for, which the arms below know.
+    if crate::command_alias::read(&app.command_aliases).contains_key(parts[0]) {
+        return execute_command_string(app, &cmdline);
+    }
     match parts[0] {
         // Commands that need local (embedded-mode) handling.
         // In server mode the client sends these via TCP directly, so
         // execute_command_prompt() is only reached in embedded mode.
         "new-window" | "neww" => {
             let pty_system = portable_pty::native_pty_system();
-            create_window(&*pty_system, app, None, None)?;
+            create_window(&*pty_system, app, None, None, false)?;
         }
-        "split-window" | "splitw" | "split-pane" | "splitp" => {
+        "split-window" | "splitw" => {
             let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+            let zoom_after_split = parts.iter().any(|p| *p == "-Z");
+            if zoom_after_split {
+                unzoom_if_zoomed(app);
+            }
             split_active(app, kind)?;
+            if zoom_after_split {
+                toggle_zoom(app);
+            }
         }
         "kill-pane" | "killp" => { kill_active_pane(app)?; }
         "capture-pane" | "capturep" => { capture_active_pane(app)?; }
@@ -926,6 +1757,590 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
     Ok(())
 }
 
+/// The flags of tmux's `paste-buffer` (cmd-paste-buffer.c:36, args `"db:prSs:t:"`).
+///
+/// `-S` (no visual escaping of unprintable bytes) is parsed and ignored: psmux
+/// never applies tmux's `utf8_stravisx`, so its default already behaves as if
+/// `-S` were given.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PasteBufferArgs {
+    /// `-p`: wrap in `ESC[200~` / `ESC[201~`, but only if the pane asked for it.
+    pub bracket: bool,
+    /// `-b`: buffer name, or a decimal index into the paste stack.
+    pub buffer: Option<String>,
+    /// `-d`: delete the buffer once it has been pasted.
+    pub delete: bool,
+    /// The separator that replaces each newline, from `-s` or implied by `-r`.
+    /// `None` means tmux's default, a carriage return (cmd-paste-buffer.c:93);
+    /// see [`PasteBufferArgs::effective_separator`].
+    pub separator: Option<String>,
+    /// `-t`: target pane.
+    pub target: Option<String>,
+}
+
+impl PasteBufferArgs {
+    /// The separator actually written in place of each LF: `-s`, else LF for
+    /// `-r`, else CR (cmd-paste-buffer.c:88 to :95).
+    ///
+    /// Issue #719: `None` used to mean "leave the line endings to the pane
+    /// writer", on the belief that the writer emits CR.  Only the bracketed
+    /// writer does; a plain `paste-buffer` goes through the send-keys text path,
+    /// which writes LF as LF, so a multi line buffer reached the pane with LF
+    /// where tmux writes CR.
+    pub fn effective_separator(&self) -> &str {
+        self.separator.as_deref().unwrap_or("\r")
+    }
+}
+
+/// The exact text `paste-buffer` writes to the pane for `text`: every LF
+/// replaced by the separator, nothing else touched.  The `-p` brackets are
+/// added by the writer, and only when the pane asked for `?2004h`
+/// (cmd-paste-buffer.c:97 and :124).
+pub(crate) fn paste_buffer_payload(text: &str, pb: &PasteBufferArgs) -> String {
+    apply_separator(text, pb.effective_separator())
+}
+
+/// What the `-t` of a command on the in server route names, for the commands
+/// whose target is an existing window or pane (tmux CMD_FIND_WINDOW /
+/// CMD_FIND_PANE without CMD_FIND_WINDOW_INDEX).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InServerTarget {
+    Window,
+    Pane,
+}
+
+pub(crate) fn in_server_target_kind(cmd: &str) -> Option<InServerTarget> {
+    match cmd {
+        "kill-window" | "killw" | "rename-window" | "renamew" | "rotate-window" | "rotatew"
+        | "next-layout" | "nextl" | "previous-layout" | "prevl" | "select-window" | "selectw"
+        | "respawn-window" | "respawnw" | "resize-window" | "resizew" => Some(InServerTarget::Window),
+        "kill-pane" | "killp" | "respawn-pane" | "respawnp" | "resize-pane" | "resizep"
+        | "capture-pane" | "capturep" | "clear-history" | "clearhist" | "pipe-pane" | "pipep"
+        | "send-keys" | "send" | "display-message" | "display" | "select-layout" | "selectl"
+        | "paste-buffer" | "pasteb" | "split-window" | "splitw" => Some(InServerTarget::Pane),
+        _ => None,
+    }
+}
+
+/// Resolve a window or pane `-t` on the in server route to the `@id` or
+/// `%id` it names. `Ok(None)` leaves the target to the command as it is: an
+/// id already, a mouse, marked or layout token, or a session other than this
+/// one (routed elsewhere). `Err` is tmux's "can't find ..." message.
+pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: &str) -> Result<Option<String>, String> {
+    let t = t.trim();
+    let plain = crate::cli::strip_exact_match_prefix(t);
+    if plain.is_empty() || plain.starts_with('%') || plain.starts_with('@')
+        || plain == "~" || plain == "{marked}" || plain == "{mouse}" || t == "="
+    {
+        return Ok(None);
+    }
+    if let Some(colon) = t.find(':') {
+        let sess = crate::cli::strip_exact_match_prefix(&t[..colon]);
+        if !sess.is_empty() && sess != app.session_name {
+            return Ok(None);
+        }
+    }
+    match kind {
+        InServerTarget::Window => {
+            if plain.starts_with('{') && !matches!(plain, "{start}" | "{last}" | "{end}" | "{next}" | "{previous}") {
+                return Ok(None);
+            }
+            let pos = app.resolve_window_target(t)?;
+            Ok(Some(format!("@{}", app.windows[pos].id)))
+        }
+        InServerTarget::Pane => {
+            if plain.starts_with('{') {
+                return Ok(None);
+            }
+            // This session's own name, when no window has it, is the session
+            // and so its current pane, which may be a focused float; the
+            // tiled path below would name the pane under it.
+            if !t.contains(':') && plain == app.session_name
+                && !matches!(app.resolve_window_spec(t, false), Ok(crate::types::WindowTarget::Pos(_)))
+            {
+                return Ok(None);
+            }
+            // A bare index is a pane of the current window before it is a
+            // window (cmd_find_get_pane, cmd-find.c:575 to :600).
+            if !app.windows.is_empty() && plain.chars().all(|c| c.is_ascii_digit()) {
+                let win = &app.windows[app.active_idx.min(app.windows.len() - 1)];
+                if let Some(path) = plain.parse::<usize>().ok()
+                    .and_then(|i| i.checked_sub(app.pane_base_index_of(app.active_idx)))
+                    .and_then(|i| crate::tree::path_by_position(&win.root, i))
+                {
+                    return Ok(crate::tree::get_active_pane_id_at_path(&win.root, &path).map(|id| format!("%{}", id)));
+                }
+            }
+            let (wp, path) = crate::window_ops::resolve_pane_spec(app, t)?;
+            Ok(crate::tree::get_active_pane_id_at_path(&app.windows[wp].root, &path)
+                .map(|id| format!("%{}", id)))
+        }
+    }
+}
+
+/// The `-t` of an in-server `select-pane -d/-e` or `last-pane -d/-e`, in the
+/// shape `server::set_pane_input_off` resolves.
+fn input_toggle_temp_target(raw_target: Option<&str>) -> Option<crate::types::TempTarget> {
+    raw_target.map(|t| {
+        let pt = crate::cli::parse_target(t);
+        crate::types::TempTarget {
+            win: pt.window,
+            win_is_id: pt.window_is_id,
+            win_name: pt.window_name,
+            pane: pt.pane,
+            pane_is_id: pt.pane_is_id,
+            session: None, pane_check_only: false,
+        }
+    })
+}
+
+/// Write a `paste-buffer` payload to the active pane.  Neither route rewrites
+/// line endings again: `-p` uses the verbatim paste writer, plain text the
+/// send-keys text path, so `-r` keeps its LF and a CR in the buffer stays a CR,
+/// as in tmux.
+fn deliver_paste_buffer(app: &mut AppState, text: &str, pb: &PasteBufferArgs) -> io::Result<()> {
+    let payload = paste_buffer_payload(text, pb);
+    if payload.is_empty() {
+        return Ok(());
+    }
+    // select-pane -d: cmd-paste-buffer.c writes only `if (~wp->flags &
+    // PANE_INPUTOFF)`, and that is not an error (a `-d` still deletes the
+    // buffer, in the caller).  Checked here and not just in the writers
+    // below because a pane in copy mode would otherwise take the text as
+    // copy mode keys, where tmux writes nothing at all.
+    if !crate::input::input_target_accepts_input(app) {
+        return Ok(());
+    }
+    if pb.bracket {
+        crate::input::send_paste_buffer_to_active(app, &payload)
+    } else {
+        crate::input::send_text_to_active(app, &payload)
+    }
+}
+
+/// Parse a `paste-buffer` command line.
+///
+/// `args` is the command line WITHOUT the command name.  In the in server
+/// dispatch it is whitespace split, so a separator containing a space cannot be
+/// expressed there; that is a property of that dispatch, shared with every other
+/// command it serves, not of the flag handling.
+pub(crate) fn parse_paste_buffer_args(args: &[&str]) -> PasteBufferArgs {
+    let mut pb = PasteBufferArgs::default();
+    let mut raw_newlines = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-p" => pb.bracket = true,
+            "-d" => pb.delete = true,
+            "-r" => raw_newlines = true,
+            "-S" => {}
+            "-b" => { pb.buffer = args.get(i + 1).map(|s| s.to_string()); i += 1; }
+            "-s" => { pb.separator = args.get(i + 1).map(|s| s.to_string()); i += 1; }
+            "-t" => { pb.target = args.get(i + 1).map(|s| s.to_string()); i += 1; }
+            _ => {}
+        }
+        i += 1;
+    }
+    if pb.separator.is_none() && raw_newlines {
+        pb.separator = Some("\n".to_string());
+    }
+    pb
+}
+
+/// Replace every newline with `sep`, the way cmd-paste-buffer.c:103 to :122
+/// walks the buffer and writes the separator after each line.
+///
+/// A CRLF counts as ONE newline.  tmux splits on LF only, which on Unix is the
+/// whole story; on Windows a buffer loaded from a file (`load-buffer`) or taken
+/// from the clipboard ends its lines with CRLF, and splitting on the LF alone
+/// would leave the CR in front of the separator, so every line would be
+/// submitted twice (CR CR).  A lone CR is data and is left alone.
+pub(crate) fn apply_separator(text: &str, sep: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('\n') {
+        let line = &rest[..i];
+        out.push_str(line.strip_suffix('\r').unwrap_or(line));
+        out.push_str(sep);
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Point `app` at the pane `-t` names for the duration of `f`, then put the
+/// focus back exactly where it was.
+///
+/// tmux resolves `paste-buffer -t` with `cmd_find_pane` and writes to that
+/// pane's event (cmd-paste-buffer.c:66 and :124), so the target is the pane the
+/// text lands in, not the one the user is looking at.  psmux's paste writers
+/// take the pane from `app.active_idx` / `active_path`, so the shortest honest
+/// equivalent is to move that cursor, paste, and move it back, all inside one
+/// server request so nothing else can observe the move.
+///
+/// The CLI route used to issue a `FocusTargetTemp` before this, a focus that
+/// was spent by the first non-focus request the server handled, which
+/// is why a `-t` used to reach the buffer lookup and never the paste
+/// (gabri-ns, #684 follow up).
+///
+/// Returns tmux's error text when the target does not resolve.
+fn with_paste_target<T>(
+    app: &mut AppState,
+    target: &str,
+    f: impl FnOnce(&mut AppState) -> io::Result<T>,
+) -> io::Result<Result<T, String>> {
+    let pt = crate::cli::parse_target(target);
+    let win_idx: Option<usize> = if let Some(w) = pt.window {
+        if pt.window_is_id {
+            app.windows.iter().position(|x| x.id == w)
+        } else {
+            app.win_pos(w)
+        }
+    } else if let Some(ref name) = pt.window_name {
+        app.windows.iter().position(|x| x.name == *name)
+    } else if pt.pane_is_id {
+        // A bare `%N` names a pane in any window (issue #332).
+        pt.pane
+            .and_then(|p| crate::tree::find_pane_by_id_global(app, p))
+            .map(|(wi, _)| wi)
+    } else {
+        Some(app.active_idx)
+    };
+    let win_idx = match win_idx {
+        Some(i) if i < app.windows.len() => i,
+        _ => {
+            let spec = if let Some(w) = pt.window {
+                if pt.window_is_id { format!("@{}", w) } else { w.to_string() }
+            } else if let Some(ref name) = pt.window_name {
+                name.clone()
+            } else if let Some(p) = pt.pane {
+                return Ok(Err(format!("can't find pane: %{}", p)));
+            } else {
+                target.to_string()
+            };
+            return Ok(Err(format!("can't find window: {}", spec)));
+        }
+    };
+
+    let saved_idx = app.active_idx;
+    let saved_path = app.windows[saved_idx].active_path.clone();
+    app.active_idx = win_idx;
+    if let Some(p) = pt.pane {
+        if pt.pane_is_id {
+            if crate::tree::find_pane_by_id_global(app, p).is_none() {
+                app.active_idx = saved_idx;
+                return Ok(Err(format!("can't find pane: %{}", p)));
+            }
+            crate::tree::focus_pane_by_id_no_mru(app, p);
+        } else {
+            let pos = p.checked_sub(app.pane_base_index_of(win_idx))
+                .filter(|pos| *pos < crate::tree::count_panes(&app.windows[win_idx].root));
+            let Some(pos) = pos else {
+                app.active_idx = saved_idx;
+                return Ok(Err(format!("can't find pane: {}", p)));
+            };
+            crate::tree::focus_pane_by_index(app, pos);
+        }
+    }
+    let out = f(app);
+    if saved_idx < app.windows.len() {
+        app.active_idx = saved_idx;
+        app.windows[saved_idx].active_path = saved_path;
+    }
+    out.map(Ok)
+}
+
+/// Run a parsed `paste-buffer` against the pane `-t` names, or the active pane
+/// (issue #684).
+///
+/// The `-p` split mirrors `server/connection.rs`: bracketed pastes take the
+/// paste route, which is the one that consults the pane's `?2004h` and picks
+/// its delivery channel; everything else is plain text, which is what tmux does
+/// for a `paste-buffer` with no `-p` (cmd-paste-buffer.c:97).
+///
+/// `Ok(Some(msg))` is tmux's error text for the caller to report: the CLI route
+/// writes it to the client as `ERROR: ...`, the in server route puts it in the
+/// status line.
+pub(crate) fn run_paste_buffer(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result<Option<String>> {
+    match pb.target.clone() {
+        Some(t) => match with_paste_target(app, &t, |app| run_paste_buffer_here(app, pb))? {
+            Ok(inner) => Ok(inner),
+            Err(msg) => Ok(Some(msg)),
+        },
+        None => run_paste_buffer_here(app, pb),
+    }
+}
+
+fn run_paste_buffer_here(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result<Option<String>> {
+    // A named register selected in copy mode ("x p) still wins when no explicit
+    // buffer was asked for, the behaviour paste_latest gave prefix + ].
+    if pb.buffer.is_none() {
+        if let Some(reg) = app.copy_register.take() {
+            if let Some(text) = app.named_registers.get(&reg).cloned() {
+                deliver_paste_buffer(app, &text, pb)?;
+            }
+            return Ok(None);
+        }
+    }
+
+    let text = match &pb.buffer {
+        Some(name) => {
+            // By name only, automatic or named (paste_get_name,
+            // cmd-paste-buffer.c:80): `-b 1` is the buffer named 1.
+            match app.paste_get(name).map(str::to_string) {
+                Some(t) => t,
+                None => {
+                    // tmux: "no buffer <name>" (cmd-paste-buffer.c:82).
+                    return Ok(Some(format!("no buffer {}", name)));
+                }
+            }
+        }
+        None => {
+            let top = app.paste_top().unwrap_or_default().to_string();
+            if top.is_empty() {
+                // Issue #428: an empty stack falls back to the OS clipboard, the
+                // same fallback server/connection.rs applies.
+                crate::clipboard::read_from_system_clipboard().unwrap_or_default()
+            } else {
+                top
+            }
+        }
+    };
+
+    deliver_paste_buffer(app, &text, pb)?;
+
+    if pb.delete {
+        // paste_delete announces it (%paste-buffer-deleted, paste.c paste_free).
+        let name = match &pb.buffer {
+            Some(name) => Some(name.clone()),
+            None => app.paste_buffers.first().map(|b| b.name.clone()),
+        };
+        if let Some(name) = name {
+            app.paste_delete(&name);
+        }
+    }
+    Ok(None)
+}
+
+/// A parsed `set-buffer`, run by run_set_buffer. Every route parses with
+/// parse_set_buffer_args: the CLI, the server's command dispatch (if-shell, a
+/// key binding), execute_command_string (hooks, menus) and control mode
+/// (#813).
+pub(crate) struct SetBufferArgs {
+    /// `-b`: the buffer by name; none means a new automatic buffer.
+    pub name: Option<String>,
+    pub content: String,
+    /// `-w`: also put the text on the system clipboard.
+    pub clipboard: bool,
+    /// `-a`: append to the buffer instead of replacing it.
+    pub append: bool,
+    /// `-n`: rename the buffer instead of setting it.
+    pub new_name: Option<String>,
+    /// `-t`: the target client. Only a session name means anything here: see
+    /// set_buffer_foreign_session.
+    pub target: Option<String>,
+}
+
+/// Parse `set-buffer [-aw] [-b name] [-n new-name] [-t target-client]
+/// [-H hex] [--] data`, as tmux's `ab:t:n:w` (cmd-set-buffer.c:36). Flags
+/// may be bundled (`-ab NAME`, `-bNAME`, `-nNEW`), as args_parse_flags reads
+/// them. `-t` names the client whose terminal `-w` would set; psmux's `-w`
+/// sets the system clipboard, so the value is kept only to refuse one that
+/// names another session (set_buffer_foreign_session). `-H` is psmux's own
+/// byte-exact wire form of the data.
+///
+/// `Ok(None)` is an empty data argument, which tmux accepts and ignores
+/// (cmd-set-buffer.c returns before paste_set when the length is 0); no data
+/// at all is its "no data specified" error.
+pub(crate) fn parse_set_buffer_args<S: AsRef<str>>(args: &[S]) -> Result<Option<SetBufferArgs>, String> {
+    let args = crate::cli::expand_flag_clusters("set-buffer", args);
+    let mut buf_name: Option<String> = None;
+    let mut new_name: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut append = false;
+    let mut propagate_to_clipboard = false;
+    let mut hex_content: Option<&str> = None;
+    let mut i = 0;
+    let mut content_parts: Vec<&str> = Vec::new();
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "-b" {
+            if let Some(name) = args.get(i + 1) {
+                buf_name = Some(name.to_string());
+            }
+            i += 2; // skip -b and its value (buffer name)
+        } else if arg == "-n" {
+            new_name = args.get(i + 1).map(|n| n.to_string());
+            i += 2;
+        } else if arg == "-t" {
+            target = args.get(i + 1).map(|t| t.to_string());
+            i += 2;
+        } else if arg == "-a" {
+            append = true;
+            i += 1;
+        } else if arg == "-w" {
+            propagate_to_clipboard = true;
+            i += 1;
+        } else if arg == "-H" {
+            // Byte-exact content, hex encoded. Bare words cannot carry a
+            // buffer: this line has already been split on `;`, tokenized
+            // with quote grouping stripped, and had runs of whitespace
+            // collapsed, so quotes, tabs, control bytes and newlines are
+            // gone before the handler runs. tmux's paste is verbatim, and
+            // for a buffer pasted at a shell prompt the lost quoting is a
+            // DIFFERENT command, not cosmetic damage.
+            hex_content = args.get(i + 1).map(String::as_str);
+            i += 2;
+        } else if arg == "--" {
+            // End of options: the data follows even when it starts with
+            // `-` (issue #795: `set-buffer -- -x=foo` stored nothing).
+            content_parts.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            i += 1; // skip unknown flags
+        } else {
+            content_parts.extend(args[i..].iter().map(String::as_str));
+            break;
+        }
+    }
+    let clipboard = propagate_to_clipboard;
+    if new_name.is_some() {
+        return Ok(Some(SetBufferArgs { name: buf_name, content: String::new(), clipboard, append, new_name, target }));
+    }
+    // A control-mode client is an external boundary, so a bad payload is
+    // refused loudly rather than stored half-decoded. psmux buffers are
+    // Rust `String`s, so non-UTF-8 bytes are rejected here too (the CLI
+    // never sends them: load-buffer reads the file as UTF-8 and errors on
+    // the file itself).
+    let content = match hex_content {
+        Some(hex) => crate::util::hex_decode(hex)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(|| "set-buffer: -H requires hex-encoded UTF-8".to_string())?,
+        None if content_parts.is_empty() => return Err("no data specified".to_string()),
+        None => content_parts.join(" "),
+    };
+    if content.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SetBufferArgs { name: buf_name, content, clipboard, append, new_name, target }))
+}
+
+/// The line the CLI sends for a parsed set-buffer. The data goes as `-H` hex,
+/// the same byte-exact wire as load-buffer: `set-buffer "a  'b'"` reached the
+/// server as three bare words and came back out of paste-buffer as `a b`.
+/// `-w` stays with the CLI, which sets the clipboard itself. `-t` goes along,
+/// so the server can refuse one that names another session.
+pub(crate) fn set_buffer_wire_line(set: &SetBufferArgs) -> String {
+    let mut line = "set-buffer".to_string();
+    if set.append {
+        line.push_str(" -a");
+    }
+    if let Some(name) = &set.name {
+        line.push_str(&format!(" -b {}", crate::util::quote_arg(name)));
+    }
+    if let Some(target) = &set.target {
+        line.push_str(&format!(" -t {}", crate::util::quote_arg(target)));
+    }
+    if let Some(new) = &set.new_name {
+        line.push_str(&format!(" -n {}", crate::util::quote_arg(new)));
+    } else {
+        line.push_str(&format!(" -H {}", crate::util::hex_encode(set.content.as_bytes())));
+    }
+    line.push('\n');
+    line
+}
+
+/// The session a set-buffer `-t` names, when that is a live session other
+/// than the one `app` serves.
+///
+/// In tmux `-t` is a client and the buffers are server wide, so the command
+/// never reaches another store. psmux keeps paste buffers per session, one
+/// server each, so a server cannot set another session's buffer. Like the
+/// cross-session window and pane commands (foreign_session_in_spec), that is
+/// an error instead of a silent write to this session's buffers. Any other
+/// value, such as a client name, is tmux's missing client and is ignored
+/// (CMD_CLIENT_CANFAIL, cmd-set-buffer.c:40). The CLI routes a `-t` naming a
+/// session to that session's server, where it is this server's own.
+pub(crate) fn set_buffer_foreign_session(app: &AppState, target: &str) -> Option<String> {
+    let spec = if target.contains(':') { target.to_string() } else { format!("{}:", target) };
+    foreign_session_in_spec(app, &spec)
+}
+
+/// The error for a set-buffer whose `-t` names another session.
+pub(crate) fn set_buffer_cross_session_refusal(session: &str) -> String {
+    format!(
+        "set-buffer: {} is another session (cross-session set-buffer is not supported: each session runs in its own psmux server, with its own paste buffers)",
+        session
+    )
+}
+
+/// Refuse a set-buffer whose `-t` names another session, then run it.
+pub(crate) fn run_set_buffer_args(app: &mut AppState, set: &SetBufferArgs) -> Result<(), String> {
+    if let Some(session) = set.target.as_deref().and_then(|t| set_buffer_foreign_session(app, t)) {
+        return Err(set_buffer_cross_session_refusal(&session));
+    }
+    if set.clipboard && set.new_name.is_none() {
+        crate::clipboard::copy_to_system_clipboard(&set.content);
+    }
+    run_set_buffer(app, set.name.as_deref(), &set.content, set.append, set.new_name.as_deref())
+}
+
+/// set-buffer as cmd-set-buffer.c runs it: `-n` renames the `-b` buffer (or
+/// the newest one), otherwise the data replaces the `-b` buffer (`-a`
+/// appends to it) or becomes a new automatic buffer. Empty data changes
+/// nothing. `Err` is tmux's message.
+pub(crate) fn run_set_buffer(
+    app: &mut AppState,
+    name: Option<&str>,
+    data: &str,
+    append: bool,
+    new_name: Option<&str>,
+) -> Result<(), String> {
+    if let Some(new) = new_name {
+        let from = match name {
+            Some(n) if app.paste_get(n).is_some() => n.to_string(),
+            Some(n) => return Err(format!("unknown buffer: {}", n)),
+            None => app.paste_buffers.first().map(|b| b.name.clone()).ok_or("no buffer")?,
+        };
+        // paste.c paste_rename.
+        if new.is_empty() {
+            return Err("new name is empty".to_string());
+        }
+        if from == new {
+            return Ok(());
+        }
+        let text = app.paste_get(&from).unwrap_or_default().to_string();
+        app.paste_delete(&from);
+        app.paste_set(new, text);
+        return Ok(());
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    match name {
+        Some(n) => {
+            let text = if append { format!("{}{}", app.paste_get(n).unwrap_or(""), data) } else { data.to_string() };
+            app.paste_set(n, text);
+        }
+        None => app.paste_add(data.to_string()),
+    }
+    Ok(())
+}
+
+/// delete-buffer as cmd-set-buffer.c runs it: the `-b` buffer, or the newest
+/// automatic one.
+pub(crate) fn run_delete_buffer(app: &mut AppState, name: Option<&str>) -> Result<(), String> {
+    let target = match name {
+        Some(n) => n.to_string(),
+        None => app.paste_buffers.first().map(|b| b.name.clone()).ok_or("no buffer")?,
+    };
+    if app.paste_delete(&target) {
+        Ok(())
+    } else {
+        Err(format!("unknown buffer: {}", target))
+    }
+}
+
 /// Execute a command string (used by menus, hooks, confirm dialogs, etc.)
 pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     // Split on \; or ; to support command chaining (issue #192)
@@ -939,31 +2354,147 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     execute_command_string_single(app, cmd)
 }
 
+/// Join parsed arguments back into a line that parses to the same arguments.
+fn requote(args: &[&str]) -> String {
+    args.iter().map(|a| crate::util::quote_arg_if_needed(a)).collect::<Vec<_>>().join(" ")
+}
+
 fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    // `command-alias` is expanded ahead of the arms below, as tmux expands an
+    // alias before it looks the command up. Only a name no arm knew reached
+    // the server's expansion before, with its words split on whitespace. The
+    // alias's own commands are not expanded again (tmux CMD_PARSE_NOALIAS).
+    let expanded = crate::command_alias::read(&app.command_aliases).expand(&parse_command_line(cmd));
+    if let Some(commands) = expanded {
+        for words in commands {
+            execute_unaliased_command(app, &crate::command_alias::command_line(&words))?;
+        }
+        return Ok(());
+    }
+    execute_unaliased_command(app, cmd)
+}
+
+fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
+    // Quotes group and are removed here, as tmux's command parser does and as
+    // the server's own command line handler (connection.rs) already does. A
+    // whitespace split kept them: a copy mode prompt's `rename-window '%%'`
+    // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
+    // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
+    let tokens = parse_command_line(cmd);
+    let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }
-    
+
+    // Issue #635: this is the route menus, hooks, confirm dialogs, the command
+    // prompt and key bindings take. A value-taking flag with no value must not
+    // fall through to the DEFAULT target here either — `kill-window -t` bound
+    // to a key used to kill the current window silently.
+    if let Err(flag_error) = crate::cli::validate_command_line_flags(&parts) {
+        app.status_message = Some((flag_error, std::time::Instant::now(), None));
+        return Ok(());
+    }
+
+    // A bare `-t` name of a window or pane command on this route (hooks,
+    // menus, confirm dialogs) is resolved here by tmux's rules (cmd-find.c,
+    // a window of this session before a session name) and rewritten to the
+    // `@id` / `%id` it names, so the arms below and the server route a
+    // command is forwarded to agree on it. A name matching nothing is tmux's
+    // error and the command does not run: parse_target filed it as a session
+    // and `kill-window -t keywin` killed the CURRENT window.
+    let rewritten: Vec<String>;
+    let rewritten_cmd: String;
+    let mut parts = parts;
+    let mut cmd = cmd;
+    let mut has_target = false;
+    if let Some(kind) = in_server_target_kind(parts[0]) {
+        if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
+            if let Some(t) = parts.get(t_pos + 1) {
+                has_target = true;
+                let resolved = if crate::cli::bare_target_token(t) {
+                    resolve_in_server_target(app, kind, t)
+                } else {
+                    Ok(None)
+                };
+                match resolved {
+                    Ok(Some(id)) => {
+                        rewritten = parts.iter().enumerate()
+                            .map(|(i, p)| if i == t_pos + 1 { id.clone() } else { p.to_string() })
+                            .collect();
+                        parts = rewritten.iter().map(String::as_str).collect();
+                        rewritten_cmd = requote(&parts);
+                        cmd = &rewritten_cmd;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        app.status_message = Some((e, std::time::Instant::now(), None));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    // These arms act on the current window or pane and never read `-t`; with
+    // one, the server route runs the command against it.
+    if has_target && matches!(parts[0],
+        "kill-pane" | "killp" | "rename-window" | "renamew" | "rotate-window" | "rotatew"
+        | "next-layout" | "nextl" | "previous-layout" | "prevl" | "clear-history" | "clearhist"
+        | "capture-pane" | "capturep" | "resize-pane" | "resizep")
+    {
+        if let Some(port) = app.control_port {
+            let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            return Ok(());
+        }
+    }
+
+
     match parts[0] {
         "new-window" | "neww" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "new-window\n", &app.session_key);
+                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             }
         }
-        "split-window" | "splitw" | "split-pane" | "splitp" => {
+        "split-window" | "splitw" => {
             if let Some(port) = app.control_port {
                 // Forward the full command string to preserve -c, -d, -p etc. flags
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            } else if parts.iter().any(|p| *p == "-Z") {
+                let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+                unzoom_if_zoomed(app);
+                split_active(app, kind)?;
+                toggle_zoom(app);
             }
         }
         "kill-pane" => {
             let _ = kill_active_pane(app);
         }
         "kill-window" | "killw" => {
-            if app.windows.len() > 1 {
-                let mut win = app.windows.remove(app.active_idx);
-                kill_all_children(&mut win.root);
-                if app.active_idx >= app.windows.len() {
-                    app.active_idx = app.windows.len() - 1;
+            // Resolve an explicit -t here; an unresolvable target is an error,
+            // not a fallback to the active window (tmux: "can't find window").
+            let mut removed_pos = Some(app.active_idx);
+            if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
+                if let Some(t) = parts.get(t_pos + 1) {
+                    // cmd_find_get_window: a bare word is a window of this
+                    // session before it is this session's name, and one
+                    // naming neither is an error, never the current window.
+                    removed_pos = match app.resolve_window_target(t) {
+                        Ok(pos) => Some(pos),
+                        Err(e) => {
+                            app.status_message = Some((e, std::time::Instant::now(), None));
+                            None
+                        }
+                    };
+                }
+            }
+            if let Some(pos) = removed_pos {
+                if app.windows.len() > 1 && pos < app.windows.len() {
+                    let mut win = app.windows.remove(pos);
+                    kill_all_children(&mut win.root);
+                    app.on_window_removed(pos);
+                    if app.active_idx > pos {
+                        app.active_idx -= 1;
+                    }
+                    if app.active_idx >= app.windows.len() {
+                        app.active_idx = app.windows.len() - 1;
+                    }
                 }
             }
         }
@@ -984,40 +2515,97 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "last-window" | "last" => {
-            if app.last_window_idx < app.windows.len() {
+            if let Some(last) = app.last_window_pos() {
                 switch_with_copy_save(app, |app| {
                     let tmp = app.active_idx;
-                    app.active_idx = app.last_window_idx;
+                    app.active_idx = last;
                     app.last_window_idx = tmp;
                 });
+            } else {
+                app.status_message = Some(("no last window".to_string(), std::time::Instant::now(), None));
             }
         }
         "select-window" | "selectw" => {
+            // -T on the current window selects the last window, and with no
+            // last window is the error "no last window" (tmux 3.8,
+            // cmd-select-window.c:131-138). With no -t the target is the
+            // current window. It used to be ignored on this route.
+            let toggle = parts.contains(&"-T")
+                && !parts.iter().any(|p| matches!(*p, "-l" | "-n" | "-p"));
+            if toggle && !parts.contains(&"-t") {
+                match crate::server::temp_target::select_window_destination(app, app.active_idx, true) {
+                    Ok(dest) => switch_with_copy_save(app, |app| {
+                        app.last_window_idx = app.active_idx;
+                        app.active_idx = dest;
+                    }),
+                    Err(e) => app.status_message = Some((e, std::time::Instant::now(), None)),
+                }
+                return Ok(());
+            }
             if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
                 if let Some(t) = parts.get(t_pos + 1) {
-                    if let Some(idx) = parse_window_target(t) {
-                        if idx >= app.window_base_index {
-                            let internal_idx = idx - app.window_base_index;
-                            if internal_idx < app.windows.len() {
-                                switch_with_copy_save(app, |app| {
-                                    app.last_window_idx = app.active_idx;
-                                    app.active_idx = internal_idx;
-                                });
+                    // The shared #602 resolver, so `+1`, `!` and `{end}` mean
+                    // here what they mean to move-window (#693 item 4).
+                    // `parse_window_target` only ever understood a plain
+                    // index, so every symbolic form was a silent no-op.
+                    // The pane part is only checked, never focused, as on the
+                    // server's own select-window path.
+                    let pane = crate::server::connection::select_window_pane_part(Some(t));
+                    let resolved = match crate::server::connection::select_window_spec(Some(t)) {
+                        Some(spec) => crate::server::temp_target::select_window_pos(app, &spec, pane.as_deref()).ok(),
+                        None if pane.is_some() => crate::server::temp_target::select_window_pos(app, "", pane.as_deref()).ok(),
+                        None => parse_window_target(t).and_then(|idx| app.win_pos(idx)),
+                    };
+                    // Selecting the current window changes nothing, the last
+                    // window included (session_set_current returns early when
+                    // wl is already curw); it used to become the last window.
+                    // With -T the current window toggles to the last one.
+                    let resolved = match resolved {
+                        Some(pos) => match crate::server::temp_target::select_window_destination(app, pos, toggle) {
+                            Ok(dest) => Some(dest),
+                            Err(e) => {
+                                app.status_message = Some((e, std::time::Instant::now(), None));
+                                None
                             }
-                        }
+                        },
+                        None => None,
+                    };
+                    if let Some(internal_idx) = resolved.filter(|&i| i != app.active_idx) {
+                        switch_with_copy_save(app, |app| {
+                            app.last_window_idx = app.active_idx;
+                            app.active_idx = internal_idx;
+                        });
                     }
                 }
             }
         }
         "select-pane" | "selectp" => {
+            // select-pane -d / -e (tmux PANE_INPUTOFF) from a key binding,
+            // hook, menu or the command prompt: the same rule and the same
+            // server helper as the client routes, selecting nothing.
+            // The getopt walk, so a clustered `-dt %1` names %1 here too.
+            let raw_target = crate::server::connection::select_pane_target_arg(&parts[1..]);
+            if let Some((off, last)) = crate::server::connection::select_pane_input_toggle(&parts[1..], raw_target) {
+                if let Err(e) = crate::server::set_pane_input_off(app, input_toggle_temp_target(raw_target).as_ref(), off, last) {
+                    app.status_message = Some((e, Instant::now(), None));
+                }
+                return Ok(());
+            }
             // Save/restore copy mode across pane switches (tmux parity #43)
             let is_last = parts.iter().any(|p| *p == "-l");
             if is_last {
+                // One rule for what "the last pane" is, tmux's
+                // cmd-select-pane.c:165-177 (#693 item 5).
+                let target = crate::server::last_pane_path(app);
+                if target.is_none() {
+                    app.status_message = Some(("no last pane".to_string(), Instant::now(), None));
+                    return Ok(());
+                }
                 switch_with_copy_save(app, |app| {
-                    let win = &mut app.windows[app.active_idx];
-                    if !app.last_pane_path.is_empty() {
+                    if let Some(t) = target {
+                        let win = &mut app.windows[app.active_idx];
                         let tmp = win.active_path.clone();
-                        win.active_path = app.last_pane_path.clone();
+                        win.active_path = t;
                         app.last_pane_path = tmp;
                     }
                 });
@@ -1085,26 +2673,49 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 });
             }
         }
+        "last-pane" | "lastp" if crate::server::connection::last_pane_input_toggle(&parts[1..]).is_some() => {
+            // last-pane -d / -e: select-pane -l -d / -e (cmd-select-pane.c
+            // runs last-pane through the same -l branch), selecting nothing.
+            let off = crate::server::connection::last_pane_input_toggle(&parts[1..]).unwrap_or(true);
+            let raw_target = crate::server::connection::select_pane_target_arg(&parts[1..]);
+            if let Err(e) = crate::server::set_pane_input_off(app, input_toggle_temp_target(raw_target).as_ref(), off, true) {
+                app.status_message = Some((e, Instant::now(), None));
+            }
+        }
         "last-pane" | "lastp" => {
-            switch_with_copy_save(app, |app| {
-                let win = &mut app.windows[app.active_idx];
-                if !app.last_pane_path.is_empty() {
-                    let tmp = win.active_path.clone();
-                    win.active_path = app.last_pane_path.clone();
-                    app.last_pane_path = tmp;
+            let target = crate::server::last_pane_path(app);
+            match target {
+                None => {
+                    app.status_message = Some(("no last pane".to_string(), Instant::now(), None));
                 }
-            });
+                Some(t) => {
+                    switch_with_copy_save(app, |app| {
+                        let win = &mut app.windows[app.active_idx];
+                        let tmp = win.active_path.clone();
+                        win.active_path = t;
+                        app.last_pane_path = tmp;
+                    });
+                }
+            }
         }
         "rename-window" | "renamew" => {
-            if let Some(name) = parts.get(1) {
+            if let Some(name) = crate::cli::first_operand("rename-window", &parts[1..]) {
+                // tmux parity (#552): the argument is a format, expanded
+                // against the window being renamed (cmd-rename-window.c uses
+                // format_single_from_target), so `rename-window
+                // '#{s/^XX //:window_name}'` transforms the current name.
+                // #647 (WIN-03): tmux runs every window name through
+                // clean_name (tmux.c:303), so a control byte can never reach
+                // #{window_name} and break a tab or newline separated record.
+                let name = crate::util::clean_name(&crate::format::expand_format(name, app));
                 if app.active_idx < app.windows.len() {
                     let win = &mut app.windows[app.active_idx];
-                    win.name = name.to_string();
+                    win.name = name.clone();
                     win.manual_rename = true;
                 }
                 // Forward to server so external queries (display-message, list-windows) see the new name
                 if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("rename-window {}\n", crate::util::quote_arg(name)), &app.session_key);
+                    let _ = send_control_to_port(port, &format!("rename-window {}\n", crate::util::quote_arg(&name)), &app.session_key);
                 }
             }
         }
@@ -1132,23 +2743,17 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             toggle_zoom(app);
         }
         "copy-mode" => {
-            if parts.iter().any(|a| *a == "-u") {
-                if app.scroll_enter_copy_mode {
-                    enter_copy_mode(app);
-                    let half = app.windows.get(app.active_idx)
-                        .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
-                        .map(|p| p.last_rows as usize).unwrap_or(20);
-                    scroll_copy_up(app, half);
-                } else {
-                    // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
-                    if let Some(win) = app.windows.get_mut(app.active_idx) {
-                        if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                            let _ = pane.writer.write_all(b"\x1b[5~");
-                        }
+            let flags = crate::copy_mode::CopyModeFlags::parse(&parts[1..]);
+            if crate::copy_mode::run_copy_mode_command(app, flags)
+                == crate::copy_mode::CopyModeOutcome::ForwardPageUp
+            {
+                // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
+                if let Some(win) = app.windows.get_mut(app.active_idx) {
+                    // A PageUp KEY for the program: not for an input-off pane.
+                    if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path).filter(|p| p.accepts_input()) {
+                        let _ = pane.writer.write_all(b"\x1b[5~");
                     }
                 }
-            } else {
-                enter_copy_mode(app);
             }
         }
         "display-panes" | "displayp" => {
@@ -1158,13 +2763,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             app.display_map.clear();
             for (i, (path, _)) in rects.into_iter().enumerate() {
                 if i >= 10 { break; }
-                let digit = (i + app.pane_base_index) % 10;
+                let digit = (i + app.pane_base_index_of(app.active_idx)) % 10;
                 app.display_map.push((digit, path));
             }
             app.mode = Mode::PaneChooser { opened_at: Instant::now() };
         }
         "confirm-before" | "confirm" => {
-            let rest = parts[1..].join(" ");
+            // Quoted again where needed: the command is parsed a second time
+            // when it runs.
+            let rest = requote(&parts[1..]);
             app.mode = Mode::ConfirmMode {
                 prompt: format!("Run '{}'?", rest),
                 command: rest,
@@ -1172,65 +2779,44 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             };
         }
         "display-menu" | "menu" => {
-            let rest = parts[1..].join(" ");
+            // parse_menu_definition reads quoted items, so they are quoted again.
+            let rest = requote(&parts[1..]);
             let menu = parse_menu_definition(&rest, None, None);
             if !menu.items.is_empty() {
                 app.mode = Mode::MenuMode { menu };
             }
         }
         "display-popup" | "popup" => {
-            // Parse -w width, -h height, -E close-on-exit, -d start-dir flags
-            let mut width_spec = "80".to_string();
-            let mut height_spec = "24".to_string();
-            let mut start_dir: Option<String> = None;
-            let close_on_exit = parts.iter().any(|p| *p == "-E");
-            let mut skip_indices = std::collections::HashSet::new();
-            skip_indices.insert(0); // skip the command name itself
-            let mut i = 1;
-            while i < parts.len() {
-                match parts[i] {
-                    "-w" => { if let Some(v) = parts.get(i + 1) { width_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
-                    "-h" => { if let Some(v) = parts.get(i + 1) { height_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
-                    "-d" | "-c" => { if let Some(v) = parts.get(i + 1) { start_dir = Some(v.to_string()); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
-                    "-E" | "-K" => { skip_indices.insert(i); }
-                    _ => {}
+            // Re-tokenize with a quote-aware parser (#470). The raw `parts` above
+            // come from `split_whitespace()`, which does NOT strip shell quotes.
+            // When this command arrives from a display-menu item, the inner popup
+            // command is still quoted (e.g. `display-popup -E 'lazygit'`), so a
+            // naive split leaves the literal quotes on the command (`'lazygit'`),
+            // which is not a runnable executable. The popup shell then exits
+            // immediately and close-on-exit tears the popup back down before the
+            // user ever sees it. parse_command_line() strips the quotes so the
+            // command matches what the CLI/TCP path (connection.rs) already does.
+            let qparts = parse_command_line(cmd);
+            // The same parser as the CLI/TCP path (#792), so -B, -T, -b, -S
+            // and -s from a key binding or a menu item style the frame
+            // instead of becoming part of the command.
+            let req = match crate::popup::parse_display_popup_args(qparts.get(1..).unwrap_or(&[])) {
+                Ok(req) => req,
+                Err(e) => {
+                    app.status_message = Some((format!("display-popup: {}", e), std::time::Instant::now(), None));
+                    return Ok(());
                 }
-                i += 1;
-            }
-            // Resolve percentage dimensions against terminal size (#154)
-            let (term_w, term_h) = crossterm::terminal::size().unwrap_or((120, 40));
-            let width = parse_popup_dim_local(&width_spec, term_w, 80);
-            let height = parse_popup_dim_local(&height_spec, term_h, 24);
-            // Collect remaining args as the command
-            let rest: String = parts.iter().enumerate()
-                .filter(|(idx, _)| !skip_indices.contains(idx))
-                .map(|(_, a)| *a)
-                .collect::<Vec<&str>>()
-                .join(" ");
-            
-            // Spawn popup as a real Pane via the popup module
-            let pane_result = if !rest.is_empty() {
-                crate::popup::create_popup_pane(
-                    &rest,
-                    start_dir.as_deref(),
-                    height.saturating_sub(2),
-                    width.saturating_sub(2),
-                    app.next_pane_id,
-                    "1", // session name not available in local mode
-                    &app.environment,
-                )
-            } else { None };
-            
-            app.mode = Mode::PopupMode {
-                command: rest,
-                output: String::new(),
-                process: None,
-                width,
-                height,
-                close_on_exit,
-                popup_pane: pane_result,
-                scroll_offset: 0,
             };
+            let close_on_exit = req.close_on_exit > 0;
+            // Resolve percentage dimensions against the window area the
+            // server knows, else the local terminal (#154).
+            let area = if app.last_window_area.width > 0 && app.last_window_area.height > 0 {
+                (app.last_window_area.width, app.last_window_area.height)
+            } else {
+                crossterm::terminal::size().unwrap_or((120, 40))
+            };
+            let session_name = if app.session_name.is_empty() { "1".to_string() } else { app.session_name.clone() };
+            crate::popup::open_display_popup(app, req, area, close_on_exit, false, &session_name);
         }
         "resize-pane" | "resizep" => {
             if parts.iter().any(|p| *p == "-Z") {
@@ -1266,22 +2852,21 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 if let Some(port) = app.control_port {
                     let d = if detach { " -d" } else { "" };
                     let _ = send_control_to_port(port, &format!("swap-pane{} -s {} -t {}\n", d, src, tgt), &app.session_key);
-                } else {
-                    match (resolve_swap_pane_target_path(app, src), resolve_swap_pane_target_path(app, tgt)) {
-                        (Some(sp), Some(dp)) => { crate::window_ops::swap_pane_between(app, sp, dp, detach); }
-                        _ => { app.status_message = Some(("swap-pane: can't find pane".to_string(), Instant::now(), None)); }
-                    }
+                } else if let Err(e) = crate::window_ops::swap_pane_by_spec(app, Some(src), tgt, detach) {
+                    // Session wide resolution: -s / -t may name panes in two
+                    // different windows (#689).
+                    app.status_message = Some((format!("swap-pane: {}", e), Instant::now(), None));
                 }
             } else if let Some(tgt) = target {
                 if let Some(port) = app.control_port {
                     let _ = send_control_to_port(port, &format!("swap-pane -t {}\n", tgt), &app.session_key);
-                } else {
-                    let path = resolve_swap_pane_target_path(app, &tgt);
-                    if let Some(path) = path {
-                        crate::window_ops::swap_pane_with_path(app, path);
-                    } else {
-                        app.status_message = Some((format!("swap-pane: can't find pane: {}", tgt), Instant::now(), None));
+                } else if tgt.starts_with('{') {
+                    match resolve_swap_pane_target_path(app, &tgt) {
+                        Some(path) => { crate::window_ops::swap_pane_with_path(app, path); }
+                        None => { app.status_message = Some((format!("swap-pane: can't find pane: {}", tgt), Instant::now(), None)); }
                     }
+                } else if let Err(e) = crate::window_ops::swap_pane_by_spec(app, None, &tgt, detach) {
+                    app.status_message = Some((format!("swap-pane: {}", e), Instant::now(), None));
                 }
             } else if let Some(port) = app.control_port {
                 let dir = if parts.iter().any(|p| *p == "-U") { "-U" }
@@ -1307,32 +2892,53 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "break-pane" | "breakp" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "break-pane\n", &app.session_key);
+                // Forward the WHOLE command line. It used to send a bare
+                // "break-pane\n", which dropped every flag the user typed at
+                // the command prompt or bound to a key (#689).
+                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                crate::window_ops::break_pane_to_window(app);
+                let flags: Vec<&str> = parts[1..].to_vec();
+                let (req, _print) = crate::server::connection::parse_break_pane_args(&flags, None);
+                if let Err(e) = crate::window_ops::break_pane(app, &req) {
+                    app.status_message = Some((format!("break-pane: {}", e), Instant::now(), None));
+                }
             }
         }
         "respawn-pane" | "respawnp" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let kill = parts.iter().any(|p| *p == "-k");
+                let empty = parts.iter().any(|p| *p == "-E");
+                let kill = parts.iter().any(|p| *p == "-k") || empty;
                 // Honor `-- <shell-command>` (issue #399).
+                // The shell command is taken from the raw line, so its own
+                // quoting (a path with spaces) reaches the shell untouched.
                 let command = parts.iter().position(|p| *p == "--")
-                    .map(|i| parts[i + 1..].join(" "))
+                    .and_then(|_| cmd.find(" -- ").map(|at| cmd[at + 4..].to_string()))
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
-                crate::window_ops::respawn_active_pane(app, None, None, kill, command.as_deref())?;
+                let env_sets = crate::server::connection::env_flag_values(&parts);
+                crate::window_ops::respawn_active_pane(app, None, None, kill, command.as_deref(), empty, &env_sets)?;
             }
         }
         "toggle-sync" => {
             app.sync_input = !app.sync_input;
         }
         "set-option" | "set" | "set-window-option" | "setw" => {
-            // Always apply locally first (fix #179: TCP server drops these)
+            // Applied here, once, in order: a later command of the same chain
+            // (`set -g mouse \; display '#{mouse}'`) reads the new value, as
+            // tmux's queue gives it. Only the server has a control port, and
+            // this IS the server, so the command is not sent back to it: that
+            // ran it a second time, and `set -ga` appended twice while a bare
+            // `set -g mouse` toggled straight back (tmux appends once,
+            // cmd-set-option.c:347 and :351-353). The server loop runs the
+            // after-write work a client's set-option gets.
             crate::config::parse_config_line(app, cmd);
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            if app.control_port.is_some() {
+                let parsed = crate::cli::parse_set_option_args(&parts[1..]);
+                if let Some(option) = parsed.positionals.first() {
+                    app.in_process_option_writes.push(option.trim_matches('"').to_string());
+                }
             }
         }
         "bind-key" | "bind" => {
@@ -1350,18 +2956,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "source-file" | "source" => {
-            // Always apply locally first for immediate visual feedback,
-            // then forward to server for authoritative state update.
-            if let Some(path) = parts.get(1) {
-                crate::config::source_file(app, path);
-            }
+            // With a server, the server runs the file once: its source-file
+            // runs the file's commands in order (issue #842). Running it here
+            // as well, as this arm used to, ran the file twice, so a hook's
+            // `source-file` made every window in it twice.
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            } else if let Some((_, rest)) = cmd.trim().split_once(char::is_whitespace) {
+                // Every argument, so all the paths are read, and a quoted
+                // path with a space stays one path.
+                crate::config::source_file(app, rest.trim());
             }
         }
         "send-keys" | "send" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            } else if !crate::input::active_tiled_accepts_input(app) {
+                // select-pane -d (tmux PANE_INPUTOFF): the keys go nowhere.
             } else {
                 // Local: write key text directly to active pane
                 let literal = parts.iter().any(|p| *p == "-l");
@@ -1476,7 +3087,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             };
                             if let Some(win) = app.windows.get_mut(app.active_idx) {
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                                    let _ = p.writer.write_all(expanded.as_bytes());
+                                    // DECCKM app-cursor mode: SS3, not CSI (see crate::input::write_key_seq).
+                                    crate::input::write_key_seq(p, expanded.as_bytes());
                                     let _ = p.writer.flush();
                                 }
                             }
@@ -1489,7 +3101,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             // handled by caller to set quit flag
         }
         "rename-session" => {
-            if let Some(name) = parts.get(1) {
+            if let Some(name) = crate::cli::first_operand("rename-session", &parts[1..]) {
+                // A name the server refuses must not become this client's
+                // name either.
+                if let Some(msg) = crate::session::reserved_session_name_error(app.socket_name.as_deref(), name) {
+                    app.status_message = Some((msg, Instant::now(), None));
+                    return Ok(());
+                }
                 app.session_name = name.to_string();
                 // Forward to server so external queries see the new session name
                 if let Some(port) = app.control_port {
@@ -1517,96 +3135,100 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             }
         }
-        "choose-tree" | "choose-window" | "choose-session" => {
-            let tree = build_choose_tree(app);
-            let selected = tree.iter().position(|e| e.is_current_session && e.is_active_window && !e.is_session_header).unwrap_or(0);
-            app.mode = Mode::WindowChooser { selected, tree };
+        "choose-tree" => {
+            let words = parse_command_line(cmd);
+            let args = words.get(1..).unwrap_or(&[]);
+            let kind = crate::choose_tree::chooser_kind(args);
+            let template = crate::choose_tree::chooser_template(args);
+            open_client_chooser(app, kind, template.as_deref());
+        }
+        "command-prompt" if app.mode.in_copy() => {
+            // A copy mode key table binding (tmux's own `:`, `/`, `f`, ... are
+            // written this way). The prompt belongs to the pane's copy mode:
+            // replacing `app.mode` with `Mode::CommandPrompt` below threw copy
+            // mode away and opened a prompt no client draws.
+            let trimmed = cmd.trim_start();
+            let args = trimmed.strip_prefix(parts[0]).unwrap_or("");
+            crate::copy_prompt::open(app, args);
         }
         "command-prompt" => {
+            // A hook or a binding the server runs: the prompt opens on an
+            // attached client, which draws it and runs it the way a prefix
+            // binding's prompt runs (#789 follow up). The server's own prompt
+            // below is drawn by no client, so it is only the fallback for a
+            // server with nobody attached.
+            let trimmed = cmd.trim_start();
+            let args = trimmed.strip_prefix(parts[0]).unwrap_or("");
+            match crate::server::helpers::request_client_prompt(app, args) {
+                Ok(_) => return Ok(()),
+                Err(e) if e != "no current client" => {
+                    app.status_message = Some((e, std::time::Instant::now(), None));
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
             // Support -I initial_text, -p prompt (ignored), -1 (ignored)
             let initial = parts.windows(2).find(|w| w[0] == "-I").map(|w| w[1].to_string()).unwrap_or_default();
             app.command_vi_normal = false;
+            app.prompt_saved = None;
             app.mode = Mode::CommandPrompt { input: initial.clone(), cursor: initial.len() };
         }
         "paste-buffer" | "pasteb" => {
-            paste_latest(app)?;
+            // Issue #684: this dispatch used to call paste_latest() and throw
+            // every flag away, so a binding or a `:paste-buffer -p -b name`
+            // typed at the command prompt pasted the TOP buffer, unbracketed,
+            // whatever it asked for.  Only the CLI route
+            // (server/connection.rs) honoured -p and -b.
+            //
+            // A -t target used to be forwarded to the control port so the CLI
+            // dispatch's FocusTargetTemp would resolve it.  That focus was spent
+            // by the first non-focus request the server handled, so the paste
+            // still landed in the active pane; `run_paste_buffer` resolves the
+            // target itself now, the way cmd-paste-buffer.c does with
+            // cmd_find_pane, and both dispatches share it.
+            let pb = parse_paste_buffer_args(&parts[1..]);
+            if let Some(msg) = run_paste_buffer(app, &pb)? {
+                app.status_message = Some((msg, std::time::Instant::now(), None));
+            }
         }
         "set-buffer" | "setb" => {
-            // Parse -b name, -w (clipboard), and extract content
-            let mut i = 1;
-            let mut buf_name: Option<String> = None;
-            let mut content: Option<String> = None;
-            let mut propagate_to_clipboard = false;
-            while i < parts.len() {
-                if parts[i] == "-b" {
-                    if let Some(name) = parts.get(i + 1) {
-                        buf_name = Some(name.to_string());
-                    }
-                    i += 2; // skip -b and its value (buffer name)
-                } else if parts[i] == "-w" {
-                    propagate_to_clipboard = true;
-                    i += 1;
-                } else if parts[i].starts_with('-') {
-                    i += 1; // skip unknown flags
-                } else {
-                    // Everything from here is content
-                    content = Some(parts[i..].join(" "));
-                    break;
-                }
-            }
-            if let Some(ref text) = content {
-                if propagate_to_clipboard {
-                    crate::clipboard::copy_to_system_clipboard(text);
-                }
-                if let Some(name) = buf_name {
-                    app.named_buffers.insert(name, text.clone());
-                } else {
-                    app.paste_buffers.insert(0, text.clone());
-                    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
-                }
+            // The parser and executor every other route uses, so a hook's
+            // `-n` renames instead of storing the new name as data, `-ab
+            // NAME` keeps its `-a`, and `-t` (a client) is not read as data.
+            let result = parse_set_buffer_args(&parts[1..]).and_then(|set| match set {
+                Some(set) => run_set_buffer_args(app, &set),
+                None => Ok(()),
+            });
+            if let Err(msg) = result {
+                app.status_message = Some((msg, std::time::Instant::now(), None));
             }
         }
         "delete-buffer" | "deleteb" => {
             let buf_name: Option<String> = parts.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
             if let Some(name) = buf_name {
-                if let Ok(idx) = name.parse::<usize>() {
-                    if idx < app.paste_buffers.len() { app.paste_buffers.remove(idx); }
-                } else {
-                    app.named_buffers.remove(&name);
+                if !app.paste_delete(&name) {
+                    // cmd-set-buffer.c:73
+                    app.status_message = Some((format!("unknown buffer: {}", name), std::time::Instant::now(), None));
                 }
             } else {
                 if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
             }
         }
         "list-buffers" | "lsb" => {
-            let mut output = String::new();
-            for (i, buf) in app.paste_buffers.iter().enumerate() {
-                output.push_str(&format!("buffer{}: {} bytes: \"{}\"\n", i,
-                    buf.len(), &buf.chars().take(50).collect::<String>()));
-            }
-            // List named buffers
-            let mut names: Vec<&String> = app.named_buffers.keys().collect();
-            names.sort();
-            for name in names {
-                let buf = &app.named_buffers[name];
-                let preview: String = buf.chars().take(50).collect();
-                output.push_str(&format!("{}: {} bytes: \"{}\"\n", name, buf.len(), preview));
-            }
+            let mut output = app.paste_listing(false);
             if output.is_empty() { output.push_str("(no buffers)\n"); }
             show_output_popup(app, "list-buffers", output);
         }
         "show-buffer" | "showb" => {
             let buf_name: Option<String> = parts.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
             if let Some(name) = buf_name {
-                if let Ok(idx) = name.parse::<usize>() {
-                    if let Some(buf) = app.paste_buffers.get(idx) {
-                        show_output_popup(app, "show-buffer", buf.clone());
-                    }
-                } else if let Some(buf) = app.named_buffers.get(&name) {
-                    show_output_popup(app, "show-buffer", buf.clone());
+                match app.paste_get(&name).map(str::to_string) {
+                    Some(buf) => show_output_popup(app, "show-buffer", buf),
+                    // cmd-save-buffer.c:92
+                    None => app.status_message = Some((format!("no buffer {}", name), std::time::Instant::now(), None)),
                 }
-            } else if let Some(buf) = app.paste_buffers.first() {
-                show_output_popup(app, "show-buffer", buf.clone());
+            } else if let Some(buf) = app.paste_top().map(str::to_string) {
+                show_output_popup(app, "show-buffer", buf);
             }
         }
         "choose-buffer" | "chooseb" => {
@@ -1624,6 +3246,11 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     if let Ok(mut parser) = p.term.lock() {
                         let mut fresh = vt100::Parser::new(p.last_rows, p.last_cols, history_limit);
                         fresh.screen_mut().set_allow_alternate_screen(allow_alt);
+                        // Same console host, so the same answer to "does it
+                        // parse win32 input records" (issue #845).
+                        fresh.screen_mut().set_win32_input_requested(parser.screen().win32_input_requested());
+                        // Same application, same key mode (issue #860).
+                        fresh.screen_mut().set_extended_keys_mode(parser.screen().extended_keys_mode());
                         *parser = fresh;
                     }
                 }
@@ -1635,6 +3262,29 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "kill-server" => {
+            // tmux's kill-server ends the whole server the client is attached
+            // to. psmux runs one server per session, so the equivalent is every
+            // server on this client's socket: its own `-L` namespace, or the
+            // default one. Other namespaces are other sockets and survive
+            // (#649); `-a` is the psmux-only everything sweep.
+            let kill_all = parts
+                .iter()
+                .skip(1)
+                .any(|a| *a == "-a" || *a == "--all");
+            let scope = if kill_all {
+                crate::session::KillScope::All
+            } else {
+                crate::session::KillScope::Namespace(app.socket_name.as_deref())
+            };
+            // The peers go first, with this server excluded: it is the one
+            // running this very command, so it cannot answer its own graceful
+            // kill until the command returns. It kills itself below.
+            let own_base = app.port_file_base();
+            crate::session::kill_servers_in_scope(
+                std::path::Path::new(&crate::paths::psmux_dir()),
+                scope,
+                Some(&own_base),
+            );
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, "kill-server\n", &app.session_key);
             }
@@ -1653,8 +3303,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "load-buffer" | "loadb" => {
             if let Some(path) = parts.get(1) {
                 if let Ok(data) = std::fs::read_to_string(path) {
-                    app.paste_buffers.insert(0, data);
-                    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+                    app.paste_add(data);
                 }
             }
         }
@@ -1668,17 +3317,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "list-keys" | "lsk" => {
             let mut output = String::new();
-            for (table_name, binds) in &app.key_tables {
-                for bind in binds {
-                    let key_str = crate::config::format_key_binding(&bind.key);
-                    let cmd_str = format_action(&bind.action);
-                    output.push_str(&format!("bind-key -T {} {} {}\n", table_name, key_str, cmd_str));
-                }
+            for (table_name, key_str, cmd_str, repeat) in crate::config::list_keys_entries(app) {
+                let r = if repeat { " -r" } else { "" };
+                output.push_str(&format!("bind-key{} -T {} {} {}\n", r, table_name, key_str, cmd_str));
             }
             if output.is_empty() { output.push_str("(no bindings)\n"); }
             show_output_popup(app, "list-keys", output);
         }
-        "show-options" | "show" | "show-window-options" | "showw" => {
+        "show-options" | "show" | "show-window-options" | "showw"
+        | "show-option" | "show-window-option" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
@@ -1730,29 +3377,22 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "show-messages" | "showmsgs" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
-            } else {
-                show_output_popup(app, "show-messages", "(no messages)\n".to_string());
-            }
+            let text = server_info_text(app);
+            show_output_popup(app, "show-messages", text);
         }
         "set-environment" | "setenv" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let has_u = parts.iter().any(|p| *p == "-u");
-                let non_flag: Vec<&str> = parts[1..].iter().filter(|p| !p.starts_with('-')).copied().collect();
-                if has_u {
-                    if let Some(key) = non_flag.first() {
-                        app.environment.remove(*key);
-                        std::env::remove_var(key);
-                    }
-                } else if non_flag.len() >= 2 {
-                    app.environment.insert(non_flag[0].to_string(), non_flag[1].to_string());
-                    std::env::set_var(non_flag[0], non_flag[1]);
-                } else if non_flag.len() == 1 {
-                    app.environment.insert(non_flag[0].to_string(), String::new());
-                    std::env::set_var(non_flag[0], "");
+                // Same parser and semantics as the server (#775). The
+                // arguments are split quote aware: `parts` is a plain
+                // whitespace split, so `NAME "a b"` reached the parser as
+                // three tokens with the quotes still on them.
+                let args = parse_command_line(cmd);
+                let args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+                match crate::environ::parse_set_environment(&args) {
+                    Ok(parsed) => crate::environ::apply_set(&mut app.environment, &mut app.env_scopes, &parsed),
+                    Err(e) => app.status_message = Some((e, std::time::Instant::now(), None)),
                 }
             }
         }
@@ -1760,12 +3400,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let mut output = String::new();
-                for (key, value) in &app.environment {
-                    output.push_str(&format!("{}={}\n", key, value));
+                let args = parse_command_line(cmd);
+                let args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+                match crate::environ::parse_show_environment(&args)
+                    .and_then(|a| crate::environ::show(&app.environment, &app.env_scopes, &a))
+                {
+                    Ok(output) if output.is_empty() => show_output_popup(app, "show-environment", "(no environment variables)\n".to_string()),
+                    Ok(output) => show_output_popup(app, "show-environment", output),
+                    Err(e) => app.status_message = Some((e, std::time::Instant::now(), None)),
                 }
-                if output.is_empty() { output.push_str("(no environment variables)\n"); }
-                show_output_popup(app, "show-environment", output);
             }
         }
         "set-hook" => {
@@ -1791,7 +3434,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         non_flag[1..].join(" ")
                     };
                     if has_append {
-                        app.hooks.entry(hook_name.to_string()).or_default().push(hook_cmd);
+                        // Dedup identical handlers so a re-sourced config does
+                        // not accumulate duplicate hooks that fire every tick
+                        // (issue #459); mirrors the replace path's #133 guard.
+                        let entry = app.hooks.entry(hook_name.to_string()).or_default();
+                        if !entry.contains(&hook_cmd) {
+                            entry.push(hook_cmd);
+                        }
                     } else {
                         app.hooks.insert(hook_name.to_string(), vec![hook_cmd]);
                     }
@@ -1803,17 +3452,19 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 let _ = send_control_to_port(port, "send-prefix\n", &app.session_key);
             } else {
                 // Send the prefix key to the active pane as if typed
-                let prefix = app.prefix_key;
-                let encoded: Vec<u8> = match prefix.0 {
-                    crossterm::event::KeyCode::Char(c) if prefix.1.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                // Nothing to send when the prefix is None (tmux cmd-send-keys.c).
+                let encoded: Vec<u8> = match app.prefix_key {
+                    Some((crossterm::event::KeyCode::Char(c), m)) if m.contains(crossterm::event::KeyModifiers::CONTROL) => {
                         vec![(c.to_ascii_lowercase() as u8) & 0x1F]
                     }
-                    crossterm::event::KeyCode::Char(c) => format!("{}", c).into_bytes(),
+                    Some((crossterm::event::KeyCode::Char(c), _)) => format!("{}", c).into_bytes(),
                     _ => vec![],
                 };
                 if !encoded.is_empty() {
                     if let Some(win) = app.windows.get_mut(app.active_idx) {
-                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                        // send-prefix is a key (tmux window_pane_key), so an
+                        // input-off pane does not get it.
+                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path).filter(|p| p.accepts_input()) {
                             let _ = p.writer.write_all(&encoded);
                             let _ = p.writer.flush();
                         }
@@ -1836,21 +3487,32 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     let condition = positional[0];
                     let true_cmd = positional[1];
                     let false_cmd = positional.get(2).copied();
+                    // The shell command is format expanded before it runs,
+                    // like tmux (cmd-if-shell.c:86 format_single_from_target);
+                    // untimed, because a `%` in a shell command is not
+                    // strftime (issue #734 follow up).
+                    let shell_condition = if format_mode {
+                        String::new()
+                    } else {
+                        crate::format::expand_format_untimed(condition, app)
+                    };
                     let success = if format_mode {
                         let expanded = crate::format::expand_format(condition, app);
                         !expanded.is_empty() && expanded != "0"
-                    } else if condition == "true" || condition == "1" {
+                    } else if shell_condition == "true" || shell_condition == "1" {
                         true
-                    } else if condition == "false" || condition == "0" {
+                    } else if shell_condition == "false" || shell_condition == "0" {
                         false
                     } else {
                         {
                             let (shell_prog, mut shell_args) = resolve_run_shell();
-                            shell_args.push(condition.to_string());
+                            shell_args.push(shell_condition);
                             let mut cmd = std::process::Command::new(&shell_prog);
                             cmd.args(shell_args)
+                            .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null());
+                            apply_job_env(&mut cmd);
                             #[cfg(windows)]
                             { use crate::platform::HideWindowCommandExt; cmd.hide_window(); }
                             cmd.status()
@@ -1877,7 +3539,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 let mut output = String::new();
                 for (i, win) in app.windows.iter().enumerate() {
                     if win.name.contains(pattern) {
-                        output.push_str(&format!("{}: {}\n", i + app.window_base_index, win.name));
+                        output.push_str(&format!("{}: {}\n", app.win_display_index(i), win.name));
                     }
                 }
                 if output.is_empty() { output.push_str(&format!("(no windows matching '{}')\n", pattern)); }
@@ -1888,15 +3550,18 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let target = parts[1..].iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok());
-                if let Some(t) = target {
-                    let t: usize = t;
-                    if t < app.windows.len() && app.active_idx != t {
-                        let win = app.windows.remove(app.active_idx);
-                        let insert_idx = if t > app.active_idx { t - 1 } else { t };
-                        app.windows.insert(insert_idx.min(app.windows.len()), win);
-                        app.active_idx = insert_idx.min(app.windows.len() - 1);
-                    }
+                // Same shared resolver the server path uses, so the command
+                // prompt and a config `move-window` agree with the CLI on what
+                // `-s`, `+1` and `{last}` mean (issue #602).
+                let src = parts.windows(2).find(|w| w[0] == "-s").map(|w| w[1].to_string());
+                let dst = parts.windows(2).find(|w| w[0] == "-t").map(|w| w[1].to_string())
+                    .or_else(|| parts[1..].iter().find(|a| !a.starts_with('-')).map(|s| s.to_string()));
+                let has = |f: &str| parts[1..].iter().any(|a| *a == f);
+                if let Err(msg) = app.move_window(
+                    src.as_deref(), dst.as_deref(),
+                    has("-d"), has("-r"), has("-a"), has("-b"))
+                {
+                    app.status_message = Some((format!("move-window: {}", msg), std::time::Instant::now(), None));
                 }
             }
         }
@@ -1904,9 +3569,33 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                if let Some(target) = parts[1..].iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse::<usize>().ok()) {
-                    if target < app.windows.len() && app.active_idx != target {
-                        app.windows.swap(app.active_idx, target);
+                let src = parts.windows(2).find(|w| w[0] == "-s").map(|w| w[1].to_string());
+                let dst = parts.windows(2).find(|w| w[0] == "-t").map(|w| w[1].to_string())
+                    .or_else(|| parts[1..].iter().find(|a| !a.starts_with('-')).map(|s| s.to_string()));
+                let detach = parts[1..].iter().any(|a| *a == "-d");
+                let resolved = dst.as_deref().ok_or_else(|| "can't find window: ".to_string())
+                    .and_then(|d| {
+                        let spos = match src.as_deref() {
+                            Some(s) => app.resolve_window_spec(s, false)?.pos()
+                                .ok_or_else(|| format!("can't find window: {}", s))?,
+                            None => app.active_idx,
+                        };
+                        let tpos = app.resolve_window_spec(d, false)?.pos()
+                            .ok_or_else(|| format!("can't find window: {}", d))?;
+                        Ok((spos, tpos))
+                    });
+                match resolved {
+                    Ok((spos, tpos)) if spos != tpos => {
+                        app.windows.swap(spos, tpos);
+                        // tmux selects the destination index only WITH -d.
+                        if detach && app.active_idx != tpos {
+                            app.last_window_idx = app.active_idx;
+                            app.active_idx = tpos;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(msg) => {
+                        app.status_message = Some((format!("swap-window: {}", msg), std::time::Instant::now(), None));
                     }
                 }
             }
@@ -1915,43 +3604,119 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                // Intra-session link-window: parse -s and -t flags
-                let src_idx = parts.windows(2).find(|w| w[0] == "-s")
-                    .and_then(|w| w[1].trim_start_matches(':').parse::<usize>().ok());
-                let dst_idx = parts.windows(2).find(|w| w[0] == "-t")
-                    .and_then(|w| w[1].trim_start_matches(':').parse::<usize>().ok());
-                let src = src_idx.unwrap_or(app.active_idx);
-                if src < app.windows.len() {
-                    let src_id = app.windows[src].id;
-                    let src_name = app.windows[src].name.clone();
-                    let pty_system = portable_pty::native_pty_system();
-                    if let Ok(()) = crate::pane::create_window(&*pty_system, app, None, None) {
-                        let new_idx = app.windows.len() - 1;
-                        app.windows[new_idx].linked_from = Some(src_id);
-                        app.windows[new_idx].name = src_name;
-                        if let Some(dst) = dst_idx {
-                            if dst < new_idx {
-                                let win = app.windows.remove(new_idx);
-                                app.windows.insert(dst, win);
+                // Same shared resolver the server and the CLI use, so a
+                // config file, a binding and `psmux link-window` agree on what
+                // `-s sess:0` and `-t 5` mean (#693 item 1). `-s` and `-t`
+                // used to be `trim_start_matches(':').parse::<usize>()`, which
+                // read neither a session qualified source nor a destination
+                // index that no window holds yet.
+                let src = parts.windows(2).find(|w| w[0] == "-s").map(|w| w[1].to_string());
+                let dst = parts.windows(2).find(|w| w[0] == "-t").map(|w| w[1].to_string());
+                let has = |f: &str| parts[1..].iter().any(|a| *a == f);
+                let resolved = (|| -> Result<(usize, Option<usize>), String> {
+                    let spos = match src.as_deref() {
+                        Some(s) => app.resolve_window_spec(s, false)?.pos()
+                            .ok_or_else(|| format!("can't find window: {}", s))?,
+                        None => app.active_idx,
+                    };
+                    let didx = match dst.as_deref() {
+                        Some(d) => Some(match app.resolve_window_spec(d, true)? {
+                            crate::types::WindowTarget::Pos(p) => app.win_display_index(p),
+                            crate::types::WindowTarget::FreeIndex(i) => i,
+                        }),
+                        None => None,
+                    };
+                    Ok((spos, didx))
+                })();
+                match resolved {
+                    Err(msg) => {
+                        app.status_message = Some((format!("link-window: {}", msg), Instant::now(), None));
+                    }
+                    Ok((src_pos, mut didx)) => {
+                        if has("-a") || has("-b") {
+                            if let Some(i) = didx.as_mut() {
+                                if has("-a") { *i += 1; }
+                                app.shuffle_window_indices_up(*i);
                             }
                         }
-                        fire_hooks(app, "window-linked");
+                        let occupied = didx.and_then(|i| app.win_pos(i));
+                        if occupied.is_some() && !has("-k") {
+                            app.status_message = Some((format!("link-window: index in use: {}", didx.unwrap_or(0)), Instant::now(), None));
+                        } else {
+                            if let Some(pos) = occupied {
+                                let mut win = app.windows.remove(pos);
+                                kill_all_children(&mut win.root);
+                                app.on_window_removed(pos);
+                                if app.active_idx >= app.windows.len() && !app.windows.is_empty() {
+                                    app.active_idx = app.windows.len() - 1;
+                                }
+                            }
+                            let src_pos = src_pos.min(app.windows.len().saturating_sub(1));
+                            let src_id = app.windows[src_pos].id;
+                            let src_name = app.windows[src_pos].name.clone();
+                            let prev_active_id = app.windows.get(app.active_idx).map(|w| w.id);
+                            let pty_system = portable_pty::native_pty_system();
+                            if let Ok(()) = crate::pane::create_window(&*pty_system, app, None, None, false) {
+                                let new_idx = app.windows.len() - 1;
+                                app.windows[new_idx].linked_from = Some(src_id);
+                                app.windows[new_idx].name = src_name;
+                                let new_id = app.windows[new_idx].id;
+                                if let Some(d) = didx {
+                                    if app.window_indices_valid() {
+                                        app.move_active_window_to_index(d);
+                                    } else if d < new_idx {
+                                        let win = app.windows.remove(new_idx);
+                                        app.windows.insert(d, win);
+                                    }
+                                }
+                                if has("-d") {
+                                    if let Some(p) = prev_active_id
+                                        .and_then(|id| app.windows.iter().position(|w| w.id == id))
+                                    {
+                                        app.active_idx = p;
+                                    }
+                                } else if let Some(p) = app.windows.iter().position(|w| w.id == new_id) {
+                                    if p != app.active_idx { app.last_window_idx = app.active_idx; }
+                                    app.active_idx = p;
+                                }
+                                fire_hooks(app, "window-linked");
+                            }
+                        }
                     }
-                } else {
-                    app.status_message = Some(("link-window: source window not found".to_string(), Instant::now(), None));
                 }
             }
         }
         "unlink-window" | "unlinkw" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
-            } else if app.windows.len() > 1 {
-                let mut win = app.windows.remove(app.active_idx);
-                kill_all_children(&mut win.root);
-                if app.active_idx >= app.windows.len() {
-                    app.active_idx = app.windows.len() - 1;
+            } else {
+                // tmux unlinks the window its own -t names
+                // (cmd-kill-window.c:75-83); this always removed the ACTIVE
+                // window (#693 item 2).
+                let target = parts.windows(2).find(|w| w[0] == "-t").map(|w| w[1].to_string());
+                let resolved = match target.as_deref() {
+                    Some(t) => app.resolve_window_spec(t, false)
+                        .and_then(|w| w.pos().ok_or_else(|| format!("can't find window: {}", t))),
+                    None => Ok(app.active_idx),
+                };
+                match resolved {
+                    Err(msg) => {
+                        app.status_message = Some((format!("unlink-window: {}", msg), Instant::now(), None));
+                    }
+                    Ok(removed_pos) if app.windows.len() > 1 => {
+                        let mut win = app.windows.remove(removed_pos);
+                        kill_all_children(&mut win.root);
+                        app.on_window_removed(removed_pos);
+                        if removed_pos < app.active_idx {
+                            app.active_idx -= 1;
+                        }
+                        if app.active_idx >= app.windows.len() {
+                            app.active_idx = app.windows.len() - 1;
+                        }
+                        fire_hooks(app, "window-unlinked");
+                    }
+                    Ok(_) => {}
                 }
-                fire_hooks(app, "window-unlinked");
             }
         }
         "move-pane" | "movep" => {
@@ -1986,14 +3751,26 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     }
                     pi += 1;
                 }
-                // Legacy: bare integer as target window
+                // Legacy: bare integer as target window (not the value of -l / -p)
                 if tgt_win.is_none() {
-                    tgt_win = parts[1..].iter()
-                        .filter(|a| !a.starts_with('-'))
-                        .find(|a| a.parse::<usize>().is_ok())
-                        .and_then(|s| s.parse::<usize>().ok());
+                    tgt_win = parts.iter().enumerate().skip(1)
+                        .filter(|(i, a)| !a.starts_with('-') && !matches!(parts[*i - 1], "-l" | "-p" | "-s" | "-t"))
+                        .find(|(_, a)| a.parse::<usize>().is_ok())
+                        .and_then(|(_, s)| s.parse::<usize>().ok());
                 }
-                join_pane_local(app, src_win, src_pane, tgt_win, tgt_pane, horizontal);
+                let size = join_size_arg(&parts[1..]);
+                let detach = parts[1..].iter().any(|a| *a == "-d");
+                let before = parts[1..].iter().any(|a| *a == "-b");
+                let spos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+                let tpos = match tgt_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+                match (spos, tpos) {
+                    (Some(s), Some(t)) if s == t => {
+                        if let Err(e) = move_pane_in_window(app, s, src_pane, tgt_pane, horizontal, detach, before, size) {
+                            app.status_message = Some((format!("move-pane: {}", e), Instant::now(), None));
+                        }
+                    }
+                    _ => { join_pane_local(app, src_win, src_pane, tgt_win, tgt_pane, horizontal, detach, before, size); }
+                }
             }
         }
         "join-pane" | "joinp" => {
@@ -2028,14 +3805,17 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     }
                     pi += 1;
                 }
-                // Legacy: bare integer as target window
+                // Legacy: bare integer as target window (not the value of -l / -p)
                 if tgt_win.is_none() {
-                    tgt_win = parts[1..].iter()
-                        .filter(|a| !a.starts_with('-'))
-                        .find(|a| a.parse::<usize>().is_ok())
-                        .and_then(|s| s.parse::<usize>().ok());
+                    tgt_win = parts.iter().enumerate().skip(1)
+                        .filter(|(i, a)| !a.starts_with('-') && !matches!(parts[*i - 1], "-l" | "-p" | "-s" | "-t"))
+                        .find(|(_, a)| a.parse::<usize>().is_ok())
+                        .and_then(|(_, s)| s.parse::<usize>().ok());
                 }
-                join_pane_local(app, src_win, src_pane, tgt_win, tgt_pane, horizontal);
+                let size = join_size_arg(&parts[1..]);
+                join_pane_local(app, src_win, src_pane, tgt_win, tgt_pane, horizontal,
+                    parts[1..].iter().any(|a| *a == "-d"),
+                    parts[1..].iter().any(|a| *a == "-b"), size);
             }
         }
         "resize-window" | "resizew" => {
@@ -2062,15 +3842,6 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "start-server" | "start" => {
             // Already running
-        }
-        "server-info" | "info" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "server-info\n", &app.session_key);
-            } else {
-                let output = format!("psmux {}\nSession: {}\nWindows: {}\nActive: {}\n",
-                    crate::types::VERSION, app.session_name, app.windows.len(), app.active_idx);
-                show_output_popup(app, "server-info", output);
-            }
         }
         "new-session" | "new" => {
             // Issue #200: create a new session from inside a running session.
@@ -2116,17 +3887,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             // Generate session name if not provided
             let ns_prefix = app.socket_name.as_deref();
             let name = session_name.unwrap_or_else(|| crate::session::next_session_name(ns_prefix));
+            if let Some(msg) = crate::session::reserved_session_name_error(ns_prefix, &name) {
+                app.status_message = Some((msg, Instant::now(), None));
+                return Ok(());
+            }
 
             // Build port file base (with namespace prefix if applicable)
-            let port_file_base = if let Some(ref sn) = app.socket_name {
-                format!("{}__{}", sn, name)
-            } else {
-                name.clone()
-            };
+            let port_file_base = crate::session::session_name_base(ns_prefix, &name);
 
             // Check if session already exists
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
+            let port_path = crate::paths::port_file(&port_file_base);
             if std::path::Path::new(&port_path).exists() {
                 if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -2135,13 +3905,20 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             &addr.parse().unwrap(),
                             std::time::Duration::from_millis(100),
                         ).is_ok() {
-                            app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
+                            // tmux's wording, cmd-new-session.c:138
+                            app.status_message = Some((format!("duplicate session: {}", name), Instant::now(), None));
                             return Ok(());
                         }
                     }
                 }
                 // Stale port file, remove it
                 let _ = std::fs::remove_file(&port_path);
+            }
+
+            // #798: the switch says shared (or is bad); claim and start nothing.
+            if let Err(e) = crate::server::shared::check_server_start() {
+                app.status_message = Some((e, Instant::now(), None));
+                return Ok(());
             }
 
             // Try to claim a warm server first (fast path)
@@ -2153,7 +3930,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                let warm_port_path = crate::paths::port_file(&warm_base);
                 if std::path::Path::new(&warm_port_path).exists() {
                     if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
                         if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
@@ -2164,19 +3941,31 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             ).is_ok() {
                                 let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
                                 if !warm_key.is_empty() {
-                                    let claim_cmd = format!("claim-session {}\n", crate::util::quote_arg(&name));
+                                    // In-TUI new-session runs inside psmux, so the
+                                    // resolve reads this server's own environment and
+                                    // config rather than a user shell. Sending it is
+                                    // still right: a session created from the TUI
+                                    // should land on the same class as the psmux the
+                                    // user is sitting in, not on the standby's stale
+                                    // one (#608).
+                                    let claim_prio = crate::platform::claim_priority_arg();
+                                    // -n rides on the claim, same as the CLI path
+                                    // (#674): the standby applies it before it
+                                    // answers, so the session is never seen under
+                                    // the pool's window name and nothing has to
+                                    // succeed afterwards for the name to stick.
+                                    let name_flag = match window_name {
+                                        Some(ref wn) => format!(" -n {}", crate::util::quote_arg(wn)),
+                                        None => String::new(),
+                                    };
+                                    let claim_cmd = format!("claim-session {} -p {}{}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio), name_flag);
                                     match crate::session::send_auth_cmd_response(
                                         &warm_addr, &warm_key,
                                         claim_cmd.as_bytes(),
                                     ) {
                                         Ok(resp) if resp.contains("OK") => {
-                                            if let Some(ref wn) = window_name {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                let _ = crate::session::send_auth_cmd(
-                                                    &warm_addr, &new_key,
-                                                    format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
-                                                );
-                                            }
+                                            // The window name arrived with the claim
+                                            // and is already applied (#674).
                                             // Apply -e environment variables to the claimed warm session
                                             if !env_vars.is_empty() {
                                                 let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
@@ -2220,7 +4009,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     server_args.push(cmd.clone());
                 }
                 // Pass current terminal dimensions
-                let area = app.last_window_area;
+                let area = app.client_area;
                 if area.width > 1 && area.height > 1 {
                     server_args.push("-x".into());
                     server_args.push(area.width.to_string());
@@ -2286,7 +4075,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             app.status_message = Some(("suspend: not available on Windows".to_string(), Instant::now(), None));
         }
         "choose-client" => {
-            app.status_message = Some(("choose-client: single-client model (you are the only client)".to_string(), Instant::now(), None));
+            // psmux has no client mode yet; show the attached clients, as the
+            // wire path does (`ShowTextPopup("choose-client", ...)`). The old
+            // status line claimed a single client model, which psmux is not:
+            // every client is in `client_registry` (discussion #776).
+            let output = generate_list_clients(app);
+            show_output_popup(app, "choose-client", output);
         }
         "customize-mode" => {
             // tmux 3.2+ customize-mode: interactive options editor
@@ -2309,21 +4103,42 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "run-shell" | "run" => {
             // Parse with quote-aware parser to handle nested quotes properly
             let args = parse_command_line(cmd);
-            let mut cmd_parts: Vec<&str> = Vec::new();
-            let mut background = false;
-            for arg in &args[1..] {
-                if arg == "-b" { background = true; }
-                else { cmd_parts.push(arg); }
-            }
-            let shell_cmd = cmd_parts.join(" ");
-            if shell_cmd.is_empty() {
+            let parsed = match parse_run_shell_args(&args[1..]) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    app.status_message = Some((e, Instant::now(), None));
+                    return Ok(());
+                }
+            };
+            let background = parsed.background;
+            let delay = parsed.delay;
+            let shell_cmd = parsed.command.join(" ");
+            if shell_cmd.is_empty() && delay.is_some() {
+                // `-d` with no command only waits (cmd-run-shell.c:125); here
+                // nothing waits on it, so there is nothing to do.
+            } else if shell_cmd.is_empty() {
                 // No command given: show usage (tmux parity)
                 app.status_message = Some((
-                    "usage: run-shell [-b] shell-command".to_string(),
+                    "usage: run-shell [-b] [-d delay] shell-command".to_string(),
                     Instant::now(),
                     None,
                 ));
             } else {
+                // Expand #{...} format variables (tmux parity: run-shell's
+                // command is format-expanded before it runs).
+                //
+                // This was missing entirely, and it silently broke every bind of
+                // the shape `run-shell "helper --path '#{pane_current_path}'"`:
+                // the helper received the literal string `#{pane_current_path}`.
+                // Combined with `-b` discarding the spawn result below, such a
+                // bind did nothing at all and reported nothing — no output, no
+                // status message, no log line. Only `-c`/`-d` start-dirs were
+                // being expanded (in server/mod.rs), which is why `popup -d
+                // "#{pane_current_path}"` worked and this did not.
+                //
+                // Untimed, like tmux's format_expand: a `%` in a shell
+                // command (cmd's %VAR%, PowerShell's `%`) is not strftime.
+                let shell_cmd = crate::format::expand_format_untimed(&shell_cmd, app);
                 // Expand ~ to home directory + XDG fallback for plugin paths
                 let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd);
                 // Set PSMUX_TARGET_SESSION so child scripts connect to the correct server
@@ -2332,10 +4147,28 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 if background {
                     // -b flag: fire and forget, no output capture
                     let mut c = build_run_shell_command(&shell_cmd);
+                    null_job_output(&mut c);
                     if !target_session.is_empty() {
                         c.env("PSMUX_TARGET_SESSION", &target_session);
                     }
-                    let _ = c.spawn();
+                    if let Some(delay) = delay {
+                        // `-b -d N`: started after the delay, nothing waits.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(delay);
+                            let _ = c.spawn();
+                        });
+                    }
+                    // Report a spawn failure. `-b` means "don't wait for the
+                    // command", not "don't tell me it never started" — the old
+                    // `let _ = c.spawn();` made a broken background bind
+                    // indistinguishable from an unbound key.
+                    else if let Err(e) = c.spawn() {
+                        app.status_message = Some((
+                            format!("run-shell: {}: {}", shell_cmd, e),
+                            Instant::now(),
+                            None,
+                        ));
+                    }
                 } else {
                     // No -b: spawn async to avoid blocking the UI thread.
                     // Interactive commands (htop, vim, etc.) would freeze psmux
@@ -2351,6 +4184,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     let shell_cmd_display = shell_cmd.clone();
                     let target_session = target_session.clone();
                     std::thread::spawn(move || {
+                        if let Some(delay) = delay {
+                            std::thread::sleep(delay);
+                        }
                         let mut c = build_run_shell_command(&shell_cmd);
                         if !target_session.is_empty() {
                             c.env("PSMUX_TARGET_SESSION", &target_session);
@@ -2389,9 +4225,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let old_shell = app.default_shell.clone();
             crate::config::parse_config_line(app, cmd);
             if app.default_shell != old_shell {
-                if let Some(mut wp) = app.warm_pane.take() {
-                    wp.child.kill().ok();
-                }
+                app.warm_pane.kill_all();
             }
             // Also forward unknown commands to server (catch-all for tmux compat)
             if let Some(port) = app.control_port {
@@ -2413,7 +4247,7 @@ fn resolve_swap_pane_target_path(app: &AppState, target: &str) -> Option<Vec<usi
     let win = &app.windows[app.active_idx];
     match parsed.pane {
         Some(p) if parsed.pane_is_id => crate::tree::find_path_by_id(&win.root, p),
-        Some(p) => p.checked_sub(app.pane_base_index)
+        Some(p) => p.checked_sub(app.pane_base_index_of(app.active_idx))
             .and_then(|idx| crate::tree::path_by_position(&win.root, idx)),
         None => None,
     }
@@ -2456,6 +4290,10 @@ mod tests_issue200_new_session;
 mod tests_run_shell_resolve;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue804_job_env.rs"]
+mod tests_issue804_job_env;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_hide_window.rs"]
 mod tests_hide_window;
 
@@ -2488,6 +4326,10 @@ mod tests_mega_unit_coverage;
 mod tests_flag_parity;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue618_set_option_server_scope.rs"]
+mod tests_issue618_set_option_server_scope;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue227_remain_on_exit_hooks.rs"]
 mod tests_issue227_remain_on_exit_hooks;
 
@@ -2506,6 +4348,22 @@ mod tests_issue245_mouse_selection;
 #[cfg(test)]
 #[path = "../tests-rs/test_pr255_active_border.rs"]
 mod tests_pr255_active_border;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_border_lines_render.rs"]
+mod tests_pane_border_lines_render;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_content_box_drawing.rs"]
+mod tests_pane_content_box_drawing;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_copy_line_numbers_render.rs"]
+mod tests_copy_line_numbers_render;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_floating_render.rs"]
+mod tests_floating_render;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_pr207_compat_bugs.rs"]
@@ -2530,3 +4388,51 @@ mod tests_issue402_parse;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue426_split_pane_alias.rs"]
 mod tests_issue426_split_pane_alias;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue470_menu_popup.rs"]
+mod tests_issue470_menu_popup;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_killwindow_bad_target.rs"]
+mod tests_killwindow_bad_target;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue725_join_pane_focus.rs"]
+mod test_issue725_join_pane_focus;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_cross_session_source_targets.rs"]
+mod test_cross_session_source_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_disc776_in_process_clients.rs"]
+mod test_disc776_in_process_clients;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_bare_window_target.rs"]
+mod tests_bare_window_target;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue836_set_buffer_flags.rs"]
+mod tests_issue836_set_buffer_flags;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_in_process_set_option_once.rs"]
+mod tests_in_process_set_option_once;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_select_window_toggle.rs"]
+mod tests_select_window_toggle;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_base_index_window_scope.rs"]
+mod tests_pane_base_index_window_scope;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_set_hook_cli_command_list.rs"]
+mod tests_set_hook_cli_command_list;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_unlink_window_focus.rs"]
+mod tests_unlink_window_focus;

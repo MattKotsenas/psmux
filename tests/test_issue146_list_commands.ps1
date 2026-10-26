@@ -12,9 +12,12 @@ function Add-Result($name, $pass, $detail="") {
         Result=if($pass){"PASS"}else{"FAIL"}
         Detail=$detail
     }
+    # Standard per-check marker line so the test runner can count results
+    if ($pass) { Write-Host "  [PASS] $name" -ForegroundColor Green }
+    else       { Write-Host "  [FAIL] $name" -ForegroundColor Red }
 }
 
-$SESSION = "test146_$$"
+$SESSION = "test146_$PID"
 
 try {
     # Clean up any leftover session
@@ -36,9 +39,13 @@ try {
     Add-Result "list-panes (external CLI)" $pass "Output: $($lsp.Trim())"
 
     # ---- Test 3: list-clients via external CLI ----
+    # The session was created with -d and no client ever attached, so tmux parity
+    # (and deliberate post-issue-434 behavior: no ghost client rows) is EMPTY
+    # output with exit code 0. Empty output is the PASS condition here.
     $lsc = psmux list-clients -t $SESSION 2>&1 | Out-String
-    $pass = $lsc -match "$SESSION" -or $lsc -match "utf8"
-    Add-Result "list-clients (external CLI)" $pass "Output: $($lsc.Trim())"
+    $lscExit = $LASTEXITCODE
+    $pass = ($lsc.Trim().Length -eq 0) -and ($lscExit -eq 0)
+    Add-Result "list-clients (external CLI, detached session: empty output, exit 0)" $pass "Exit: $lscExit Output: '$($lsc.Trim())'"
 
     # ---- Test 4: show-hooks via external CLI ----
     $hooks = psmux show-hooks -t $SESSION 2>&1 | Out-String
@@ -148,5 +155,6 @@ Write-Host "=== Issue #146: List Commands Test Results ==="
 $results | Format-Table -AutoSize
 $fail = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
 $total = $results.Count
-Write-Host "Result: $($total - $fail)/$total passed"
-if ($fail -gt 0) { exit 1 }
+Write-Host "  Passed: $($total - $fail)" -ForegroundColor Green
+Write-Host "  Failed: $fail" -ForegroundColor $(if ($fail -gt 0) {"Red"} else {"Green"})
+exit $fail

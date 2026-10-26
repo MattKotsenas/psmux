@@ -38,7 +38,21 @@ function Wait-For-Psmux {
 
 function Send-Keys {
     param([string]$Keys, [int]$DelayMs = 300)
-    psmux send-keys $Keys 2>$null
+    # Split into separate operands. Call sites pass things like 'clear Enter' and
+    # ':END" Enter', which are a command followed by the Enter KEY.
+    #
+    # Passed as one argument the whole string is a single operand, and psmux (like
+    # tmux) treats an operand that is not a known key name as literal text, so it
+    # typed "clear Enter" into the prompt and never pressed Enter at all. The line
+    # just accumulated:
+    #
+    #   clear EnterWrite-Host "PIPE:|:END" Enter
+    #
+    # Nothing ever ran. The pipe check still reported PASS because the text it
+    # searched for was sitting in the ECHOED command line, and the tilde check
+    # failed for the same reason it should have: no command output existed.
+    $parts = @($Keys -split ' ' | Where-Object { $_ -ne '' })
+    psmux send-keys @parts 2>$null
     Start-Sleep -Milliseconds $DelayMs
 }
 

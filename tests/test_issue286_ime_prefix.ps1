@@ -114,7 +114,7 @@ Write-Host "`n[Test 6] TUI: Attached session with prefix+c via keystroke injecti
 $injectorExe = "$env:TEMP\psmux_injector.exe"
 $injectorSrc = Join-Path (Split-Path $PSMUX -Parent) "..\Documents\workspace\psmux\tests\injector.cs"
 if (-not (Test-Path $injectorSrc)) {
-    $injectorSrc = "C:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs"
+    $injectorSrc = "$PSScriptRoot\injector.cs"
 }
 if (-not (Test-Path $injectorExe) -or ((Get-Item $injectorSrc -EA SilentlyContinue).LastWriteTime -gt (Get-Item $injectorExe -EA SilentlyContinue).LastWriteTime)) {
     $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"

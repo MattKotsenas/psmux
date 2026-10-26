@@ -11,7 +11,7 @@
 # 8. refresh-client / refresh (CLI → server)
 # 9. send-prefix (CLI → server)
 # 10. show-messages / showmsgs (CLI → response)
-# 11. Platform no-ops: suspend-client, lock-*, resize-window, customize-mode
+# 11. Platform handlers: suspend-client, lock-*, resize-window, customize-mode
 # 12. choose-client, respawn-window, link-window, unlink-window
 
 $ErrorActionPreference = "Continue"
@@ -95,15 +95,18 @@ Test-Assert "'info' alias returns same as 'server-info'" ($aliasStr -match 'psmu
 # ============================================================
 Write-Host "`n[Test Group 2] command-prompt (CLI acceptance)" -ForegroundColor Magenta
 
-# Test 2.1: command-prompt doesn't error
-$cpResult = & $exe -t test-cli command-prompt 2>&1
+# The prompt opens on a client (tmux cmd-command-prompt.c status_prompt_set),
+# and this session is detached: tmux answers "no current client", rc 1. The
+# attached client path is covered by tests/test_cli_command_prompt.ps1.
+# Test 2.1: command-prompt with no client is refused like tmux, not dropped
+$cpResult = (& $exe -t test-cli command-prompt -b 2>&1 | Out-String)
 $cpExitCode = $LASTEXITCODE
-Test-Assert "command-prompt accepted without error" ($cpExitCode -eq 0 -or $cpExitCode -eq $null) "Exit code: $cpExitCode"
+Test-Assert "command-prompt with no attached client: 'no current client', rc 1" ($cpExitCode -eq 1 -and $cpResult -match 'no current client') "Exit code: $cpExitCode Output: $cpResult"
 
-# Test 2.2: command-prompt with -I flag accepted
-$cpIResult = & $exe -t test-cli command-prompt -I test 2>&1
+# Test 2.2: the -I flag is parsed (no flag error), then the same refusal
+$cpIResult = (& $exe -t test-cli command-prompt -b -I test 2>&1 | Out-String)
 $cpIExitCode = $LASTEXITCODE
-Test-Assert "command-prompt -I accepted" ($cpIExitCode -eq 0 -or $cpIExitCode -eq $null) "Exit code: $cpIExitCode"
+Test-Assert "command-prompt -I parsed, then 'no current client'" ($cpIExitCode -eq 1 -and $cpIResult -match 'no current client' -and $cpIResult -notmatch 'unknown flag|invalid') "Exit code: $cpIExitCode Output: $cpIResult"
 
 # ============================================================
 # TEST GROUP 3: refresh-client / refresh
@@ -151,9 +154,9 @@ $smAliasExitCode = $LASTEXITCODE
 Test-Assert "'showmsgs' alias accepted" ($smAliasExitCode -eq 0 -or $smAliasExitCode -eq $null) "Exit code: $smAliasExitCode"
 
 # ============================================================
-# TEST GROUP 6: Platform no-ops (should not error)
+# TEST GROUP 6: Platform handlers
 # ============================================================
-Write-Host "`n[Test Group 6] Platform no-ops" -ForegroundColor Magenta
+Write-Host "`n[Test Group 6] Platform handlers" -ForegroundColor Magenta
 
 # Test 6.1: suspend-client
 $suspResult = & $exe -t test-cli suspend-client 2>&1
@@ -196,14 +199,14 @@ $locksErr = ($locksResult | Out-String)
 Test-Assert "'locks' alias is silent no-op" (-not ($locksErr -match 'unknown command')) "Got: '$locksErr'"
 
 # Test 6.9: resize-window
-$rwResult = & $exe -t test-cli resize-window 2>&1
-$rwErr = ($rwResult | Out-String)
-Test-Assert "resize-window is silent no-op" (-not ($rwErr -match 'unknown command')) "Got: '$rwErr'"
+$rwResult = & $exe -t test-cli resize-window -x 90 -y 28 2>&1
+$rwSize = "$((& $exe -t test-cli display-message -p '#{window_width}' 2>&1).Trim())x$((& $exe -t test-cli display-message -p '#{window_height}' 2>&1).Trim())"
+Test-Assert "resize-window changes window geometry" ($rwSize -eq "90x28") "Got: '$rwSize'; command output: '$rwResult'"
 
 # Test 6.10: resizew alias
-$rwAliasResult = & $exe -t test-cli resizew 2>&1
-$rwAliasErr = ($rwAliasResult | Out-String)
-Test-Assert "resizew alias is silent no-op" (-not ($rwAliasErr -match 'unknown command')) "Got: '$rwAliasErr'"
+$rwAliasResult = & $exe -t test-cli resizew -x 92 -y 29 2>&1
+$rwAliasSize = "$((& $exe -t test-cli display-message -p '#{window_width}' 2>&1).Trim())x$((& $exe -t test-cli display-message -p '#{window_height}' 2>&1).Trim())"
+Test-Assert "resizew alias changes window geometry" ($rwAliasSize -eq "92x29") "Got: '$rwAliasSize'; command output: '$rwAliasResult'"
 
 # Test 6.11: customize-mode
 $cmResult = & $exe -t test-cli customize-mode 2>&1

@@ -148,16 +148,19 @@ if ("$historyLimitBaseline" -match '^\d+$') {
 Write-Test "show-options -v unknown option"
 $val = Psmux show-options -v nonexistent-option -t feat3 | Out-String
 $val = $val.Trim()
-if ("$val" -eq "" -or "$val" -match "unknown") { Write-Pass "show-options -v unknown returns empty/error" }
+if ("$val" -eq "" -or "$val" -match "unknown|invalid option: nonexistent-option") { Write-Pass "show-options -v unknown returns empty/error (tmux: invalid option)" }
 else { Write-Fail "show-options -v unknown got: '$val'" }
 
+# #655: a plain `-w` listing is the window's OWN table, which is empty on a
+# window nobody has written to, so the full catalog now lives behind -g (the
+# global window table) exactly as it does in tmux.
 Write-Test "show-window-options alias"
-$val = Psmux show-window-options -t feat3 | Out-String
+$val = Psmux show-window-options -g -t feat3 | Out-String
 if ("$val" -match "window-status-format|automatic-rename|window-size") { Write-Pass "show-window-options returns window options" }
 else { Write-Fail "show-window-options missing expected window options" }
 
 Write-Test "showw alias"
-$val = Psmux showw -t feat3 | Out-String
+$val = Psmux showw -g -t feat3 | Out-String
 if ("$val" -match "window-status-format|automatic-rename|window-size") { Write-Pass "showw alias returns window options" }
 else { Write-Fail "showw alias missing expected window options" }
 
@@ -382,7 +385,7 @@ $val = $val.Trim()
 if ("$val" -eq "100") { Write-Pass "show-options -v reflects escape-time change: $val" }
 else { Write-Fail "show-options -v escape-time got: '$val'" }
 # Restore
-Psmux set-option -t feat3 escape-time 500 2>$null | Out-Null
+Psmux set-option -t feat3 escape-time 10 2>$null | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 Write-Test "display-message format with clock_mode"
 $val = Psmux display-message -p "mode=#{pane_mode}" -t feat3 | Out-String

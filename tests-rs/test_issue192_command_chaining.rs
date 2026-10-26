@@ -16,6 +16,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -26,6 +29,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -114,4 +119,22 @@ fn execute_command_prompt_chained_commands() {
         "First chained command from prompt should execute");
     assert_eq!(app.status_left, "PROMPT",
         "Second chained command from prompt should execute");
+}
+
+// ─── select-pane inside a chain ─────────────────────────────────────────────
+// A select-pane that has nothing to do on this route (a title, an input flag,
+// a target the one-shot path resolves) returns early from its own command; the
+// commands after it in the list must still run (bindings, hooks, the prompt).
+
+#[test]
+fn execute_command_string_select_pane_does_not_end_the_chain() {
+    for chained in [
+        r"select-pane -T ttl \; set-option status-left AFTER",
+        r"select-pane -t %1 ; set-option status-left AFTER",
+        r"set-option status-style bg=red \; select-pane -d \; set-option status-left AFTER",
+    ] {
+        let mut app = mock_app_with_window();
+        execute_command_string(&mut app, chained).unwrap();
+        assert_eq!(app.status_left, "AFTER", "command after select-pane must run: {chained}");
+    }
 }

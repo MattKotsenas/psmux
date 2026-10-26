@@ -226,7 +226,7 @@ Write-Host "`n[Test B2] WriteConsoleInput into WezTerm-hosted psmux" -Foreground
 # Get the psmux server/TUI process that owns this session
 $psmuxProcs = Get-Process psmux -EA SilentlyContinue
 $injectorExe = "$env:TEMP\psmux_injector.exe"
-$injectorSrc = "C:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs"
+$injectorSrc = "$PSScriptRoot\injector.cs"
 
 # Compile injector if needed
 if (-not (Test-Path $injectorExe) -or ((Test-Path $injectorSrc) -and (Get-Item $injectorSrc).LastWriteTime -gt (Get-Item $injectorExe -EA SilentlyContinue).LastWriteTime)) {

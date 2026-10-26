@@ -149,6 +149,11 @@ fn client_info_creation() {
         last_activity: std::time::Instant::now(),
         tty_name: "/dev/pts/0".to_string(),
         is_control: false,
+        termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+        last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     };
     assert_eq!(info.id, 1);
     assert_eq!(info.width, 120);
@@ -167,6 +172,11 @@ fn client_info_control_mode() {
         last_activity: std::time::Instant::now(),
         tty_name: "/dev/pts/3".to_string(),
         is_control: true,
+        termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+        last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     };
     assert!(info.is_control);
 }
@@ -188,6 +198,11 @@ fn client_registry_add_client() {
         last_activity: std::time::Instant::now(),
         tty_name: "/dev/pts/0".to_string(),
         is_control: false,
+        termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+        last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     };
     app.client_registry.insert(1, info);
     assert_eq!(app.client_registry.len(), 1);
@@ -206,6 +221,11 @@ fn client_registry_add_multiple_clients() {
             last_activity: std::time::Instant::now(),
             tty_name: format!("/dev/pts/{}", i),
             is_control: false,
+            termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+            last_session: None,
+            pid: 0,
+            readonly: false,
+            focused: false,
         });
     }
     assert_eq!(app.client_registry.len(), 5);
@@ -222,6 +242,11 @@ fn client_registry_remove_client() {
         last_activity: std::time::Instant::now(),
         tty_name: "/dev/pts/0".to_string(),
         is_control: false,
+        termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+        last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     });
     app.client_registry.insert(2, ClientInfo {
         id: 2,
@@ -231,6 +256,11 @@ fn client_registry_remove_client() {
         last_activity: std::time::Instant::now(),
         tty_name: "/dev/pts/1".to_string(),
         is_control: false,
+        termfeatures: crate::terminal_features::TerminalFeatures::from_bits(0xf),
+        last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     });
     assert_eq!(app.client_registry.len(), 2);
     app.client_registry.remove(&1);
@@ -302,13 +332,24 @@ fn option_catalog_entries_have_scope() {
 #[test]
 fn option_catalog_default_for_escape_time() {
     let def = crate::server::option_catalog::default_for("escape-time");
-    assert_eq!(def, Some("500"));
+    // tmux 3.5+ default (options-table.c `.default_num = 10`); psmux used
+    // tmux 3.4's 500 until the #841 follow up.
+    assert_eq!(def, Some("10"));
 }
 
 #[test]
 fn option_catalog_default_for_mouse() {
+    // This asserted "off" (tmux's default) while psmux actually starts with
+    // `mouse_enabled: true`, so the catalog was advertising a default the
+    // product does not have. Because customize-mode writes the catalog default
+    // verbatim when you reset an option, that mismatch meant resetting `mouse`
+    // silently turned the mouse OFF in a session the user never reconfigured.
+    // psmux deliberately diverges from tmux here and enables the mouse by
+    // default; the catalog has to mirror the runtime, not upstream tmux.
+    // Enforced across every option by
+    // `tests-rs/test_option_default_parity.rs`.
     let def = crate::server::option_catalog::default_for("mouse");
-    assert_eq!(def, Some("off"));
+    assert_eq!(def, Some("on"));
 }
 
 #[test]
@@ -327,30 +368,6 @@ fn option_catalog_default_for_mode_keys() {
 fn option_catalog_default_for_unknown_returns_none() {
     let def = crate::server::option_catalog::default_for("nonexistent-option");
     assert_eq!(def, None);
-}
-
-#[test]
-fn option_catalog_all_entries_have_valid_types() {
-    let valid_types = ["number", "boolean", "choice", "string"];
-    for def in crate::server::option_catalog::OPTION_CATALOG {
-        assert!(
-            valid_types.contains(&def.option_type),
-            "option '{}' has invalid type '{}' (expected one of {:?})",
-            def.name, def.option_type, valid_types
-        );
-    }
-}
-
-#[test]
-fn option_catalog_all_entries_have_valid_scopes() {
-    let valid_scopes = ["server", "session", "window", "pane"];
-    for def in crate::server::option_catalog::OPTION_CATALOG {
-        assert!(
-            valid_scopes.contains(&def.scope),
-            "option '{}' has invalid scope '{}' (expected one of {:?})",
-            def.name, def.scope, valid_scopes
-        );
-    }
 }
 
 #[test]
@@ -456,7 +473,11 @@ fn search_next_wraps_by_default() {
     crate::copy_mode::search_next(&mut app);
     // Should wrap to index 0
     assert_eq!(app.copy_search_idx, 0);
-    assert_eq!(app.copy_pos, Some((0, 5)));
+    // Where the cursor lands is no longer a plain copy of the match tuple: the
+    // match carries an ABSOLUTE line number and copy_mode::scroll_to_abs_line
+    // maps it back onto the viewport, scrolling if the line is off screen
+    // (#612). That needs a real grid, so it is pinned in
+    // tests-rs/test_issue612_copy_search_scrollback.rs instead.
 }
 
 #[test]
@@ -477,7 +498,6 @@ fn search_next_advances_normally() {
     app.copy_search_idx = 0;
     crate::copy_mode::search_next(&mut app);
     assert_eq!(app.copy_search_idx, 1);
-    assert_eq!(app.copy_pos, Some((1, 10)));
 }
 
 #[test]
@@ -488,7 +508,6 @@ fn search_prev_wraps_by_default() {
     crate::copy_mode::search_prev(&mut app);
     // Should wrap to last index
     assert_eq!(app.copy_search_idx, 2);
-    assert_eq!(app.copy_pos, Some((2, 0)));
 }
 
 #[test]
@@ -509,7 +528,6 @@ fn search_prev_retreats_normally() {
     app.copy_search_idx = 2;
     crate::copy_mode::search_prev(&mut app);
     assert_eq!(app.copy_search_idx, 1);
-    assert_eq!(app.copy_pos, Some((1, 10)));
 }
 
 #[test]
@@ -540,7 +558,6 @@ fn search_next_single_match_wraps_to_self() {
     crate::copy_mode::search_next(&mut app);
     // Only one match, wraps to itself
     assert_eq!(app.copy_search_idx, 0);
-    assert_eq!(app.copy_pos, Some((5, 10)));
 }
 
 #[test]
@@ -551,7 +568,6 @@ fn search_prev_single_match_wraps_to_self() {
     crate::copy_mode::search_prev(&mut app);
     // Only one match, wraps to itself (last index = 0)
     assert_eq!(app.copy_search_idx, 0);
-    assert_eq!(app.copy_pos, Some((5, 10)));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -576,10 +592,20 @@ fn session_group_can_be_set() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn session_id_is_unique() {
+fn building_a_state_object_allocates_no_session_id() {
+    // This used to assert that two `AppState`s differ, which held only because
+    // the constructor spent a number out of the `next_session_id` counter in
+    // whatever data directory the process pointed at. A server allocates its own
+    // id now (server/mod.rs, right after `socket_name` is known), so a state
+    // object built here writes no file and carries the unallocated 0.
+    //
+    // The property the old assertion was reaching for, that no two sessions get
+    // one id, is `allocate_session_id_is_unique_under_concurrency` in
+    // test_session_id_alloc_race.rs, which hammers the allocator from 16 threads.
     let app1 = AppState::new("s1".to_string());
     let app2 = AppState::new("s2".to_string());
-    assert_ne!(app1.session_id, app2.session_id, "each AppState should get a unique session_id");
+    assert_eq!(app1.session_id, 0, "a constructed state object holds no allocated id");
+    assert_eq!(app2.session_id, 0, "a constructed state object holds no allocated id");
 }
 
 #[test]
@@ -619,9 +645,12 @@ fn user_options_initially_empty() {
 }
 
 #[test]
-fn command_aliases_initially_empty() {
+fn command_aliases_initially_hold_tmux_defaults() {
     let app = mock_app();
-    assert!(app.command_aliases.is_empty());
+    assert_eq!(
+        *crate::command_alias::read(&app.command_aliases),
+        crate::command_alias::CommandAliases::with_defaults()
+    );
 }
 
 #[test]

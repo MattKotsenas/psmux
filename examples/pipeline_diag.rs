@@ -39,7 +39,7 @@ fn vt_to_color(c: vt100::Color) -> Color {
     }
 }
 
-/// Identical to the cell → span logic in render_node
+/// Mirrors the cell-to-span logic in client::render_layout_json.
 fn build_lines_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
     for r in 0..rows {
@@ -110,7 +110,7 @@ fn main() {
     let hcell = screen.cell(0, 15).unwrap();
     println!("  cell(0,15): '{}' hidden={}", hcell.contents(), hcell.hidden());
 
-    // Step 2: Build lines exactly as render_node does
+    // Step 2: Build lines as the active client renderer does
     let lines = build_lines_from_screen(screen, rows, cols);
 
     // Step 3: Inspect the spans
@@ -293,4 +293,3 @@ fn main() {
         println!("FAIL: Hidden (\\e[8m) leaked into output");
     }
 }
-

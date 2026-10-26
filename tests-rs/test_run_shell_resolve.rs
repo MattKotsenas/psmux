@@ -23,6 +23,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -33,6 +36,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -378,4 +383,163 @@ fn parse_command_line_backslash_in_double_quotes() {
 fn parse_command_line_empty_string() {
     let parts = parse_command_line("");
     assert!(parts.is_empty());
+}
+
+// ─── run-shell child PATH ───────────────────────────────────────────────────
+//
+// A run-shell child inherits the SERVER's environment, which may not contain
+// the directory psmux itself runs from: a parked warm server keeps the
+// environment of whatever spawned it, even after another session claims it.
+// Plugin scripts and user bindings that shell out to `psmux` then fail with
+// "not recognized as the name of a cmdlet" although psmux is running.
+
+#[cfg(windows)]
+fn own_dir() -> String {
+    std::env::current_exe()
+        .expect("current_exe()")
+        .parent()
+        .expect("current_exe() has a parent")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn child_path(cmd: &std::process::Command) -> Option<String> {
+    cmd.get_envs()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+}
+
+#[cfg(windows)]
+fn path_entries(path: &str) -> Vec<&str> {
+    path.split(';').collect()
+}
+
+#[test]
+#[cfg(windows)]
+fn prepend_if_absent_prepends_missing_dir() {
+    assert_eq!(
+        prepend_if_absent(r"C:\Windows;C:\Windows\System32", r"D:\psmux").as_deref(),
+        Some(r"D:\psmux;C:\Windows;C:\Windows\System32")
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn prepend_if_absent_handles_empty_path() {
+    assert_eq!(prepend_if_absent("", r"D:\psmux").as_deref(), Some(r"D:\psmux"));
+}
+
+#[test]
+#[cfg(windows)]
+fn prepend_if_absent_keeps_an_existing_entry() {
+    assert_eq!(prepend_if_absent(r"D:\psmux;C:\Windows", r"D:\psmux"), None);
+}
+
+#[test]
+#[cfg(windows)]
+fn prepend_if_absent_ignores_case_and_trailing_separator() {
+    assert_eq!(prepend_if_absent(r"d:\PSMUX\;C:\Windows", r"D:\psmux"), None);
+    assert_eq!(prepend_if_absent(r"C:\Windows;D:\psmux", r"D:\psmux\"), None);
+}
+
+/// The reported failure: a server whose `PATH` does not contain the psmux
+/// directory. The child still has to be able to resolve `psmux`, and the
+/// directory must show up exactly once.
+#[test]
+#[cfg(windows)]
+fn run_shell_child_gets_psmux_dir_on_a_poisoned_path() {
+    let mut cmd = std::process::Command::new("cmd");
+    apply_own_dir_to_path(&mut cmd, r"C:\Windows;C:\Windows\System32");
+
+    let path = child_path(&cmd).expect("the child must receive an explicit PATH");
+    let dir = own_dir();
+    let entries = path_entries(&path);
+    assert_eq!(
+        entries.first().map(|entry| entry.trim_end_matches(|c| c == '\\' || c == '/')),
+        Some(dir.trim_end_matches(|c| c == '\\' || c == '/')),
+        "expected {dir} first on the child PATH, got {path}"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.trim_end_matches(|c| c == '\\' || c == '/').eq_ignore_ascii_case(&dir))
+            .count(),
+        1,
+        "expected {dir} exactly once on the child PATH, got {path}"
+    );
+    assert!(
+        path.ends_with(r"C:\Windows;C:\Windows\System32"),
+        "the inherited PATH must be preserved after the prepended entry, got {path}"
+    );
+}
+
+/// An environment that already knows about psmux is left exactly as the caller
+/// set it up: no duplicate entry, no reordering.
+#[test]
+#[cfg(windows)]
+fn run_shell_child_path_is_untouched_when_psmux_is_already_on_it() {
+    let mut cmd = std::process::Command::new("cmd");
+    apply_own_dir_to_path(&mut cmd, &format!("{};C:\\Windows", own_dir()));
+    assert!(
+        child_path(&cmd).is_none(),
+        "an inherited PATH that already contains the psmux directory must not be rewritten"
+    );
+}
+
+
+// ─── a plugin's .tmux entry script runs with Git Bash ──────────────────────
+
+/// A Git for Windows install under `root`: its `bin\bash.exe`, the MSYS
+/// `usr\bin\bash.exe` beside it and `cmd\git.exe`.
+#[cfg(windows)]
+fn fake_git_install(root: &std::path::Path) {
+    for dir in ["bin", "usr\\bin", "cmd"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for file in ["bin\\bash.exe", "usr\\bin\\bash.exe", "cmd\\git.exe"] {
+        std::fs::write(root.join(file), b"").unwrap();
+    }
+}
+
+/// Git Bash is the `bin\bash.exe` of the install `git.exe` belongs to, else
+/// of an install directory, and only with its MSYS bash beside it.
+#[test]
+#[cfg(windows)]
+fn git_bash_is_found_from_git_or_an_install_directory() {
+    let tmp = std::env::temp_dir().join(format!("psmux_test_git_bash_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (installed, other, stray) = (tmp.join("Git"), tmp.join("Other"), tmp.join("Stray"));
+    fake_git_install(&installed);
+    fake_git_install(&other);
+    std::fs::create_dir_all(stray.join("bin")).unwrap();
+    std::fs::write(stray.join("bin").join("bash.exe"), b"").unwrap();
+
+    let git = installed.join("cmd").join("git.exe");
+    assert_eq!(find_git_bash(Some(&git), &[other.clone()]), Some(installed.join("bin").join("bash.exe")));
+    assert_eq!(find_git_bash(None, &[stray.clone(), other.clone()]), Some(other.join("bin").join("bash.exe")));
+    assert_eq!(find_git_bash(Some(&stray.join("bin").join("git.exe")), &[stray.clone()]), None);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A run-shell command that is one `.tmux` file runs it with Git Bash, its
+/// path written with `/` so the script's `dirname "${BASH_SOURCE[0]}"`
+/// finds its directory.
+#[test]
+#[cfg(windows)]
+fn a_tmux_script_runs_with_git_bash() {
+    let Some(bash) = git_bash() else { return };
+    let tmp = std::env::temp_dir().join(format!("psmux_test_tmux_script_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let script = tmp.join("p.tmux");
+    std::fs::write(&script, "tmux set -g @p on\n").unwrap();
+
+    let cmd = build_run_shell_command(&format!("'{}'", script.display()));
+    assert_eq!(std::path::Path::new(cmd.get_program()), bash);
+    let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert_eq!(args, vec![script.to_string_lossy().replace('\\', "/")]);
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

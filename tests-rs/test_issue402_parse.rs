@@ -16,8 +16,8 @@ fn extract_run_shell(cmd: &str) -> (String, bool) {
 
 #[test]
 fn parse_singlequoted_vs_unquoted_c_path() {
-    let sq = r"run-shell psmux new-window -n W -c 'C:\Users\godwin\psmux_test402\project'";
-    let uq = r"run-shell psmux new-window -n W -c C:\Users\godwin\psmux_test402\project";
+    let sq = r"run-shell psmux new-window -n W -c 'C:\Users\testuser\psmux_test402\project'";
+    let uq = r"run-shell psmux new-window -n W -c C:\Users\testuser\psmux_test402\project";
 
     let sq_tokens = parse_command_line(sq);
     let uq_tokens = parse_command_line(uq);

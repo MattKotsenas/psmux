@@ -1,9 +1,8 @@
-# Issue #168: update_tab_positions() uses hardcoded format, causing tab click
-# misalignment when status-left / window-status-format is customized.
+# Issue #168: Client-side tab positions honor customized status-left and
+# window-status-format.
 #
-# Fix: The server-side update_tab_positions() is now dead code (#[allow(dead_code)]).
-# Tab click positions are computed CLIENT-SIDE at render time (client.rs:5119),
-# using the actual rendered widths of status-left and window-status-format spans.
+# Tab click positions are computed client-side at render time, using the actual
+# rendered widths of status-left and window-status-format spans.
 # This means tab positions automatically track any custom status-left width.
 #
 # What is observable via dump-state / show-options:

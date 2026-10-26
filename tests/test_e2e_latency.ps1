@@ -52,6 +52,7 @@ function Run-LatencyTest {
     )
     
     $sessionName = "lattest_$(Get-Random)"
+    $stallIdx = $null; $stallChar = $null
     
     Write-Host ""
     Write-Host "=== $Label ===" -ForegroundColor Cyan
@@ -152,7 +153,36 @@ function Run-LatencyTest {
         
         while (([System.Diagnostics.Stopwatch]::GetTimestamp() - $startTick) -lt $maxTicks) {
             $wr.WriteLine("dump-state"); $wr.Flush()
-            $resp = $rd.ReadLine()
+            try {
+                $resp = $rd.ReadLine()
+            } catch {
+                # Sweep 2026-09-27_22-06-09: the server stopped answering this
+                # connection for the whole 10 s read timeout after a WSL key got
+                # no echo. The exception used to escape, so the suite died with
+                # no assertions, no evidence, and a leaked session server. Six
+                # isolated reruns passed. Record what the server was doing and
+                # fail cleanly so a recurrence can be diagnosed.
+                $stallChar = $ch; $stallIdx = $i
+                Write-Host "  [FAIL] dump-state got no reply within 10 s after $ch (idx $i): $($_.Exception.InnerException.Message)" -ForegroundColor Red
+                $alive = $false; try { $alive = -not (Get-Process -Id $proc.Id -EA Stop).HasExited } catch {}
+                Write-Host "  [DIAG] launching client pid $($proc.Id) alive: $alive"
+                try {
+                    $t2 = New-Object System.Net.Sockets.TcpClient; $t2.Connect("127.0.0.1", $port)
+                    $s2 = $t2.GetStream(); $s2.ReadTimeout = 5000
+                    $w2 = New-Object System.IO.StreamWriter($s2); $r2 = New-Object System.IO.StreamReader($s2)
+                    $sw2 = [Diagnostics.Stopwatch]::StartNew()
+                    $w2.WriteLine("AUTH $key"); $w2.Flush(); $a2 = $r2.ReadLine()
+                    $w2.WriteLine("display-message -p #{pane_current_command} #{pane_dead}"); $w2.Flush(); $d2 = $r2.ReadLine()
+                    Write-Host "  [DIAG] fresh connection: auth=$a2 reply=$d2 in $([int]$sw2.Elapsed.TotalMilliseconds) ms"
+                    $t2.Close()
+                } catch { Write-Host "  [DIAG] fresh connection also got no reply: $($_.Exception.Message)" }
+                try {
+                    $cap = & $psmuxExe capture-pane -t $sessionName -p 2>&1 | Select-Object -Last 6
+                    Write-Host "  [DIAG] pane tail:"; $cap | ForEach-Object { Write-Host "         $_" }
+                } catch {}
+                $script:StallFailures++
+                break
+            }
             $polls++
             
             if ($resp -ne "NC") {
@@ -171,6 +201,7 @@ function Run-LatencyTest {
         [void]$latencies.Add($elapsedMs)
         [void]$pollCountList.Add($polls)
         
+        if ($null -ne $stallIdx) { break }
         if (-not $found) {
             Write-Host "  WARN: no echo for '$ch' (idx $i)" -ForegroundColor Red
         }
@@ -242,6 +273,7 @@ function Run-LatencyTest {
     }
 }
 
+$script:StallFailures = 0
 # ── Run tests ──
 $results = @()
 
@@ -270,3 +302,8 @@ foreach ($r in $results) {
         $r.Label, $r.Avg, $r.P50, $r.P90, $r.Max, $r.Degradation)
 }
 Write-Host ""
+
+# A dump-state stall fails the suite (see the catch in Run-LatencyTest);
+# everything else here is a measurement, not an assertion.
+if ($script:StallFailures -gt 0) { Write-Host "  [FAIL] $($script:StallFailures) run(s) stalled on dump-state" -ForegroundColor Red; exit 1 }
+exit 0

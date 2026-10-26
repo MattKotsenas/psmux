@@ -43,6 +43,43 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
         }
     }
 
+    /// A copy of this parser's screen: same grid, same scrollback, same
+    /// visible rows and cursor, with a fresh escape-sequence parser.
+    ///
+    /// psmux's copy mode reads one of these instead of the live screen, which
+    /// is how tmux's copy mode works (`window_copy_init` copies the pane's
+    /// grid).  The pane keeps running underneath the frozen view, so nothing
+    /// the application prints can shift, evict or re-anchor what the user is
+    /// reading, and leaving copy mode shows everything that arrived meanwhile.
+    #[must_use]
+    pub fn snapshot(&self) -> Self
+    where
+        CB: Default,
+    {
+        let mut screen = self.screen.screen.clone();
+        screen.capture_queries(false);
+        Self {
+            parser: vte::Parser::new(),
+            screen: crate::perform::WrappedScreen::from_screen(screen, CB::default()),
+        }
+    }
+
+    /// A [`snapshot`](Self::snapshot) of the main screen that the alternate
+    /// screen covers, or `None` when the alternate screen is not in use.
+    /// This is what tmux's `capture-pane -a` reads (`wp->base.saved_grid`).
+    #[must_use]
+    pub fn saved_normal_snapshot(&self) -> Option<Self>
+    where
+        CB: Default,
+    {
+        if !self.screen().alternate_screen() {
+            return None;
+        }
+        let mut snap = self.snapshot();
+        snap.screen.screen.show_saved_normal_grid();
+        Some(snap)
+    }
+
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {

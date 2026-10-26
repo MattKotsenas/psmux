@@ -245,11 +245,18 @@ if ($lkD -match "bind-key.*-T\s+prefix\s+d\s+detach-client") {
 }
 
 Write-Host "  [Test 3e] list-keys -T prefix x returns kill-pane (offline)"
+# Real tmux's actual default `x` binding is NOT bare "kill-pane" -- it is
+# confirm-before wrapped, per tmux's own key-bindings.c and the DEFAULT KEY
+# BINDINGS section of the tmux(1) man page:
+#   bind-key x confirm-before -p "kill-pane #P? (y/n)" kill-pane
+# psmux matches this exactly, so the regex below was checking for the wrong
+# (bare) form; it is corrected to require the confirm-before wrapper while
+# still verifying "kill-pane" is the underlying action (task #7 batch A bug 4).
 $lkX = & $PSMUX list-keys -T prefix x 2>&1 | Out-String
-if ($lkX -match "bind-key.*-T\s+prefix\s+x\s+kill-pane") {
-    Pass "x => kill-pane: $($lkX.Trim())"
+if ($lkX -match "bind-key.*-T\s+prefix\s+x\s+confirm-before\s.*kill-pane.*kill-pane") {
+    Pass "x => confirm-before ... kill-pane (tmux-compat default): $($lkX.Trim())"
 } else {
-    Fail "x did not map to kill-pane, got: $($lkX.Trim())"
+    Fail "x did not map to confirm-before-wrapped kill-pane, got: $($lkX.Trim())"
 }
 
 Write-Host "  [Test 3f] list-keys -T prefix (no key) lists ALL prefix bindings"

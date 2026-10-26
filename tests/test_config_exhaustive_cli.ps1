@@ -46,10 +46,9 @@ function Send-Tcp($session, $cmd, [int]$TimeoutMs = 5000) {
                 $line = $reader.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if (-not $stream.DataAvailable) {
-                    Start-Sleep -Milliseconds 100
-                    if (-not $stream.DataAvailable) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $client.Close()
@@ -59,6 +58,11 @@ function Send-Tcp($session, $cmd, [int]$TimeoutMs = 5000) {
 
 function CLI-Show($sess, $opt) {
     $out = & $psmux show-options -t $sess -g $opt 2>&1 | Out-String
+    return $out.Trim()
+}
+
+function CLI-ShowSession($sess, $opt) {
+    $out = & $psmux show-options -t $sess $opt 2>&1 | Out-String
     return $out.Trim()
 }
 
@@ -102,7 +106,7 @@ $bools = @(
     'allow-rename', 'monitor-activity',
     'remain-on-exit', 'destroy-unattached', 'exit-empty',
     'set-titles',
-    'scroll-enter-copy-mode', 'pwsh-mouse-selection',
+    'scroll-enter-copy-mode', 'pwsh-mouse-selection', 'mouse-selection-force',
     'synchronize-panes', 'warm',
     'allow-predictions', 'claude-code-fix-tty', 'claude-code-force-interactive'
 )
@@ -122,7 +126,7 @@ foreach ($opt in $bools) {
 # ============================================================
 
 $nums = @(
-    @{n='escape-time'; v='100'; d='500'},
+    @{n='escape-time'; v='100'; d='10'},  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
     @{n='history-limit'; v='50000'; d='2000'},
     @{n='display-time'; v='3000'; d='750'},
     @{n='display-panes-time'; v='5000'; d='1000'},
@@ -198,14 +202,15 @@ Test-Result "cli-flag-g" ($show -match '\b42\b') "show='$show'"
 # -a (append) using separate flag
 CLI-Set $sess @('-g', 'status-right', 'AAA')
 & $psmux set-option -t $sess -a status-right BBB 2>&1 | Out-Null
-$show = CLI-Show $sess 'status-right'
+# -a without -g appends to the session's own value; the global stays AAA (tmux, #803)
+$show = CLI-ShowSession $sess 'status-right'
 Test-Result "cli-flag-a-append" ($show -match 'AAABBB') "show='$show'"
 
 # Triple append
 CLI-Set $sess @('-g', 'status-left', 'X')
 & $psmux set-option -t $sess -a status-left Y 2>&1 | Out-Null
 & $psmux set-option -t $sess -a status-left Z 2>&1 | Out-Null
-$show = CLI-Show $sess 'status-left'
+$show = CLI-ShowSession $sess 'status-left'
 Test-Result "cli-flag-a-triple" ($show -match 'XYZ') "show='$show'"
 
 # -u (unset) on @user option using separate flag
@@ -223,7 +228,8 @@ Test-Result "cli-flag-q-silent" ($show -match 'mouse') "Server still alive: show
 
 # -w (window scope)
 & $psmux set-option -t $sess -w mouse on 2>&1 | Out-Null
-$show = CLI-Show $sess 'mouse'
+# mouse is a session option, so -w sets the session's value (tmux options_scope_from_name)
+$show = CLI-ShowSession $sess 'mouse'
 Test-Result "cli-flag-w" ($show -match '\bon\b') "show='$show'"
 
 # -t target
@@ -232,7 +238,7 @@ $show = CLI-Show $sess 'escape-time'
 Test-Result "cli-flag-t-target" ($show -match '99') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ============================================================
 # SECTION 5: User/@- options lifecycle via CLI
@@ -430,7 +436,7 @@ $tcp = Send-Tcp $sess "show-options -g @cross-test"
 Test-Result "cli-cross-tcp-user" ($tcp -match 'clipal') "TCP verify: '$tcp'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ============================================================
 # SECTION 17: Config file via source-file CLI + VERIFY loaded values
@@ -458,7 +464,7 @@ $show = CLI-Show $sess 'status-position'
 Test-Result "cfg-top" ($show -match 'top') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 CLI-Set $sess @('-g', 'base-index', '0')
 CLI-Set $sess @('-g', 'status-position', 'bottom')
 Remove-Item $tempConfig -Force -ErrorAction SilentlyContinue
@@ -486,7 +492,7 @@ $show = CLI-Show $sess 'status-left'
 Test-Result "cont-Hello" ($show -match 'HELLO') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 Remove-Item $tempCont -Force -ErrorAction SilentlyContinue
 
 # ============================================================
@@ -517,7 +523,7 @@ $show = CLI-Show $sess 'base-index'
 Test-Result "if-false-2" ($show -match '\b2\b') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 CLI-Set $sess @('-g', 'base-index', '0')
 Remove-Item $tempIf -Force -ErrorAction SilentlyContinue
 
@@ -538,7 +544,7 @@ $show = CLI-Show $sess 'escape-time'
 Test-Result "hidden-99" ($show -match '\b99\b') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 Remove-Item $tempHid -Force -ErrorAction SilentlyContinue
 
 # ============================================================
@@ -556,7 +562,7 @@ $show = CLI-Show $sess 'escape-time'
 Test-Result "bom-44" ($show -match '\b44\b') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 Remove-Item $tempBom -Force -ErrorAction SilentlyContinue
 
 # ============================================================
@@ -578,7 +584,7 @@ $show = CLI-Show $sess 'base-index'
 Test-Result "cli-source-bi-3" ($show -match '\b3\b') "show='$show'"
 
 # Restore
-CLI-Set $sess @('-g', 'escape-time', '500')
+CLI-Set $sess @('-g', 'escape-time', '10')  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 CLI-Set $sess @('-g', 'base-index', '0')
 Remove-Item $tempSrc -Force -ErrorAction SilentlyContinue
 

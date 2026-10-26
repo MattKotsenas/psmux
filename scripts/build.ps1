@@ -18,7 +18,9 @@ try {
     Write-Host "[build] Killing old psmux instances..." -ForegroundColor Cyan
     $existing = Get-Command psmux -ErrorAction SilentlyContinue
     if ($existing) {
-        & psmux kill-server 2>$null
+        # -a: a build has to free the binary in EVERY namespace, and a bare
+        # kill-server is scoped to the default one since #649.
+        & psmux kill-server -a 2>$null
     }
     foreach ($name in @("psmux", "pmux", "tmux")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

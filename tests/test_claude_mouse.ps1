@@ -76,13 +76,13 @@ foreach ($pos in $rightPositions) {
 
 # Send scroll events
 Write-Host "Sending 4 scroll events..."
-Send-MouseCmd -P $Port -K $Key -Cmd "mouse-scroll-up 30 15"
+Send-MouseCmd -P $Port -K $Key -Cmd "scroll-up 30 15"
 Start-Sleep -Milliseconds 100
-Send-MouseCmd -P $Port -K $Key -Cmd "mouse-scroll-up 30 15"
+Send-MouseCmd -P $Port -K $Key -Cmd "scroll-up 30 15"
 Start-Sleep -Milliseconds 100
-Send-MouseCmd -P $Port -K $Key -Cmd "mouse-scroll-down 30 15"
+Send-MouseCmd -P $Port -K $Key -Cmd "scroll-down 30 15"
 Start-Sleep -Milliseconds 100
-Send-MouseCmd -P $Port -K $Key -Cmd "mouse-scroll-down 30 15"
+Send-MouseCmd -P $Port -K $Key -Cmd "scroll-down 30 15"
 Start-Sleep -Milliseconds 200
 
 # Wait a moment for any output to settle

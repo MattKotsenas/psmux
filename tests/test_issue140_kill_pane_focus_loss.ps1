@@ -8,6 +8,9 @@
 #
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_issue140_kill_pane_focus_loss.ps1
 
+# Pane ids go in the PANE slot: "session:.%id". Written "session:%id" the id
+# lands in the WINDOW slot, which real tmux rejects too ("can't find window: %1"),
+# so every select/kill here silently acted on the active pane instead.
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -142,20 +145,20 @@ try {
     Write-Info "  Panes: p1=${p1} p2=${p2} p3=${p3} p4=${p4} p5=${p5}"
 
     # select-pane -t %1
-    & $PSMUX select-pane -t "${SESSION}:${p1}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p1}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
     $active = Get-ActivePaneId $SESSION
     Write-Info "  After select ${p1}: active=$active"
 
     # select-pane -t %3
-    & $PSMUX select-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
     $active = Get-ActivePaneId $SESSION
     Write-Info "  After select ${p3}: active=$active"
 
     # Now MRU should be: p3, p1, ...
     # Kill %3 by pane ID
-    & $PSMUX kill-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $activeAfter = Get-ActivePaneId $SESSION
@@ -204,15 +207,15 @@ try {
     Write-Info "  Panes: p1=$p1 p2=$p2 p3=$p3"
 
     # Navigate: focus p1, focus p2, focus p3 -> MRU: p3, p2, p1
-    & $PSMUX select-pane -t "${SESSION}:${p1}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p1}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 300
-    & $PSMUX select-pane -t "${SESSION}:${p2}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p2}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 300
-    & $PSMUX select-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
 
     # Kill p3 by ID -> MRU should pick p2
-    & $PSMUX kill-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $activeAfter = Get-ActivePaneId $SESSION
@@ -248,14 +251,14 @@ try {
     Write-Info "  Panes: p1=$p1 p2=$p2 p3=$p3"
 
     # Focus p1
-    & $PSMUX select-pane -t "${SESSION}:${p1}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p1}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
 
     $activeBefore = Get-ActivePaneId $SESSION
     Write-Info "  Active before kill: $activeBefore (should be ${p1})"
 
     # Kill p3 (not active) by ID
-    & $PSMUX kill-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $activeAfter = Get-ActivePaneId $SESSION
@@ -291,15 +294,15 @@ try {
     Write-Info "  Panes: p1=$p1 p2=$p2 p3=$p3"
 
     # Navigate: p1 -> p2 -> p3 -> MRU: p3, p2, p1
-    & $PSMUX select-pane -t "${SESSION}:${p1}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p1}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 300
-    & $PSMUX select-pane -t "${SESSION}:${p2}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p2}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 300
-    & $PSMUX select-pane -t "${SESSION}:${p3}" 2>&1 | Out-Null
+    & $PSMUX select-pane -t "${SESSION}:.${p3}" 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
 
     # Send 'exit' to p3 to trigger process death path
-    & $PSMUX send-keys -t "${SESSION}:${p3}" 'exit' Enter 2>&1 | Out-Null
+    & $PSMUX send-keys -t "${SESSION}:.${p3}" 'exit' Enter 2>&1 | Out-Null
     Start-Sleep -Seconds 3
 
     $activeAfter = Get-ActivePaneId $SESSION

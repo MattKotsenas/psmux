@@ -1,10 +1,10 @@
 # Issue #263 — final irrefutable proof.
 #
 # Method: nested psmux. Inner psmux is fully attached to the outer pane, so
-# the inner's LIVE RENDER PATH (src/rendering.rs via crossterm) writes ANSI
-# sequences to the outer pane's PTY. Capture-pane on the OUTER pane shows
-# exactly what the inner renderer wrote. If the SGR color is preserved before
-# every box-drawing char, the bug is NOT present in this build.
+# client::render_layout_json writes ANSI sequences to the outer pane's PTY.
+# Capture-pane on the OUTER pane shows exactly what the inner renderer wrote.
+# If the SGR color is preserved before every box-drawing char, the bug is NOT
+# present in this build.
 #
 # Verification fix: use [regex] match instead of String.IndexOf(char) to
 # avoid PowerShell's char/string overload quirk.

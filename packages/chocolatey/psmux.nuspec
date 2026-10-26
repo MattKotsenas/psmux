@@ -4,8 +4,8 @@
     <id>psmux</id>
     <version>0.4.9</version>
     <title>psmux - Terminal Multiplexer for Windows</title>
-    <authors>Josh</authors>
-    <owners>Josh</owners>
+    <authors>Godwin Sam Josh</authors>
+    <owners>Godwin Sam Josh</owners>
     <licenseUrl>https://github.com/psmux/psmux/blob/master/LICENSE</licenseUrl>
     <projectUrl>https://github.com/psmux/psmux</projectUrl>
     <iconUrl>https://raw.githubusercontent.com/psmux/psmux/master/icon.svg</iconUrl>

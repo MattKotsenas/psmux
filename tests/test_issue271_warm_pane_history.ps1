@@ -14,9 +14,15 @@ function Write-Info($msg) { Write-Host "  [INFO] $msg" -ForegroundColor DarkCyan
 function Cleanup-Sessions {
     & $PSMUX kill-server 2>&1 | Out-Null
     Start-Sleep -Seconds 1
-    Remove-Item "$psmuxDir\*.port" -Force -EA SilentlyContinue
-    Remove-Item "$psmuxDir\*.key"  -Force -EA SilentlyContinue
-    Remove-Item "$psmuxDir\*.sess" -Force -EA SilentlyContinue
+    # Only the DEFAULT namespace's registry, which is what the bare kill-server
+    # above tore down. A namespaced file is "<ns>__<session>.<ext>" with a
+    # non-empty ns that does not start with an underscore ("__warm__" itself is
+    # the default namespace's standby). The old "*.port" wildcard deleted every
+    # -L namespace's registry too and knocked out every sibling server on the
+    # machine (2026-09-16).
+    Get-ChildItem "$psmuxDir\*.port","$psmuxDir\*.key","$psmuxDir\*.sess" -EA SilentlyContinue |
+        Where-Object { $_.BaseName -notmatch '^[^_].*?__' } |
+        Remove-Item -Force -EA SilentlyContinue
 }
 
 function Wait-PanePrompt {

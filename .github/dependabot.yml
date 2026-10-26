@@ -1,0 +1,57 @@
+version: 2
+
+# Without this file the repo gets Dependabot ALERTS but no update PRs, so every
+# advisory had to be chased by hand. The CI `audit` job is the gate; these
+# entries are what actually proposes the fix.
+#
+# Two ecosystems, because tests/monitor is a separate cargo workspace and is not
+# covered by the root manifest. Its lockfile has raised a real advisory before
+# (GHSA-rhfx-m35p-ff5j), so it is not optional.
+#
+# crates/portable-pty-psmux and crates/vt100-psmux are members of the root
+# workspace and intentionally carry no Cargo.lock of their own, so the root
+# entry already covers them.
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: build
+    groups:
+      # One PR per week for routine patch/minor churn keeps this from burying
+      # real work. Security updates are deliberately left out of the group so
+      # they arrive as their own PR and stay visible.
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: "/tests/monitor"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+    commit-message:
+      prefix: build
+    groups:
+      test-monitor-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+    commit-message:
+      prefix: ci

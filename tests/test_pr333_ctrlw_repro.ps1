@@ -21,6 +21,22 @@ try {
     $tries++
   } while ($cap -notmatch 'PS\s' -and $tries -lt 20)
 
+  # Disable PSReadLine's inline history-prediction ghost text before typing.
+  # Root-cause note (2026-07-18 debugging pass): on a dev machine whose
+  # persisted $PROFILE-independent ConsoleHost_history.txt already contains
+  # an entry starting with "Hello World " + a long run of CJK filler (from
+  # unrelated earlier manual CJK testing on this exact repo), PSReadLine's
+  # default PredictionSource=History renders that entry as inline ghost
+  # text the moment the buffer prefix-matches it. capture-pane faithfully
+  # captures that ghost text (it's real VT screen content pwsh drew), which
+  # LOOKS like Ctrl+W corrupted/duplicated CJK text but is unrelated to
+  # Ctrl+W or word-delete: Ctrl+W only edits the real input buffer, and the
+  # ghost suggestion simply re-renders against the shortened buffer since it
+  # still prefix-matches. Confirmed by disabling prediction: Ctrl+W then
+  # deletes exactly one word every time, with zero CJK ever appearing.
+  & $exe -L $session send-keys -t "${session}:0" "Set-PSReadLineOption -PredictionSource None" Enter | Out-Null
+  Start-Sleep -Milliseconds 600
+
   # Type "hello world" then Ctrl+W
   & $exe -L $session send-keys -t "${session}:0" "hello world" | Out-Null
   Start-Sleep -Milliseconds 400

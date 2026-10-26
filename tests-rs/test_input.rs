@@ -11,6 +11,66 @@ fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     }
 }
 
+// ── DECCKM (application cursor keys): arrows/Home/End use SS3 in app mode ──
+
+#[test]
+fn cursor_keys_keep_csi_when_app_cursor_off() {
+    // Not in application-cursor mode: None => caller writes the CSI form verbatim.
+    for csi in [b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b[H", b"\x1b[F"] {
+        assert_eq!(csi_cursor_to_ss3(csi, false), None, "app-cursor off must keep CSI");
+    }
+}
+
+#[test]
+fn cursor_keys_become_ss3_when_app_cursor_on() {
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", true), Some(*b"\x1bOA")); // up
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[B", true), Some(*b"\x1bOB")); // down
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[C", true), Some(*b"\x1bOC")); // right
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[D", true), Some(*b"\x1bOD")); // left
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[H", true), Some(*b"\x1bOH")); // home
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[F", true), Some(*b"\x1bOF")); // end
+}
+
+#[test]
+fn non_cursor_and_modified_keys_never_ss3() {
+    // App-cursor mode must NOT touch tilde keys or modified arrows: xterm modified
+    // cursor keys stay CSI (ESC [ 1 ; mod x) and are longer than 3 bytes.
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[5~", true), None);   // PageUp
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[3~", true), None);   // Delete
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[1;5A", true), None); // Ctrl+Up
+    assert_eq!(csi_cursor_to_ss3(b"\x1bOA", true), None);    // already SS3
+    assert_eq!(csi_cursor_to_ss3(b"x", true), None);         // not an escape
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[Z", true), None);    // BackTab: 3-byte CSI, final byte outside A-D/H/F
+    assert_eq!(csi_cursor_to_ss3(b"", true), None);          // empty
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[", true), None);     // truncated (len 2)
+}
+
+// ── Integration: parser DECCKM state drives the encoder (no pane/PTY/server) ──
+
+#[test]
+fn decckm_parser_state_drives_arrow_encoding() {
+    // Walk one terminal through the timeline the encoder observes at keypress time.
+    let mut term = vt100::Parser::new(24, 80, 0);
+
+    // Fresh screen defaults to off, so Up stays CSI.
+    assert!(!term.screen().application_cursor(), "fresh screen defaults to off");
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), None);
+
+    // PSReadLine enables DECCKM, so Up becomes SS3.
+    term.process(b"\x1b[?1h");
+    assert!(term.screen().application_cursor());
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), Some(*b"\x1bOA"));
+
+    // Mode survives later output (the encoder reads it long after the app set it).
+    term.process(b"PS C:\\> \x1b[32mgreen\x1b[m");
+    assert!(term.screen().application_cursor());
+
+    // Reset restores CSI.
+    term.process(b"\x1b[?1l");
+    assert!(!term.screen().application_cursor());
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), None);
+}
+
 // ── AltGr characters (Ctrl+Alt on Windows) should be forwarded verbatim ──
 
 #[test]
@@ -214,14 +274,34 @@ fn alt_enter_produces_correct_encoding() {
 
 // ── parse_modified_special_key tests (PR #115) ──
 
+// `send-keys S-Enter` has to put the same bytes in the pane as a real
+// Shift+Enter keystroke does, and on Windows the CSI form puts NOTHING there:
+// feeding a real pseudoconsole ESC [ 13;2 ~ and ESC [ 13;3 ~ produced zero
+// input records, while 1b 0d produced VK_RETURN with LEFT_ALT_PRESSED
+// (issue #611).  So these mirror `encode_key_event` exactly.
 #[test]
 fn parse_shift_enter() {
+    #[cfg(windows)]
+    assert_eq!(parse_modified_special_key("S-Enter"), Some("\x1b\r".to_string()));
+    #[cfg(not(windows))]
     assert_eq!(parse_modified_special_key("S-Enter"), Some("\x1b[13;2~".to_string()));
 }
 
 #[test]
 fn parse_ctrl_enter() {
+    // #409: plain Ctrl+Enter is LF on Windows, CSI 13;5~ elsewhere.
+    #[cfg(windows)]
+    assert_eq!(parse_modified_special_key("C-Enter"), Some("\n".to_string()));
+    #[cfg(not(windows))]
     assert_eq!(parse_modified_special_key("C-Enter"), Some("\x1b[13;5~".to_string()));
+}
+
+#[test]
+fn parse_alt_enter() {
+    #[cfg(windows)]
+    assert_eq!(parse_modified_special_key("M-Enter"), Some("\x1b\r".to_string()));
+    #[cfg(not(windows))]
+    assert_eq!(parse_modified_special_key("M-Enter"), Some("\x1b[13;3~".to_string()));
 }
 
 #[test]

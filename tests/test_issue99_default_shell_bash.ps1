@@ -17,6 +17,10 @@
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_issue99_default_shell_bash.ps1
 
 $ErrorActionPreference = "Continue"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and a developer's shell may have it set, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -173,29 +177,65 @@ $session = "issue99_test4"
 & $PSMUX new-session -d -s $session 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 
+# Window 0 first, so an asymmetry between the session's own pane and the one
+# new-window creates is visible rather than inferred.
+$w0cmd = (& $PSMUX display-message -t $session -p '#{pane_current_command}' 2>&1) | Out-String
+$w0shell = (& $PSMUX show-options -g -v default-shell -t $session 2>&1) | Out-String
+Write-Info "  window 0 pane_current_command: $($w0cmd.Trim()) (default-shell '$($w0shell.Trim())')"
+
 # Create a second window
 & $PSMUX new-window -t $session 2>&1 | Out-Null
 Start-Sleep -Seconds 5
 
 $cmd = (& $PSMUX display-message -t $session -p '#{pane_current_command}' 2>&1) | Out-String
 Write-Info "  new-window pane_current_command: $($cmd.Trim())"
-if ($cmd.Trim() -match "bash") {
-    Write-Pass "New window also runs bash"
+# pane_current_command is a name, not evidence: on this PATH a bare `bash` is
+# System32's WSL launcher, which also reports "bash" and also answers
+# BASH_VERSION (in 18 ms when the distro is warm). The assertion is the IMAGE
+# the pane runs, for the session's own pane and for the new window, because
+# sweep 2026-09-24_23-37-41 had both on WSL bash with the Git path configured:
+# the session had claimed a warm standby spawned under test 3's `default-shell
+# bash`, and the claim reloaded the option without respawning the standby's
+# pane or its spare pool.
+function Get-PaneImage([string]$target) {
+    $pp = (& $PSMUX display-message -t $target -p '#{pane_pid}' 2>&1 | Out-String).Trim()
+    $pi = Get-CimInstance Win32_Process -Filter "ProcessId=$pp" -ErrorAction SilentlyContinue
+    return @{ Pid = $pp; Image = [string]$pi.ExecutablePath; Cmd = [string]$pi.CommandLine }
+}
+$img0 = Get-PaneImage "${session}:0"
+$img1 = Get-PaneImage "${session}:1"
+Write-Info "  window 0 pane_pid=$($img0.Pid) image=$($img0.Image)"
+Write-Info "  window 1 pane_pid=$($img1.Pid) image=$($img1.Image)"
+$gitBash = 'C:\Program Files\Git\bin\bash.exe'
+if ($img0.Image -ieq $gitBash) {
+    Write-Pass "The session's own pane runs the configured Git bash"
 } else {
-    # ConPTY may report "conhost" as host wrapper; verify by running a bash command
-    & $PSMUX send-keys -t $session 'echo BASH_CHECK_$BASH_VERSION' Enter 2>&1 | Out-Null
-    $sw99 = [System.Diagnostics.Stopwatch]::StartNew()
-    $capOut = ""
-    while ($sw99.ElapsedMilliseconds -lt 10000) {
-        $capOut = (& $PSMUX capture-pane -t $session -p 2>&1) | Out-String
-        if ($capOut -match "BASH_CHECK_\d") { break }
-        Start-Sleep -Milliseconds 500
+    Write-Fail "The session's own pane runs '$($img0.Image)', not the configured Git bash (a claimed standby kept the shell it booted with)"
+}
+if ($img1.Image -ieq $gitBash) {
+    Write-Pass "New window runs the configured Git bash"
+} else {
+    Write-Fail "New window runs '$($img1.Image)', not the configured Git bash"
+}
+# And the shell really is a live Git bash: BASH_VERSION answers.
+& $PSMUX send-keys -t $session 'echo BASH_CHECK_$BASH_VERSION' Enter 2>&1 | Out-Null
+$sw99 = [System.Diagnostics.Stopwatch]::StartNew()
+$capOut = ""
+while ($sw99.ElapsedMilliseconds -lt 10000) {
+    $capOut = (& $PSMUX capture-pane -t $session -p 2>&1) | Out-String
+    if ($capOut -match "BASH_CHECK_\d") { break }
+    Start-Sleep -Milliseconds 500
+}
+if ($capOut -match "BASH_CHECK_\d") {
+    Write-Pass "New window answers BASH_VERSION after $($sw99.ElapsedMilliseconds)ms"
+} else {
+    $srv = (& $PSMUX display-message -t $session -p '#{pid}' 2>&1 | Out-String).Trim()
+    Write-Info "  BASH_VERSION echo never appeared within $($sw99.ElapsedMilliseconds)ms; server pid=$srv SHELL='$env:SHELL'; last pane lines: $(($capOut -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 3) -join ' / ')"
+    Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '__warm__' } | ForEach-Object {
+        $kids = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.ProcessId)" | Where-Object { $_.Name -ne 'conhost.exe' } | ForEach-Object { "$($_.Name)[$($_.CommandLine)]" }) -join ' ; '
+        Write-Info "  warm standby $($_.ProcessId): $kids"
     }
-    if ($capOut -match "BASH_CHECK_\d") {
-        Write-Pass "New window runs bash (verified via BASH_VERSION, pane_current_command=$($cmd.Trim()))"
-    } else {
-        Write-Fail "New window not running bash (got: $($cmd.Trim()))"
-    }
+    Write-Fail "New window did not answer BASH_VERSION (pane_current_command=$($cmd.Trim()))"
 }
 
 & $PSMUX kill-session -t $session 2>$null | Out-Null

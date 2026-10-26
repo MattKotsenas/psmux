@@ -50,16 +50,19 @@ $psmuxDir = Join-Path $env:USERPROFILE ".psmux"
 
 # Run a psmux command in the rbScale namespace; returns trimmed stdout (string).
 function Px {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    $out = & psmux -L $L @Args 2>&1
+    # Simple function on purpose: a [Parameter(ValueFromRemainingArguments)]
+    # param makes this advanced and its binder eats -d as the common -Debug
+    # switch, so `new-session -d` would attach and hang under capture.
+    # Automatic $args passes all tokens through verbatim.
+    $out = & psmux -L $L @args 2>&1
     if ($null -eq $out) { return "" }
     return (($out | Out-String).TrimEnd("`r", "`n"))
 }
 
 # Run a psmux command, returning the integer LASTEXITCODE.
 function PxCode {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    & psmux -L $L @Args 2>&1 | Out-Null
+    # Simple function on purpose: see Px (binder eats -d as -Debug).
+    & psmux -L $L @args 2>&1 | Out-Null
     return $LASTEXITCODE
 }
 
@@ -73,8 +76,8 @@ function Disp {
 
 # Count non-empty lines from a list-* command's output.
 function Count-Lines {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    $out = & psmux -L $L @Args 2>&1
+    # Simple function on purpose: see Px (binder eats -d as -Debug).
+    $out = & psmux -L $L @args 2>&1
     if ($null -eq $out) { return 0 }
     $lines = @($out | Out-String -Stream | Where-Object { $_.Trim().Length -gt 0 })
     return $lines.Count

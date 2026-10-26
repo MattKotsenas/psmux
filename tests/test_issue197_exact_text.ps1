@@ -8,6 +8,16 @@ $ErrorActionPreference = "Continue"
 $PSMUX = "tmux"
 $SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
 $SshHost = "$SshUser@localhost"
+
+# Fail-fast SSH availability probe: without it, the first bare `ssh` call
+# blocks forever on auth when no sshd/key-auth is set up, and the suite burns
+# its entire harness timeout producing zero output (BatchMode forbids prompts).
+$sshProbe = ssh -o ConnectTimeout=5 -o BatchMode=yes $SshHost "echo psmux_ssh_ok" 2>$null
+if ("$sshProbe" -notmatch 'psmux_ssh_ok') {
+    Write-Host "[SKIP] SSH to localhost unavailable (sshd not running or key auth not configured)" -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host "=== Issue #197 Exact Text Reproduction Test ===" -ForegroundColor Cyan
 
 # Cleanup

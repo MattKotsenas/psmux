@@ -74,6 +74,9 @@ fn bold_is_bright_is_in_option_catalog_as_boolean() {
         .iter()
         .find(|d| d.name == "bold-is-bright")
         .expect("bold-is-bright must be registered in the option catalog");
-    assert_eq!(def.option_type, "boolean");
+    assert_eq!(
+        def.option_type,
+        crate::server::option_catalog::OptionType::Boolean
+    );
     assert_eq!(def.default, "on");
 }

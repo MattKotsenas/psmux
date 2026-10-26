@@ -9,11 +9,13 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         cursor_row: 0,
         cursor_col: 0,
         alternate_screen: false,
+        wants_mouse: false,
         hide_cursor: false,
         cursor_shape: 0,
         active,
         copy_mode: false,
         scroll_offset: 0,
+        view_offset: 0,
         sel_start_row: None,
         sel_start_col: None,
         sel_end_row: None,
@@ -23,7 +25,7 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         copy_cursor_col: None,
         content: Vec::new(),
         rows_v2: Vec::new(),
-        title: None,
+        title: None, copy_hl: Vec::new(),
         images: vec![],
     }
 }

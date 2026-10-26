@@ -10,6 +10,7 @@
 #>
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $pass = 0; $fail = 0; $skip = 0; $total = 0
 
 function Write-Test($msg) { Write-Host "  TEST: $msg" -ForegroundColor Cyan; $script:total++ }
@@ -58,13 +59,8 @@ function Send-Tcp($cmd) {
     $auth = $reader.ReadLine()
     if ($auth -ne "OK") { $client.Close(); return @{ok=$false; resp="AUTH failed: $auth"} }
     $writer.WriteLine($cmd)
-    Start-Sleep -Milliseconds 200
-    $buf = New-Object byte[] 16384
-    $resp = ""
-    while ($stream.DataAvailable) {
-        $n = $stream.Read($buf, 0, $buf.Length)
-        $resp += [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
-    }
+    # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+    $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 3000
     $client.Close()
     @{ok=$true; resp=$resp.Trim()}
 }
@@ -112,7 +108,8 @@ Test-Result "tcp-combined-au-unset" ($r.ok -and $r.resp -ne 'au_val') "resp='$($
 Write-Test "TCP -qa set-option quiet+append"
 Send-Tcp "set-option -g status-left QA1" | Out-Null
 Send-Tcp "set-option -qa status-left QA2" | Out-Null
-$r = Send-Tcp "show-options -gqv status-left"
+# -a without -g appends to the session's own value, the global keeps QA1 (tmux, #803)
+$r = Send-Tcp "show-options -qv status-left"
 Test-Result "tcp-combined-qa-append" ($r.ok -and $r.resp -eq 'QA1QA2') "resp='$($r.resp)'"
 
 # -go (combined only-if-unset: existing value preserved)
@@ -128,7 +125,7 @@ Send-Tcp "set-option -u @go-new-test" | Out-Null
 Send-Tcp "set-option -go @go-new-test first" | Out-Null
 $r = Send-Tcp "show-options -gqv @go-new-test"
 Test-Result "tcp-combined-go-new" ($r.ok -and $r.resp -eq 'first') "resp='$($r.resp)'"
-Send-Tcp "set-option -g escape-time 500" | Out-Null
+Send-Tcp "set-option -g escape-time 10" | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ================================================================
 # SECTION 2: TCP separated flags (regression: must still work)
@@ -139,7 +136,7 @@ Write-Host "`n=== 2. TCP SEPARATED FLAGS ===" -ForegroundColor Cyan
 Write-Test "TCP separated -a append"
 Send-Tcp "set-option -g status-right SEP_A" | Out-Null
 Send-Tcp "set-option -a status-right SEP_B" | Out-Null
-$r = Send-Tcp "show-options -gqv status-right"
+$r = Send-Tcp "show-options -qv status-right"
 Test-Result "tcp-separated-a-append" ($r.ok -and $r.resp -eq 'SEP_ASEP_B') "resp='$($r.resp)'"
 
 # -u (separated unset)
@@ -191,9 +188,11 @@ Write-Host "`n=== 4. CLI SEPARATED FLAGS ===" -ForegroundColor Cyan
 
 # -a via CLI
 Write-Test "CLI separated -a append"
+# Drop the session value the TCP -a test above left, so the session reads the global again
+& $psmux set-option -u status-right -t $SESSION 2>&1 | Out-Null
 CLI-Set @('-g', 'status-right', 'CS_A')
 & $psmux set-option -a status-right CS_B -t $SESSION 2>&1 | Out-Null
-$r = CLI-Show 'status-right'
+$r = (& $psmux show-options -qv -t $SESSION status-right 2>&1 | Out-String).Trim()
 Test-Result "cli-separated-a-append" ($r -eq 'CS_ACS_B') "resp='$r'"
 
 # -u via CLI
@@ -268,11 +267,13 @@ Write-Host "`n=== 7. SET-ENVIRONMENT COMBINED FLAGS ===" -ForegroundColor Cyan
 
 # -gu (combined unset) via TCP
 Write-Test "TCP setenv + unsetenv -gu"
-Send-Tcp "set-environment CFTEST_VAR myval" | Out-Null
-$env1 = Send-Tcp "show-environment"
+# -gu removes the GLOBAL value (tmux cmd-set-environment.c), so the variable
+# is set and read back in the global environment (#775).
+Send-Tcp "set-environment -g CFTEST_VAR myval" | Out-Null
+$env1 = Send-Tcp "show-environment -g"
 Test-Result "tcp-env-set" ($env1.ok -and $env1.resp -match 'CFTEST_VAR=myval') "env='$($env1.resp)'"
 Send-Tcp "set-environment -gu CFTEST_VAR" | Out-Null
-$env2 = Send-Tcp "show-environment"
+$env2 = Send-Tcp "show-environment -g"
 Test-Result "tcp-env-gu-unset" ($env2.ok -and $env2.resp -notmatch 'CFTEST_VAR') "env='$($env2.resp)'"
 
 # Separated -u via TCP
@@ -340,7 +341,7 @@ $r = Send-Tcp "show-options -gqv escape-time"
 Test-Result "cfg-combined-go" ($r.ok -and $r.resp -eq '42') "resp='$($r.resp)'"
 
 # Restore escape-time
-Send-Tcp "set-option -g escape-time 500" | Out-Null
+Send-Tcp "set-option -g escape-time 10" | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ---------------------------------------------------------------
 # Cleanup

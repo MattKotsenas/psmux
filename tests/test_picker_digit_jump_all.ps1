@@ -1,7 +1,8 @@
 # Picker digit-jump parity (extends issue #247 from session picker to every
 # other picker): choose-tree, choose-buffer, customize-mode.
 #
-# Each picker now supports the same UX as the session picker:
+# The session, buffer and customize pickers share one UX (choose-tree now
+# follows tmux mode-tree instead, see issue #625):
 #   • digit keys append to a per-picker num_buffer
 #   • Enter consumes the buffer as a 1-based index and jumps to that row
 #   • Backspace edits the buffer
@@ -57,9 +58,10 @@ if (-not (Test-Path $srcFile)) {
 $src = Get-Content $srcFile -Raw
 
 # ── State declarations ─────────────────────────────────────────
-Write-Test "State: tree_num_buffer declared"
-Add-Result "tree_num_buffer declared" `
-    ($src -match 'let\s+mut\s+tree_num_buffer\s*=\s*String::new\(\)') ""
+Write-Test "State: choose-tree keeps NO digit accumulator (issue #625)"
+# tmux's mode_tree_key jumps on the keystroke itself, so nothing is buffered.
+Add-Result "tree has no num_buffer" `
+    (-not ($src -match 'tree_num_buffer')) ""
 
 Write-Test "State: buffer_num_buffer declared"
 Add-Result "buffer_num_buffer declared" `
@@ -70,18 +72,27 @@ Add-Result "customize_num_buffer declared" `
     ($src -match 'let\s+mut\s+customize_num_buffer\s*=\s*String::new\(\)') ""
 
 # ── Picker open clears the buffer ──────────────────────────────
-Write-Test "Open clears tree_num_buffer when picker opens"
-Add-Result "tree picker open clears buffer" `
-    ($src -match '(?s)do_choose_tree\s*\{[^}]*tree_num_buffer\.clear\(\)') ""
+Write-Test "Open seeds the collapsed set so every window starts collapsed"
+Add-Result "tree picker open collapses windows" `
+    (($src -match '(?s)do_choose_tree\s*\{.*?choose_tree::default_collapsed') -or
+     # Since #890 every opener (prefix w, the prompt, -s / -w) shares
+     # open_tree_chooser!, which seeds the set; the call site only invokes it.
+     (($src -match '(?s)macro_rules!\s*open_tree_chooser\s*\{.*?choose_tree::default_collapsed') -and
+      ($src -match '(?s)if\s+do_choose_tree\s*\{\s*open_tree_chooser!\(\)'))) ""
 
 Write-Test "Open clears buffer_num_buffer when picker opens"
 Add-Result "buffer picker open clears buffer (CLI path)" `
-    ($src -match '(?s)do_choose_buffer\s*\{[^}]*buffer_num_buffer\.clear\(\)') ""
+    (($src -match '(?s)do_choose_buffer\s*\{[^}]*buffer_num_buffer\.clear\(\)') -or
+     # Since #839 both openers (prefix = and the prompt) share open_buffer_chooser!,
+     # which does the clear; the call site only invokes the macro.
+     (($src -match '(?s)macro_rules!\s*open_buffer_chooser\s*\{[^}]*buffer_num_buffer\.clear\(\)') -and
+      ($src -match '(?s)if\s+do_choose_buffer\s*\{\s*open_buffer_chooser!\(\)'))) ""
 
 # ── Digit handlers ─────────────────────────────────────────────
-Write-Test "Handler: digit keys push into tree_num_buffer"
-Add-Result "tree digit arm pushes into buffer" `
-    ($src -match '(?s)KeyCode::Char\(c\)\s+if\s+tree_chooser\s+&&\s+c\.is_ascii_digit\(\)\s*=>\s*\{[^}]*tree_num_buffer\.push\(c\)') ""
+Write-Test "Handler: a digit resolves a visible line and rewrites itself to Enter"
+# mode_tree_key: mtd->current = choice; *key = '\r';
+Add-Result "tree digit arm jumps immediately" `
+    (($src -match 'choose_tree::digit_line\(c\)') -and ($src -match 'effective_code\s*=\s*KeyCode::Enter')) ""
 
 Write-Test "Handler: digit keys push into buffer_num_buffer"
 Add-Result "buffer digit arm pushes into buffer" `
@@ -92,9 +103,9 @@ Add-Result "customize digit arm pushes into buffer" `
     ($src -match '(?s)KeyCode::Char\(c\)\s+if\s+c\.is_ascii_digit\(\)\s*=>\s*\{[^}]*customize_num_buffer\.push\(c\)') ""
 
 # ── Enter parses buffer ────────────────────────────────────────
-Write-Test "Enter parses tree_num_buffer as 1-based index"
-Add-Result "tree Enter parses buffer" `
-    ($src -match '(?s)KeyCode::Enter\s+if\s+tree_chooser.*?tree_num_buffer\.parse::<usize>\(\)') ""
+Write-Test "Enter activates the row under the cursor"
+Add-Result "tree Enter activates the cursor row" `
+    ($src -match '(?s)KeyCode::Enter\s+if\s+tree_chooser.*?tree_entries\.get\(tree_selected\)') ""
 
 Write-Test "Enter parses buffer_num_buffer as 1-based index"
 Add-Result "buffer Enter parses buffer" `
@@ -109,9 +120,10 @@ Add-Result "customize Enter sends customize-navigate" `
     ($src -match '(?s)customize_num_buffer.*?format!\("customize-navigate \{\}\\n",\s*delta\)') ""
 
 # ── Backspace ──────────────────────────────────────────────────
-Write-Test "Backspace pops tree_num_buffer"
-Add-Result "tree Backspace pops" `
-    ($src -match 'KeyCode::Backspace\s+if\s+tree_chooser\s*=>\s*\{\s*tree_num_buffer\.pop\(\)') ""
+Write-Test "Left and Right collapse and expand (tmux mode_tree_key)"
+Add-Result "tree Left/Right collapse and expand" `
+    (($src -match '(?s)KeyCode::Left\s+if\s+tree_chooser.*?choose_tree::collapse_action') -and `
+     ($src -match '(?s)KeyCode::Right\s+if\s+tree_chooser.*?choose_tree::expand_action')) ""
 
 Write-Test "Backspace pops buffer_num_buffer"
 Add-Result "buffer Backspace pops" `
@@ -122,9 +134,9 @@ Add-Result "customize Backspace pops" `
     ($src -match 'KeyCode::Backspace\s*=>\s*\{\s*customize_num_buffer\.pop\(\)') ""
 
 # ── Esc clears ─────────────────────────────────────────────────
-Write-Test "Esc clears tree_num_buffer"
-Add-Result "tree Esc clears buffer" `
-    ($src -match '(?s)KeyCode::Esc\s+if\s+tree_chooser\s*=>\s*\{[^}]*tree_chooser\s*=\s*false;[^}]*tree_num_buffer\.clear\(\)') ""
+Write-Test "Esc closes the tree picker"
+Add-Result "tree Esc closes the picker" `
+    ($src -match 'KeyCode::Esc\s+if\s+tree_chooser\s*=>\s*\{\s*tree_chooser\s*=\s*false;\s*\}') ""
 
 Write-Test "Esc clears buffer_num_buffer"
 Add-Result "buffer Esc clears buffer" `
@@ -144,9 +156,10 @@ Add-Result "buffer leak-guard catch-all" `
     ($src -match 'KeyCode::Char\(_\)\s+if\s+buffer_chooser\s*=>\s*\{\s*\}') ""
 
 # ── Renderer: numbered prefix ──────────────────────────────────
-Write-Test "Renderer: tree rows numbered with dynamic-width column"
-Add-Result "tree row numbering uses dynamic width" `
-    ($src -match '(?s)tree_chooser\s*\{.*?num_width\s*=\s*tree_entries\.len\(\)\.to_string\(\)\.len\(\)') ""
+Write-Test "Renderer: tree rows carry the tmux jump key label"
+# #{mode_tree_key} is "0".."9" then "M-a".."M-z" over the VISIBLE lines.
+Add-Result "tree rows show the jump key" `
+    ($src -match '(?s)tree_chooser\s*\{.*?choose_tree::line_key_label\(i\)') ""
 
 Write-Test "Renderer: buffer rows numbered with dynamic-width column"
 Add-Result "buffer row numbering uses dynamic width" `
@@ -157,9 +170,9 @@ Add-Result "customize row numbering uses dynamic width" `
     ($src -match 'visible_pos\s*=\s*srv_customize_scroll\s*\+\s*row_idx\s*\+\s*1') ""
 
 # ── Renderer: 'go to N' indicator ──────────────────────────────
-Write-Test "Renderer: tree picker draws 'go to N' indicator"
-Add-Result "tree 'go to N' indicator rendered" `
-    ($src -match '(?s)if\s+!tree_num_buffer\.is_empty\(\).*?format!\("go to \{\}",\s*tree_num_buffer\)') ""
+Write-Test "Renderer: tree picker reserves no 'go to N' row"
+Add-Result "tree reserves no prompt row" `
+    ($src -match '(?s)tree_chooser\s*\{.*?let\s+buffer_rows:\s*u16\s*=\s*0;') ""
 
 Write-Test "Renderer: buffer picker draws 'go to N' indicator"
 Add-Result "buffer 'go to N' indicator rendered" `
@@ -170,9 +183,9 @@ Add-Result "customize 'go to N' indicator rendered" `
     ($src -match '(?s)if\s+!customize_num_buffer\.is_empty\(\).*?format!\(" go to \{\} ",\s*customize_num_buffer\)') ""
 
 # ── Renderer: title hints advertise the workflow ───────────────
-Write-Test "Renderer: tree picker title advertises digits+enter"
+Write-Test "Renderer: tree picker title advertises the bare digit jump"
 Add-Result "tree title hint" `
-    ($src -match 'choose-tree\s*\(digits\+enter=jump') ""
+    ($src -match 'choose-tree\s*\(0-9=jump') ""
 
 Write-Test "Renderer: buffer picker title advertises digits+enter"
 Add-Result "buffer title hint" `
@@ -343,7 +356,7 @@ if ($fail -gt 0) {
     Write-Host "  To verify the UX manually:" -ForegroundColor Yellow
     Write-Host "    1. psmux new-session -d -s a; new-window x N times" -ForegroundColor Yellow
     Write-Host "    2. psmux attach -t a" -ForegroundColor Yellow
-    Write-Host "    3. C-b w     -> choose-tree, type 3 + Enter -> jumps to 3rd row" -ForegroundColor Yellow
+    Write-Host "    3. C-b w     -> choose-tree, press 3 -> jumps to visible line 3" -ForegroundColor Yellow
     Write-Host "    4. C-b =     -> choose-buffer, type 2 + Enter -> pastes 2nd buffer" -ForegroundColor Yellow
     Write-Host "    5. customize-mode  -> type 5 + Enter -> jumps to 5th option" -ForegroundColor Yellow
     exit 1

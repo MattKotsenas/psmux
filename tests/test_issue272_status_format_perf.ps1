@@ -7,7 +7,7 @@
 # This test PROVES (or disproves) the claim with measurements.
 
 $ErrorActionPreference = "Continue"
-$PSMUX = "c:/Users/uniqu/Documents/workspace/psmux/target/release/psmux.exe"
+$PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $script:TestsPassed = 0
 $script:TestsFailed = 0

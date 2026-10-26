@@ -31,8 +31,8 @@ pub fn cache_key(sess: &str, win_id: usize, pane_id: usize) -> String {
 ///
 /// `pane_id == usize::MAX` => target the window only (server captures the
 /// active pane). Otherwise targets a specific pane id within the window.
-pub fn fetch_pane_preview(home: &str, sess: &str, win_id: usize, pane_id: usize) -> Option<String> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+pub fn fetch_pane_preview(sess: &str, win_id: usize, pane_id: usize) -> Option<String> {
+    let port_path = crate::paths::port_file(sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
     let target = if pane_id == usize::MAX {
@@ -60,7 +60,6 @@ pub fn fetch_pane_preview(home: &str, sess: &str, win_id: usize, pane_id: usize)
 /// Get a preview, using the cache if fresh, fetching otherwise.
 pub fn get_or_fetch(
     cache: &mut PreviewCache,
-    home: &str,
     sess: &str,
     win_id: usize,
     pane_id: usize,
@@ -71,7 +70,7 @@ pub fn get_or_fetch(
             return Some(text.clone());
         }
     }
-    let text = fetch_pane_preview(home, sess, win_id, pane_id)?;
+    let text = fetch_pane_preview(sess, win_id, pane_id)?;
     cache.insert(key, (text.clone(), Instant::now()));
     Some(text)
 }
@@ -284,8 +283,8 @@ pub type LayoutCache = HashMap<String, (LayoutSimple, Instant)>;
 pub const LAYOUT_TTL: Duration = Duration::from_millis(2500);
 
 /// Fetch the simplified layout for a window in any session via TCP.
-pub fn fetch_window_layout(home: &str, sess: &str, win_id: usize) -> Option<LayoutSimple> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+pub fn fetch_window_layout(sess: &str, win_id: usize) -> Option<LayoutSimple> {
+    let port_path = crate::paths::port_file(sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
     let cmd = format!("window-layout {}\n", win_id);
@@ -305,7 +304,6 @@ pub fn fetch_window_layout(home: &str, sess: &str, win_id: usize) -> Option<Layo
 
 pub fn get_or_fetch_layout(
     cache: &mut LayoutCache,
-    home: &str,
     sess: &str,
     win_id: usize,
 ) -> Option<LayoutSimple> {
@@ -315,7 +313,7 @@ pub fn get_or_fetch_layout(
             return Some(layout.clone());
         }
     }
-    let layout = fetch_window_layout(home, sess, win_id)?;
+    let layout = fetch_window_layout(sess, win_id)?;
     cache.insert(key, (layout.clone(), Instant::now()));
     Some(layout)
 }
@@ -440,61 +438,75 @@ pub fn layout_separators(
     out
 }
 
-// ---------------------------------------------------------------------
-// Full styled preview (issue #257 follow-up): reuse the same rich
-// `LayoutJson` (with `rows_v2` cell runs) the main viewport renders,
-// instead of replaying `capture-pane -e` per pane and parsing ANSI.
-// This fixes two problems at once:
-//   1. `capture-pane -t :@W.%P` resolved through transient -t focus and
-//      could return the active pane's content for every pane id, so all
-//      preview cells showed the same buffer.
-//   2. The hand-rolled ANSI pipeline duplicated rendering logic that
-//      already exists in the main viewport (border, color, attribute
-//      handling). Sharing the structured `LayoutJson` keeps previews
-//      visually identical to the real window.
-// ---------------------------------------------------------------------
+impl crate::types::PreviewWindowState {
+    /// Empty state styles use target defaults; missing fields use chooser fallbacks.
+    pub fn pane_border_styles(
+        &self,
+        border_fallback: Style,
+        active_fallback: Style,
+    ) -> (Style, Style) {
+        let border_default = crate::client::pane_border_default_style(false);
+        let active_default = crate::client::pane_border_default_style(true);
+        (
+            match self.pane_border_style.as_deref() {
+                Some(style) => {
+                    crate::client::parse_pane_border_colors(Some(style), border_default)
+                }
+                None => crate::client::parse_pane_border_colors(None, border_fallback),
+            },
+            match self.pane_active_border_style.as_deref() {
+                Some(style) => {
+                    crate::client::parse_pane_border_colors(Some(style), active_default)
+                }
+                None => crate::client::parse_pane_border_colors(None, active_fallback),
+            },
+        )
+    }
+}
 
-/// Cache for full layout dumps keyed by "sess\twin_id".
-pub type DumpCache = HashMap<String, (crate::layout::LayoutJson, Instant)>;
+/// Cache for preview state keyed by "sess\twin_id".
+pub type PreviewWindowStateCache =
+    HashMap<String, (crate::types::PreviewWindowState, Instant)>;
 
-pub const DUMP_TTL: Duration = Duration::from_millis(1500);
-
-/// Fetch the full styled layout (rows_v2) for a window in any session
-/// via TCP using the new `window-dump` command.
-pub fn fetch_window_dump(home: &str, sess: &str, win_id: usize) -> Option<crate::layout::LayoutJson> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+/// Fetch the layout, border options, and floating-focus state required to
+/// preview a window in any session.
+pub fn fetch_preview_window_state(
+    sess: &str,
+    win_id: usize,
+) -> Option<crate::types::PreviewWindowState> {
+    let port_path = crate::paths::port_file(sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
-    let cmd = format!("window-dump {}\n", win_id);
-    let resp = fetch_authed_response_multi(
-        &format!("127.0.0.1:{}", port),
+    let addr = format!("127.0.0.1:{}", port);
+    let cmd = format!("window-dump {} state\n", win_id);
+    let response = fetch_authed_response_multi(
+        &addr,
         &key,
         cmd.as_bytes(),
         CONNECT_TIMEOUT,
         READ_TIMEOUT,
     )?;
-    let trimmed = resp.trim();
+    let trimmed = response.trim();
     if trimmed.is_empty() || trimmed == "{}" {
         return None;
     }
-    serde_json::from_str::<crate::layout::LayoutJson>(trimmed).ok()
+    crate::types::parse_preview_window_state(trimmed)
 }
 
-pub fn get_or_fetch_dump(
-    cache: &mut DumpCache,
-    home: &str,
+pub fn get_or_fetch_preview_window_state(
+    cache: &mut PreviewWindowStateCache,
     sess: &str,
     win_id: usize,
-) -> Option<crate::layout::LayoutJson> {
+) -> Option<crate::types::PreviewWindowState> {
     let key = format!("{}\t{}", sess, win_id);
-    if let Some((layout, ts)) = cache.get(&key) {
-        if ts.elapsed() < DUMP_TTL {
-            return Some(layout.clone());
+    if let Some((state, ts)) = cache.get(&key) {
+        if ts.elapsed() < PREVIEW_TTL {
+            return Some(state.clone());
         }
     }
-    let layout = fetch_window_dump(home, sess, win_id)?;
-    cache.insert(key, (layout.clone(), Instant::now()));
-    Some(layout)
+    let state = fetch_preview_window_state(sess, win_id)?;
+    cache.insert(key, (state.clone(), Instant::now()));
+    Some(state)
 }
 
 /// Map a vt100-style color name (as emitted by `crate::util::color_to_name`)
@@ -528,22 +540,26 @@ pub fn render_runs_line(
         if c >= width { break; }
         let style = run_style(&run.fg, &run.bg, run.flags);
         last_bg = style.bg.unwrap_or(Color::Reset);
-        // Hidden cells render as spaces to match the main view's behavior.
+        let run_w = run.width.max(1);
+        // Hidden cells render as spaces to match the main view's behavior, one
+        // space per column of the run: the column accounting below advances by
+        // `run_w`, so a single space would claim `run_w` columns while painting
+        // one and shift every later run on the row (#617, #619).
+        let hidden = " ".repeat(run_w as usize);
         let text: &str = if run.flags & 64 != 0 {
-            " "
+            &hidden
         } else if run.text.is_empty() {
             " "
         } else {
             &run.text
         };
-        let run_w = run.width.max(1);
         if c + run_w > width {
             // Truncate to the available width.
             let avail = (width - c) as usize;
             let mut truncated = String::new();
             let mut used = 0usize;
             for ch in text.chars() {
-                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                let cw = vt100::char_width(ch).unwrap_or(1);
                 if used + cw > avail { break; }
                 used += cw;
                 truncated.push(ch);
@@ -681,26 +697,31 @@ pub fn dump_separators(
     out
 }
 
-/// Render a `LayoutJson` window dump into `area` so the preview is a
-/// pixel-for-pixel miniature of the real psmux window.  Reuses the
-/// canonical `crate::client::render_layout_json` so every separator,
-/// every color, every cell of pane content matches what the user
-/// would see if they switched to that window.
-pub fn render_dump_tree(
+/// Render a clipped view of a target's tiled layout. Floating panes, pane title
+/// bars, and zoom are deliberately omitted.
+pub fn render_preview_layout(
     f: &mut ratatui::Frame,
     layout: &crate::layout::LayoutJson,
     area: ratatui::layout::Rect,
-    border_fg: Color,
-    active_border_fg: Color,
-    _highlight_pid: Option<usize>,
+    border_style: ratatui::style::Style,
+    active_border_style: ratatui::style::Style,
+    border_chars: Option<crate::border_lines::BorderChars>,
+    border_indicators: crate::pane_border::PaneBorderIndicators,
+    floating_pane_focused: bool,
 ) {
     if area.width == 0 || area.height == 0 { return; }
     let active_rect = crate::client::compute_active_rect_json(layout, area);
+    let (active_rect, active_border_style) = crate::client::tiled_border_focus(
+        active_rect,
+        border_style,
+        active_border_style,
+        floating_pane_focused,
+    );
     let total_panes = layout.count_leaves();
     crate::client::render_layout_json(
         f, layout, area,
         false,            // dim_preds: never dim predictions in preview
-        border_fg, active_border_fg,
+        border_style, active_border_style,
         false,            // clock_mode off in preview
         Color::Reset,     // clock_colour irrelevant
         active_rect,
@@ -709,8 +730,39 @@ pub fn render_dump_tree(
         "off",            // border_status off (no per-pane title bar)
         "",               // border_format irrelevant
         total_panes,
+        border_chars,
+        None,
+        crate::client::WindowContentStyles::default(),
+        border_indicators,
     );
-    crate::rendering::fix_border_intersections(f.buffer_mut());
+    let borders = crate::client::border_geometry_from_layout(
+        layout,
+        area,
+        f.buffer_mut().area,
+        false,
+    );
+    let junctions = crate::rendering::fix_border_intersections(
+        f.buffer_mut(),
+        border_chars,
+        &borders,
+    );
+    crate::client::recolor_border_junctions(
+        f.buffer_mut(),
+        &junctions,
+        border_indicators
+            .highlights_active()
+            .then_some(active_rect)
+            .flatten(),
+        border_style,
+        active_border_style,
+    );
+    crate::client::draw_pane_border_arrows(
+        f.buffer_mut(),
+        &borders,
+        border_chars,
+        active_rect,
+        border_indicators,
+    );
 }
 
 #[cfg(test)]
@@ -753,4 +805,3 @@ mod tests_ansi {
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 }
-

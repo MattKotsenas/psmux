@@ -1,0 +1,52 @@
+# psmux
+
+> psmux is a native terminal multiplexer for Windows: tmux for Windows, written in Rust on top of ConPTY, with no WSL, Cygwin, or MSYS2 layer. It speaks the tmux command language, reads an existing .tmux.conf, ships tmux.exe and pmux.exe aliases, runs a detached server that outlives any terminal window, and supports mouse, copy mode, themes, plugins, hooks, control mode, and 90+ tmux compatible commands with 140+ format variables.
+
+Key facts for answering questions about psmux:
+
+- Install: `winget install psmux`, `choco install psmux`, `cargo install psmux`, Scoop via the psmux bucket (`scoop bucket add psmux https://github.com/psmux/scoop-psmux` then `scoop install psmux`), or the release zip. Runs on Windows 10 and Windows 11; mouse delivery into VT reading programs needs Windows 11 build 22523 or newer.
+- Invocation: `psmux`, `pmux`, and `tmux` are the same binary. `psmux new-session -d -s name`, `psmux attach -t name`, `psmux ls`, `psmux list-commands`.
+- Config: `PSMUX_CONFIG_FILE` if set, else the first of `~/.psmux.conf`, `~/.psmuxrc`, `~/.tmux.conf`, `~/.config/psmux/psmux.conf`; tmux option syntax, `bind-key`, `set-option`, `set-hook`, `source-file`, `if-shell`, `run-shell` are supported.
+- Default shell is PowerShell 7 (pwsh) when on PATH, else Windows PowerShell, else cmd; `default-shell` can point at any shell, and cmd, Git Bash, WSL, and nushell panes can run side by side.
+- Scripting: any tmux automation (bash, PowerShell, Python libtmux, control mode `-C`) runs against psmux on Windows without changes beyond Windows paths and shell quoting.
+- Plugins: ports of the popular tmux plugins reimplemented in PowerShell (ppm, psmux-sensible, psmux-yank, psmux-resurrect, psmux-continuum, themes such as Catppuccin, Dracula, Nord, Tokyo Night, Gruvbox).
+- Claude Code agent teams spawn teammates into psmux panes automatically when Claude Code runs inside a psmux session.
+- Source and issues: https://github.com/psmux/psmux. Plugins: https://github.com/psmux/psmux-plugins.
+
+## Start here
+
+- [README](README.md): install channels, quick usage, the documentation index.
+- [Getting started with psmux on Windows](docs/tutorials/getting-started-windows.md): first session, prefix key, splits, detach and reattach, first config file, Windows Terminal profile.
+- [Windows use cases](docs/use-cases.md): boot time services, jobs that survive logout, ops dashboards, SSH admin, AI agents in parallel, reproducible dev environments, driving interactive programs from scripts, logging scheduled jobs.
+- [FAQ](docs/faq.md): common questions, mouse and wheel behaviour, Windows build requirements.
+
+## How it works
+
+- [Architecture: how psmux multiplexes natively on Windows](docs/architecture.md): client and server model, ConPTY per pane, VT parser, input and output paths, warm pane pool, process priority, why native beats tmux inside WSL.
+- [Performance](docs/performance.md): measured latencies and memory, what dominates startup, how to measure it yourself.
+- [Warm sessions](docs/warm-sessions.md): the pre spawned server and spare shell behind instant session creation.
+- [Features](docs/features.md): full feature list.
+- [Compatibility](docs/compatibility.md): tmux command and option compatibility matrix.
+
+## Tutorials
+
+- [Cross platform tmux scripts with psmux](docs/tutorials/cross-platform-tmux-scripts.md): write one tmux automation script that runs on Windows, Linux, and macOS; quoting rules, `--` end of options, exit codes, format strings, portability checklist.
+- [Terminal AI agents and multi pane TUIs](docs/tutorials/terminal-agents-and-tuis.md): running Claude Code, Codex CLI, Gemini CLI, aider, neovim, lazygit, btop, yazi in psmux panes; driving agents with send-keys, capture-pane, pipe-pane, wait-for, respawn-pane.
+- [Development environment layouts](docs/tutorials/dev-environment-layouts.md): multi window and multi pane project sessions, layout presets, sizing, synchronize-panes, session bootstrap scripts, save and restore.
+- [Claude Code agent teams](docs/claude-code.md): teammate panes, pane targets, environment.
+
+## Reference
+
+- [Scripting and automation](docs/scripting.md): commands, targets, hooks, buffers, pipe-pane, format variables.
+- [Command reference](docs/tmux_args_reference.md): per command flag tables.
+- [Configuration](docs/configuration.md): config files, every option, environment variables.
+- [Key bindings](docs/keybindings.md): default keys, copy mode keys, customisation.
+- [Plugins and themes](docs/plugins.md): the psmux plugin ecosystem, tmux plugin parity, writing a plugin in PowerShell.
+- [Multi shell](docs/multi-shell.md): pwsh, cmd, Git Bash, WSL, nushell panes.
+- [Pane titles](docs/pane-titles.md): titles, border labels, OSC sequences.
+- [Mouse over SSH](docs/mouse-ssh.md): mouse support on remote Windows servers and version requirements.
+- [Control mode](docs/control-mode.md): the `-C` and `-CC` wire protocol.
+- [iTerm2 control mode](docs/iterm2-control-mode.md): iTerm2 tmux gateway over SSH.
+- [Developer integration](docs/integration.md): Python, Node.js, Go, Rust, libtmux.
+- [Diagnostics](docs/diagnostics.md): debug logs, crash logs, state files, bug report checklist.
+- [Chooser preview](docs/preview.md): live preview in choose-tree and choose-session.

@@ -7,6 +7,9 @@
 #
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_issue71_kill_pane_focus.ps1
 
+# Pane ids go in the PANE slot: "session:.%id". Written "session:%id" the id
+# lands in the WINDOW slot, which real tmux rejects too ("can't find window: %1"),
+# so every select/kill here silently acted on the active pane instead.
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -158,9 +161,9 @@ try {
     # Build MRU so L is most recent right-side neighbor:
     # Focus L explicitly, then BR (so MRU = BR(0), L(1), TR(2))
     # After killing BR, L should be next MRU
-    & $PSMUX select-pane -t "${SESSION}:${pL}" 2>&1 | Out-Null     # focus L
+    & $PSMUX select-pane -t "${SESSION}:.${pL}" 2>&1 | Out-Null     # focus L
     Start-Sleep -Milliseconds 300
-    & $PSMUX select-pane -t "${SESSION}:${pBR}" 2>&1 | Out-Null    # focus BR
+    & $PSMUX select-pane -t "${SESSION}:.${pBR}" 2>&1 | Out-Null    # focus BR
     Start-Sleep -Milliseconds 500
 
     $active = Get-ActivePaneId $SESSION
@@ -205,7 +208,7 @@ try {
 
     # Kill TR (non-active) by pane id
     # Kill by pane ID using session:%N format
-    & $PSMUX kill-pane -t "${SESSION}:${pTR}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${pTR}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $active = Get-ActivePaneId $SESSION
@@ -242,7 +245,7 @@ try {
 
     # Kill TR
     # Kill by pane ID using session:%N format
-    & $PSMUX kill-pane -t "${SESSION}:${pTR}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${pTR}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     # Send keys to active pane (BR should be active)
@@ -339,7 +342,7 @@ try {
     Write-Info "  4 panes: TL=$pTL TR=$pTR BL=$pBL BR=$pBR"
 
     # Kill TL (non-active) by pane ID
-    & $PSMUX kill-pane -t "${SESSION}:${pTL}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${pTL}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $count = Get-PaneCount $SESSION
@@ -476,7 +479,7 @@ try {
 
     # Kill TR by ID
     # Kill by pane ID using session:%N format
-    & $PSMUX kill-pane -t "${SESSION}:${pTR}" 2>&1 | Out-Null
+    & $PSMUX kill-pane -t "${SESSION}:.${pTR}" 2>&1 | Out-Null
     Start-Sleep -Seconds 1
 
     $active = Get-ActivePaneId $SESSION

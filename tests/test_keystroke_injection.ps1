@@ -40,6 +40,14 @@ class ConsoleKeyInjector
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr GetStdHandle(int nStdHandle);
 
+    // The console input buffer must be opened FRESH after AttachConsole. See the
+    // comment at the call site: the standard handles do not follow the process
+    // to the newly attached console.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess,
+        uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool WriteConsoleInput(
         IntPtr hConsoleInput,
@@ -155,13 +163,22 @@ class ConsoleKeyInjector
             return 2;
         }
 
-        // Get console input handle
-        IntPtr handle = GetStdHandle(STD_INPUT_HANDLE);
+        // Open the console input buffer of the console we just attached to.
+        //
+        // GetStdHandle(STD_INPUT_HANDLE) does NOT work here. FreeConsole plus
+        // AttachConsole moves the process to another console, but it does not
+        // repoint the standard handles: STD_INPUT still refers to the console we
+        // just detached from. The handle looks perfectly valid (non-null, not
+        // -1) and every WriteConsoleInput against it returned ok=False,
+        // written=0, so all five checks in this suite failed with no diagnostic
+        // beyond "not found in pane". CreateFile("CONIN$") resolves against the
+        // CURRENT console, which is the target's.
+        IntPtr handle = CreateFileW("CONIN$", 0xC0000000u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
         log.Add("Handle: " + handle);
 
         if (handle == IntPtr.Zero || handle == new IntPtr(-1))
         {
-            log.Add("FAILED: Invalid console input handle");
+            log.Add("FAILED: CreateFile(CONIN$) err=" + Marshal.GetLastWin32Error());
             File.WriteAllText(logFile, string.Join("\n", log));
             FreeConsole();
             return 3;
@@ -508,12 +525,18 @@ if ($exitCode -ne 0) {
 
         if ($best) {
             $json = $best | ConvertFrom-Json
-            $mode = $json.mode
-            Write-Host "  Current mode: $mode"
-            if ($mode -match "copy|CopyMode") {
+            # Copy mode lives on the LAYOUT object. dump-state has no top-level
+            # "mode" key at all, so $json.mode was always empty and this check
+            # could never pass, no matter what the key injection did. Verified by
+            # dumping state before and after injecting prefix+[ :
+            #   before  layout.copy_mode = False
+            #   after   layout.copy_mode = True
+            $copyMode = $json.layout.copy_mode
+            Write-Host "  layout.copy_mode: $copyMode"
+            if ($copyMode -eq $true) {
                 Write-Pass "Copy mode entered via keystroke injection"
             } else {
-                Write-Fail "Expected CopyMode, got: $mode"
+                Write-Fail "Expected layout.copy_mode=True, got: $copyMode"
             }
         } else {
             Write-Fail "Could not get dump-state"

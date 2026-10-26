@@ -11,6 +11,7 @@
 # CLI plus by confirming the underlying capture mechanism returns content.
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "issue257_preview"
 $psmuxDir = "$env:USERPROFILE\.psmux"
@@ -197,11 +198,8 @@ if ($paneCount -ne 3) {
             # Consume auth ack ("OK")
             $null = $reader.ReadLine()
             $writer.WriteLine("window-layout $wid")
-            Start-Sleep -Milliseconds 400
-            $resp = ""
-            while ($stream.DataAvailable) {
-                $resp += [char]$stream.ReadByte()
-            }
+            # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+            $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 1500
             $client.Close()
             Write-Host "  Layout JSON: $resp" -ForegroundColor DarkGray
             $leafCount = ([regex]::Matches($resp, '"type":"leaf"')).Count
@@ -325,9 +323,8 @@ if ($paneIds.Count -ne 3) {
         $writer.WriteLine("AUTH $key")
         $null = $reader.ReadLine()
         $writer.WriteLine("window-dump $wid")
-        Start-Sleep -Milliseconds 800
-        $resp = ""
-        while ($stream.DataAvailable) { $resp += [char]$stream.ReadByte() }
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 3000
         $client.Close()
 
         # Assertions: response should contain ALL THREE markers, and each
@@ -346,15 +343,19 @@ if ($paneIds.Count -ne 3) {
 
         # Stronger assertion: count occurrences of each marker. With the
         # bug each marker would either appear 0 times or 3 times (active
-        # pane echoed everywhere). With the fix each appears exactly once.
+        # pane echoed everywhere). With the fix each appears in its own pane
+        # only — which can be 1 (output line) or 2 (typed-command echo line +
+        # output line, depending on whether the shell echoed the command
+        # before the dump was taken). The bug signature is 0 or 3, so assert
+        # 1..2 rather than exactly 1 to stay timing-independent.
         $countA = ([regex]::Matches($resp, 'DUMPMARK_AAA')).Count
         $countB = ([regex]::Matches($resp, 'DUMPMARK_BBB')).Count
         $countC = ([regex]::Matches($resp, 'DUMPMARK_CCC')).Count
         Write-Host "  Marker counts: AAA=$countA BBB=$countB CCC=$countC" -ForegroundColor DarkGray
-        if ($countA -eq 1 -and $countB -eq 1 -and $countC -eq 1) {
-            Write-Pass "Each marker appears exactly once (per-pane targeting works)"
+        if (($countA -ge 1 -and $countA -le 2) -and ($countB -ge 1 -and $countB -le 2) -and ($countC -ge 1 -and $countC -le 2)) {
+            Write-Pass "Each marker confined to its own pane (per-pane targeting works, counts A=$countA B=$countB C=$countC)"
         } else {
-            Write-Fail "Expected each marker exactly once, got A=$countA B=$countB C=$countC"
+            Write-Fail "Marker counts outside 1..2 (bug signature is 0 or 3): A=$countA B=$countB C=$countC"
         }
     } catch {
         Write-Fail "TCP request to window-dump failed: $_"

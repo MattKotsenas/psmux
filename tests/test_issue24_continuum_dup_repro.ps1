@@ -1,16 +1,32 @@
-# Issue #24 (psmux-plugins): psmux-continuum auto_save.ps1 spawns a duplicate
-# background process on EVERY client attach, with no single-instance guard.
+# Issue #24 (psmux-plugins): psmux-continuum auto_save.ps1 used to spawn a
+# duplicate background process on EVERY client attach, with no single-instance
+# guard.
 #
-# This test REPRODUCES the bug tangibly: it sources the real continuum
-# plugin.conf into a live psmux session, attaches/detaches a client N times via
-# Win32, and counts the pwsh processes running auto_save.ps1 after each attach.
-# If the count grows by one per attach, the bug is proven.
+# FIXED: auto_save.ps1 now takes a named Mutex ('Local\psmux-continuum-autosave')
+# before starting its save loop, so repeat client-attached firings start a
+# script instance that finds the mutex held and exits immediately instead of
+# accumulating. See scripts/auto_save.ps1 header comment for issue #24.
+#
+# This is now a REGRESSION test (inverted from the original bug-reproduction
+# script): it sources the real continuum plugin.conf into a live psmux
+# session, attaches/detaches a client N times via Win32, and counts the pwsh
+# processes running auto_save.ps1 after each attach. It PASSES when the count
+# stays capped at 1 (the fix holds) and FAILS if the count grows with attaches
+# (the duplicate-spawn bug has regressed).
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "issue24_repro"
 $psmuxDir = "$env:USERPROFILE\.psmux"
-$PLUGINCONF = "$psmuxDir\plugins\psmux-continuum\plugin.conf"
+# Resolve the plugin the same way psmux does. src/config.rs searches BOTH
+# ~/.psmux/plugins/<name>/ and ~/.psmux/plugins/psmux-plugins/<name>/, because
+# the plugin collection is normally cloned as one repo and each plugin then sits
+# one level deeper. This hardcoded only the flat path, so with a normal install
+# it aborted at "plugin.conf not found" without running a single check.
+$PLUGINROOTS = @("$psmuxDir\plugins\psmux-continuum", "$psmuxDir\plugins\psmux-plugins\psmux-continuum")
+$PLUGINDIR = $PLUGINROOTS | Where-Object { Test-Path (Join-Path $_ "plugin.conf") } | Select-Object -First 1
+if (-not $PLUGINDIR) { $PLUGINDIR = $PLUGINROOTS[0] }
+$PLUGINCONF = Join-Path $PLUGINDIR "plugin.conf"
 $script:Pass = 0; $script:Fail = 0
 function Write-Pass($m){ Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function Write-Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
@@ -72,13 +88,15 @@ for ($i = 1; $i -le $ATTACHES; $i++) {
 $final = Count-AutoSave
 Write-Host "`n  final auto_save process count: $final after $ATTACHES attaches" -ForegroundColor Yellow
 
-# BUG is reproduced if the count grew with attaches (more than 1 surviving process)
+# REGRESSED if the count grows with attaches (more than 1 surviving process);
+# the mutex guard in auto_save.ps1 should keep this capped at 1 no matter how
+# many times client-attached fires.
 if ($final -ge 2 -and $counts[-1] -gt $counts[0]) {
-    Write-Pass "BUG REPRODUCED: auto_save processes accumulate per attach (final=$final, progression: $($counts -join ','))"
-} elseif ($final -le 1) {
-    Write-Fail "Not reproduced: count did not accumulate (final=$final). Either already fixed or attach did not fire the hook."
+    Write-Fail "REGRESSION: auto_save processes accumulate per attach (final=$final, progression: $($counts -join ','))"
+} elseif ($final -eq 1 -and ($counts | Where-Object { $_ -ge 1 }).Count -eq $ATTACHES) {
+    Write-Pass "Single-instance guard holds: auto_save stayed capped at 1 process across $ATTACHES attaches (progression: $($counts -join ','))"
 } else {
-    Write-Fail "Inconclusive: final=$final progression=$($counts -join ',')"
+    Write-Fail "Inconclusive: final=$final progression=$($counts -join ',') (hook may not have fired -- check client-attached wiring)"
 }
 
 Cleanup

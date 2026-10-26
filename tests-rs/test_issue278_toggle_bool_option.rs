@@ -14,6 +14,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -24,6 +27,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -215,7 +220,7 @@ fn issue278_bind_m_set_mouse_simulated() {
 fn all_boolean_options_recognized() {
     let booleans = [
         "mouse", "scroll-enter-copy-mode", "pwsh-mouse-selection",
-        "mouse-selection", "paste-detection", "choose-tree-preview",
+        "mouse-selection", "mouse-selection-force", "paste-detection", "choose-tree-preview",
         "focus-events", "renumber-windows", "automatic-rename",
         "allow-rename", "allow-set-title", "monitor-activity",
         "visual-activity", "synchronize-panes", "remain-on-exit",

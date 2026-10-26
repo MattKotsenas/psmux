@@ -83,8 +83,12 @@ function Test-AllPanesReachable {
     
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
-        # Select this pane by ID (include session name for correct routing)
-        Psmux select-pane -t "${Session}:${current}" | Out-Null
+        # Select this pane by ID. The id belongs in the PANE slot after the dot:
+        # "session:%id" puts it in the WINDOW slot, which real tmux rejects too
+        # ("can't find window: %1"). Written that way the BFS could never return
+        # to its current pane, so directions were probed from whatever pane
+        # happened to be active and panes looked unreachable.
+        Psmux select-pane -t "${Session}:.${current}" | Out-Null
         Start-Sleep -Milliseconds 50
         foreach ($dir in @("U", "D", "L", "R")) {
             # Navigate in direction
@@ -96,7 +100,7 @@ function Test-AllPanesReachable {
                 Write-Info "    From $current DIR=$dir -> discovered $newId"
             }
             # Return to current pane for next direction
-            Psmux select-pane -t "${Session}:${current}" | Out-Null
+            Psmux select-pane -t "${Session}:.${current}" | Out-Null
             Start-Sleep -Milliseconds 50
         }
     }

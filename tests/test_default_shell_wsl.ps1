@@ -14,6 +14,10 @@
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_default_shell_wsl.ps1
 
 $ErrorActionPreference = "Continue"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and a developer's shell may have it set, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -129,11 +133,24 @@ Start-Sleep -Seconds 5
 $hasSession = & $PSMUX has-session -t $session 2>&1
 if ($LASTEXITCODE -eq 0) {
     Write-Pass "Session created with bare 'wsl' name"
-    $cmd = (& $PSMUX display-message -t $session -p '#{pane_current_command}' 2>&1) | Out-String
+    # Poll rather than sample once: a bare 'wsl' is resolved through PATH by the
+    # spawner, and under sweep load the child was not attached 5s after
+    # new-session (sweep 2026-08-29_00-11-17 read 'psmux', the server itself,
+    # then passed 3/3 on rerun). The proof of a WSL pane is uname below, so an
+    # unrecognised name is a reason to ask the pane, not to fail on the spot.
+    $sw1 = [System.Diagnostics.Stopwatch]::StartNew()
+    $cmd = ""
+    while ($sw1.ElapsedMilliseconds -lt 20000) {
+        $cmd = (& $PSMUX display-message -t $session -p '#{pane_current_command}' 2>&1) | Out-String
+        if ($cmd.Trim() -match "wsl|bash|zsh|conhost|shell") { break }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Info "  pane_current_command after $([int]$sw1.ElapsedMilliseconds)ms: $($cmd.Trim())"
     if ($cmd.Trim() -match "wsl|bash|zsh") {
         Write-Pass "Pane runs WSL via bare name"
-    } elseif ($cmd.Trim() -match "conhost|shell") {
-        # ConPTY/shell self reports conhost or 'shell' for WSL — verify via uname
+    } else {
+        # ConPTY/shell self reports conhost or 'shell' for WSL, and a late spawn
+        # reports the server; either way the pane itself is the authority.
         & $PSMUX send-keys -t $session 'uname -s' Enter 2>&1 | Out-Null
         $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
         $capOut = ""
@@ -147,8 +164,6 @@ if ($LASTEXITCODE -eq 0) {
         } else {
             Write-Fail "Pane not running WSL (got: $($cmd.Trim()))"
         }
-    } else {
-        Write-Fail "Pane not running WSL (got: $($cmd.Trim()))"
     }
 } else {
     Write-Fail "Failed to create session with bare 'wsl' name"

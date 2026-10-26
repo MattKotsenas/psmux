@@ -1,16 +1,9 @@
 # Issue #296: psmux -> claude code -> Ctrl+G -> nvim hangs
 # =========================================================
-# Root cause: pane_wants_mouse() used an overly permissive heuristic (alt-screen +
-# fullscreen detection) to decide whether to forward SGR mouse motion sequences.
-# When Claude Code (Bubble Tea/Go) spawns nvim via Ctrl+G, nvim enters alt-screen
-# but does NOT enable mouse tracking (no DECSET 1000/1002/1003). psmux's hover
-# handler saw alt-screen=true via pane_wants_mouse() and flooded nvim's PTY pipe
-# with SGR motion sequences (ESC[<35;col;rowM) on every mouse move. Nvim treated
-# these as keyboard input, causing it to appear hung/unresponsive.
-#
-# Fix: Use pane_wants_hover() (strict check: only ButtonMotion/AnyMotion protocol)
-# for the MouseEventKind::Moved handler. Only forward hover events when the child
-# has EXPLICITLY enabled mouse motion tracking.
+# The attached client sends semantic motion commands to the server. The live
+# server path forwards hover only when pane_wants_hover confirms that the child
+# enabled DECSET 1002 or 1003. Nvim without mouse tracking receives no
+# unsolicited SGR motion input.
 #
 # This test proves:
 # 1. nvim works inside psmux (direct and nested from a TUI wrapper)
@@ -315,13 +308,5 @@ Remove-Item $pyScript -Force -EA SilentlyContinue
 Write-Host "`n=== Results ===" -ForegroundColor Cyan
 Write-Host "  Passed: $($script:TestsPassed)" -ForegroundColor Green
 Write-Host "  Failed: $($script:TestsFailed)" -ForegroundColor $(if ($script:TestsFailed -gt 0) { "Red" } else { "Green" })
-
-Write-Host "`n=== Root Cause ===" -ForegroundColor Cyan
-Write-Host "  pane_wants_mouse() heuristic (alt-screen + fullscreen detection) was" -ForegroundColor White
-Write-Host "  used for hover/motion events. This is too permissive: apps in alt-screen" -ForegroundColor White
-Write-Host "  that haven't enabled mouse tracking (nvim without mouse=a) received" -ForegroundColor White
-Write-Host "  unsolicited SGR motion sequences as garbage keyboard input." -ForegroundColor White
-Write-Host "  Fix: pane_wants_hover() only forwards motion when DECSET 1002/1003" -ForegroundColor White
-Write-Host "  (ButtonMotion/AnyMotion) is explicitly enabled by the child." -ForegroundColor White
 
 exit $script:TestsFailed

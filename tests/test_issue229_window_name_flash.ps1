@@ -202,7 +202,24 @@ if (-not (Wait-Session $SESSION)) {
 # === TEST 3: new-session with 'findstr' (fast-spawning child) ===
 Write-Host "`n[Test 3] new-session with 'findstr /R . NUL' (fast-spawning child)" -ForegroundColor Yellow
 $SESSION = "issue229_findstr"
-& $PSMUX new-session -d -s $SESSION 'findstr /R "." NUL'
+# findstr reading from NUL hits EOF and exits almost instantly. With the
+# tmux-parity default `remain-on-exit off`, the pane (and its only window
+# and session) is destroyed the moment that fast command exits -- before
+# this script's 3s Start-Sleep even returns -- which made "Session creation
+# failed" fire even though the session WAS created correctly (root cause:
+# the test raced its own default teardown, not a product bug).
+#
+# `set-option -g` on an already-running session cannot fix this: psmux is
+# one-server-per-session (each `new-session` spawns its own independent
+# server process with its own AppState), so a global option set on an
+# EXISTING session's server never reaches the NEW server this line spawns
+# (confirmed: that was tried first and the failure persisted identically).
+# Instead, chain a long-running keep-alive after findstr so the pane never
+# goes empty long enough to trigger the default teardown. The test only
+# checks that the window name never flashed to 'pwsh' during the sampling
+# window below, so which command ends up owning the window afterward
+# (findstr, then the keep-alive) does not affect what is being verified.
+& $PSMUX new-session -d -s $SESSION 'findstr /R "." NUL; timeout /T 300 /nobreak > $null'
 Start-Sleep -Seconds 3
 if (-not (Wait-Session $SESSION)) {
     Write-Fail "Session creation failed for $SESSION"
@@ -311,7 +328,7 @@ Write-Host "`n--- Part C: Edge Cases ---" -ForegroundColor Magenta
 
 Write-Host "`n[Test 6] Immediate window name after creation (before auto-rename runs)" -ForegroundColor Yellow
 # The initial name should be set by default_shell_name(), not wait for auto-rename
-$SESSION_EDGE = "issue229_edge_$$"
+$SESSION_EDGE = "issue229_edge_$PID"
 & $PSMUX new-session -d -s $SESSION_EDGE "timeout /T 300 > NUL"
 # Query IMMEDIATELY (as fast as possible after creation)
 $immediateNames = @()
@@ -335,7 +352,7 @@ if ($immediateNames.Count -gt 0) {
 Remove-Item "$psmuxDir\$SESSION_EDGE.*" -Force -EA SilentlyContinue
 
 Write-Host "`n[Test 7] Window name with 'automatic-rename off' (should keep initial name)" -ForegroundColor Yellow
-$SESSION_NOAUTO = "issue229_noauto_$$"
+$SESSION_NOAUTO = "issue229_noauto_$PID"
 & $PSMUX new-session -d -s $SESSION_NOAUTO "timeout /T 300 > NUL"
 Start-Sleep -Seconds 3
 if (Wait-Session $SESSION_NOAUTO) {
@@ -368,7 +385,7 @@ Remove-Item "$psmuxDir\$SESSION_NOAUTO.*" -Force -EA SilentlyContinue
 Write-Host "`n--- Part D: Timing Analysis ---" -ForegroundColor Magenta
 
 Write-Host "`n[Test 8] High-frequency name sampling to pinpoint flash timing" -ForegroundColor Yellow
-$SESSION_TIMING = "issue229_timing_$$"
+$SESSION_TIMING = "issue229_timing_$PID"
 # Kill any existing session cleanly
 & $PSMUX kill-session -t $SESSION_TIMING 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500

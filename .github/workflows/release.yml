@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish (e.g. v3.3.3) — tag must already exist in the repo'
+        description: 'Release tag to publish (e.g. v3.3.3). Dispatch FROM this tag (--ref), it must already be pushed'
         required: true
         type: string
+      dry_run:
+        description: 'Build, sign and verify only (upload artifacts); skip the GitHub release and every publish job. Allows a vX.Y.Z-signtest tag'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,11 +25,97 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Dispatch this workflow FROM the release tag, never from master:
+  #
+  #   gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z
+  #
+  # The windows-signing environment has a deployment policy of `tag v*`, so
+  # signing only happens when github.ref is the tag. Dispatched from a branch
+  # the build would skip the Certum login, the signing steps and the
+  # signature check, and ship unsigned files. Preflight refuses that run.
+  #
+  # Signing rehearsal, nothing released or published:
+  #
+  #   git tag v3.4.0-signtest && git push origin v3.4.0-signtest
+  #   gh workflow run release.yml --ref v3.4.0-signtest -f tag=v3.4.0-signtest -f dry_run=true
+  #
+  # A hyphenated tag is accepted only with dry_run, and only if it contains
+  # -signtest; a real release tag must equal v + the Cargo.toml version.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check dispatch ref, tag input and crate version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          fail=0
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::Dispatched from $REF_TYPE '$REF_NAME'. Dispatch from the tag so the build is signed: gh workflow run release.yml --ref $TAG -f tag=$TAG"
+            fail=1
+          elif [ "$REF_NAME" != "$TAG" ]; then
+            echo "::error::Dispatched from tag '$REF_NAME' but the tag input is '$TAG'. They must be the same tag."
+            fail=1
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::Tag '$TAG' does not start with v; the windows-signing environment only deploys for tag v* refs."; fail=1 ;;
+          esac
+          check_version=1
+          case "$TAG" in
+            *-signtest*)
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "Rehearsal tag '$TAG' with dry_run: Cargo.toml version check skipped."
+                check_version=0
+              else
+                echo "::error::'$TAG' is a rehearsal tag. Run it with -f dry_run=true; it can never be released."
+                fail=1; check_version=0
+              fi
+              ;;
+            *-*)
+              echo "::error::Tag '$TAG' contains a hyphen. Release tags are vX.Y.Z; a signing rehearsal uses vX.Y.Z-signtest with dry_run=true."
+              fail=1; check_version=0
+              ;;
+          esac
+          crate_version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/^[^"]*"|".*$/,""); print; exit}' Cargo.toml)
+          if [ "$check_version" -eq 1 ] && [ "v$crate_version" != "$TAG" ]; then
+            echo "::error::Cargo.toml package version is '$crate_version' but the tag is '$TAG'. Bump Cargo.toml to ${TAG#v} or fix the tag."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "Preflight OK: ref $REF_TYPE/$REF_NAME, tag $TAG, Cargo.toml $crate_version, dry_run $DRY_RUN"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Same check publish-crates runs, here so a sub crate that needs a
+      # version bump is caught before anything is built, signed or released.
+      # A dry run publishes nothing, so there it only reports.
+      - name: Check sub crates against crates.io
+        shell: pwsh
+        continue-on-error: ${{ inputs.dry_run }}
+        run: ./scripts/check_subcrate_divergence.ps1
+
   build:
     name: Build ${{ matrix.label }}
+    needs: preflight
     runs-on: windows-latest
+    # Windows files are signed only when this workflow runs on a release
+    # tag. Dispatch it from the tag itself to get a signed build.
+    environment: ${{ github.ref_type == 'tag' && 'windows-signing' || '' }}
     strategy:
       fail-fast: false
+      # One leg at a time: every leg logs in to Certum SimplySign with a TOTP
+      # code from a 30 s window, and two legs logging in inside the same
+      # window can be refused. A sleep based stagger does not prevent that
+      # because the legs finish their builds at different times.
+      max-parallel: 1
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
@@ -41,7 +132,7 @@ jobs:
             nsis_arch: arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,6 +141,28 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Windows code signing. The action is pinned to a reviewed commit.
+      - name: Log in to Certum SimplySign
+        id: certum
+        if: runner.os == 'Windows' && github.ref_type == 'tag'
+        uses: jay0lee/certum-cloud-code-sign@a3324503499c49090869856eeeecfe95fb613d87 # v1, reviewed 2026-10-07
+        with:
+          username: ${{ secrets.CERTUM_USERNAME }}
+          totp_secret: ${{ secrets.CERTUM_TOTP_SECRET }}
+          totp_algorithm: ${{ vars.CERTUM_TOTP_ALGORITHM || 'SHA-256' }}
+
+      # Sign the binaries before the zip and the installer are built, so
+      # both ship signed files and package checksums match them.
+      - name: Sign binaries
+        if: steps.certum.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseDir = "target/${{ matrix.target }}/release"
+          & "${{ steps.certum.outputs.signtool-path }}" sign /sha1 ${{ steps.certum.outputs.cert-thumbprint }} /tr http://time.certum.pl /td SHA256 /fd SHA256 /d "psmux" `
+            "$releaseDir/psmux.exe" "$releaseDir/pmux.exe" "$releaseDir/tmux.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool could not sign the psmux binaries" }
 
       - name: Create release package
         shell: pwsh
@@ -102,19 +215,38 @@ jobs:
 
       - name: Build NSIS installer
         shell: pwsh
+        env:
+          SIGNTOOL: ${{ steps.certum.outcome == 'success' && steps.certum.outputs.signtool-path || '' }}
+          SIGN_THUMBPRINT: ${{ steps.certum.outcome == 'success' && steps.certum.outputs.cert-thumbprint || '' }}
         run: |
           $ErrorActionPreference = "Stop"
           $version = "${{ inputs.tag }}" -replace '^v', ''
           $releaseDir = Resolve-Path "target/${{ matrix.target }}/release"
           $repoDir = Resolve-Path "."
           New-Item -ItemType Directory -Path "target\installer" -Force | Out-Null
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
 
-          & "C:\Program Files (x86)\NSIS\makensis.exe" /NOCD `
-            /DVERSION=$version `
-            /DARCH=${{ matrix.nsis_arch }} `
-            "/DSOURCE_DIR=$releaseDir" `
-            "/DREPO_DIR=$repoDir" `
-            "installer\psmux.nsi"
+          # VIProductVersion takes only the numeric part of 3.4.0-signtest.
+          $viVersion = $version -replace '-.*$', ''
+          $nsisArgs = @(
+            "/NOCD",
+            "/DVERSION=$version",
+            "/DVI_VERSION=$viVersion",
+            "/DARCH=${{ matrix.nsis_arch }}",
+            "/DSOURCE_DIR=$releaseDir",
+            "/DREPO_DIR=$repoDir"
+          )
+          # Signed builds also sign uninstall.exe, which makensis writes
+          # itself (installer\psmux.nsi, !uninstfinalize, NSIS 3.08+).
+          if ($env:SIGNTOOL) {
+            $nsisVersion = (& $makensis /VERSION) -replace '^v', ''
+            if ([version]($nsisVersion -replace '[^0-9.].*$', '') -lt [version]"3.08") {
+              throw "NSIS $nsisVersion cannot sign the uninstaller; 3.08 or newer is required"
+            }
+            $nsisArgs += "/DSIGNTOOL=$env:SIGNTOOL"
+            $nsisArgs += "/DSIGN_THUMBPRINT=$env:SIGN_THUMBPRINT"
+          }
+          & $makensis @nsisArgs "installer\psmux.nsi"
           if ($LASTEXITCODE -ne 0) { Write-Error "NSIS build failed"; exit 1 }
 
           $setup = "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
@@ -122,41 +254,82 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $setup).Length / 1MB, 2)
           Write-Output "NSIS installer: $setup ($sizeMB MB)"
 
+      - name: Sign NSIS installer
+        if: steps.certum.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $setup = "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
+          & "${{ steps.certum.outputs.signtool-path }}" sign /sha1 ${{ steps.certum.outputs.cert-thumbprint }} /tr http://time.certum.pl /td SHA256 /fd SHA256 /d "psmux" $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool could not sign $setup" }
+
+      # A release tag never ships an unsigned Windows file. This checks the
+      # binaries inside the zip as well as the installer.
+      - name: Verify signatures
+        if: runner.os == 'Windows' && github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signtool = "${{ steps.certum.outputs.signtool-path }}"
+          if (-not $signtool) { Write-Output "::error::Certum login did not run, so nothing is signed"; exit 1 }
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $zipName = "psmux-${{ inputs.tag }}-${{ matrix.artifact }}"
+          $check = Join-Path $env:RUNNER_TEMP "verify-zip"
+          Expand-Archive -Path "$zipName.zip" -DestinationPath $check -Force
+          $files = @(
+            "$check/psmux.exe", "$check/pmux.exe", "$check/tmux.exe",
+            "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
+          )
+          $bad = 0
+          foreach ($f in $files) {
+            & $signtool verify /pa /q $f
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::not signed: $f"; $bad = 1 }
+            else { Write-Output "signed: $f" }
+          }
+          if ($bad) { exit 1 }
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: psmux-${{ matrix.artifact }}
           path: |
             psmux-*-${{ matrix.artifact }}.zip
             target/installer/*-${{ matrix.nsis_arch }}-setup.exe
 
+      - name: Log out of Certum SimplySign
+        if: always() && steps.certum.outcome != 'skipped' && steps.certum.outcome != ''
+        uses: jay0lee/certum-cloud-code-sign/teardown@a3324503499c49090869856eeeecfe95fb613d87
+
   release:
     name: Create Release
-    needs: build
+    needs: [preflight, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Generate changelog
         id: changelog
         run: |
-          # Find the previous tag
+          # Find the previous release tag. Tags with a hyphen (v3.4.0-signtest,
+          # v3.3.4-fix-273) are rehearsals or side tags, never a changelog base.
           CURRENT_TAG="${{ inputs.tag }}"
-          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -n 1)
+          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -v -- '-' | grep -vxF "$CURRENT_TAG" | head -n 1 || true)
 
           if [ -z "$PREV_TAG" ]; then
-            echo "No previous tag found — generating changelog from all commits"
+            echo "No previous tag found, generating changelog from all commits"
             LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "$CURRENT_TAG")
           else
-            echo "Generating changelog: $PREV_TAG → $CURRENT_TAG"
+            echo "Generating changelog: $PREV_TAG to $CURRENT_TAG"
             LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "${PREV_TAG}..${CURRENT_TAG}")
           fi
 
           # Write to file to preserve multiline content
           echo "$LOG" > /tmp/changelog.md
-          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build release body
         id: body
@@ -169,8 +342,15 @@ jobs:
             echo ""
             echo "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal."
             echo ""
+            # Hand written notes (highlights, contributor thanks) for this
+            # tag go above the generated commit list when the file exists.
+            NOTES=".github/release-notes/${CURRENT_TAG}.md"
+            if [ -f "$NOTES" ]; then
+              cat "$NOTES"
+              echo ""
+            fi
             if [ -n "$PREV_TAG" ]; then
-              echo "### Changelog (${PREV_TAG} → ${CURRENT_TAG})"
+              echo "### Changelog (${PREV_TAG} to ${CURRENT_TAG})"
             else
               echo "### Changelog"
             fi
@@ -187,7 +367,7 @@ jobs:
             echo "| Windows x86 (Intel/AMD 32-bit) | \`psmux-${CURRENT_TAG}-windows-x86.zip\` |"
             echo "| Windows ARM64 (Snapdragon/Surface Pro X) | \`psmux-${CURRENT_TAG}-windows-arm64.zip\` |"
             echo ""
-            echo "**Installer (NSIS setup — kills running instances, adds to PATH, warmup):**"
+            echo "**Installer (NSIS setup: kills running instances, adds to PATH, warmup):**"
             echo "| Platform | File |"
             echo "|----------|------|"
             VERSION_NO_V="${CURRENT_TAG#v}"
@@ -235,13 +415,13 @@ jobs:
           } > /tmp/release_body.md
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
       - name: List artifacts
         run: find . -type f \( -name "*.zip" -o -name "*-setup.exe" \)
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
@@ -260,37 +440,43 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: release
+    needs: [preflight, release]
+    if: ${{ !inputs.dry_run }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify crate compiles with crates.io dependencies
-        run: |
-          cargo check 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Crate fails to compile with crates.io dependencies! Fix before publishing."
-            exit 1
-          }
+      # A sub crate edited under a version that is already on crates.io makes
+      # its publish say "already exists" and the main crate then fails to
+      # verify against the old published sources (v3.3.6). This must pass
+      # before anything is published. Run it locally before tagging too.
+      - name: Check sub crates against crates.io
         shell: pwsh
+        run: ./scripts/check_subcrate_divergence.ps1
 
       - name: Publish sub-crates then main crate to crates.io
         shell: pwsh
         run: |
-          # Sub-crates must be published first so crates.io can resolve path deps
-          cargo publish --allow-dirty -p portable-pty-psmux 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "portable-pty-psmux publish failed (may already be published)"
+          # Sub-crates must be published first so crates.io can resolve path deps.
+          # "already exists" is fine here: the check above proved the published
+          # sources are identical. Any other failure stops the release.
+          foreach ($sub in @("portable-pty-psmux", "vt100-psmux")) {
+            $out = cargo publish --allow-dirty -p $sub 2>&1
+            $rc = $LASTEXITCODE
+            $out | Write-Output
+            if ($rc -ne 0) {
+              if ($out -match "already exists") {
+                Write-Warning "$sub is already published at this version with identical sources -- skipping"
+              } else {
+                Write-Error "$sub publish failed!"
+                exit 1
+              }
+            }
+            Start-Sleep 45
           }
-          Start-Sleep 15
-          cargo publish --allow-dirty -p vt100-psmux 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "vt100-psmux publish failed (may already be published)"
-          }
-          Start-Sleep 15
           $out = cargo publish --allow-dirty 2>&1
           $out | Write-Output
           if ($LASTEXITCODE -ne 0) {
@@ -307,10 +493,11 @@ jobs:
 
   publish-chocolatey:
     name: Publish to Chocolatey
-    needs: release
+    needs: [preflight, release]
+    if: ${{ !inputs.dry_run }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Wait for release assets to stabilize on GitHub CDN
         shell: pwsh
@@ -439,7 +626,8 @@ jobs:
 
   publish-scoop:
     name: Publish to Scoop Bucket
-    needs: release
+    needs: [preflight, release]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
       - name: Wait for release assets to stabilize on GitHub CDN
@@ -453,8 +641,8 @@ jobs:
         run: |
           tag="${{ inputs.tag }}"
           ver="${tag#v}"
-          echo "VERSION=$ver" >> $GITHUB_OUTPUT
-          echo "TAG=$tag" >> $GITHUB_OUTPUT
+          echo "VERSION=$ver" >> "$GITHUB_OUTPUT"
+          echo "TAG=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Download release zips and compute SHA256
         id: hashes
@@ -474,7 +662,7 @@ jobs:
             done
             hash=$(sha256sum "installer-$arch.zip" | awk '{print $1}')
             upper_arch=$(echo "$arch" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-            echo "SHA256_$upper_arch=$hash" >> $GITHUB_OUTPUT
+            echo "SHA256_$upper_arch=$hash" >> "$GITHUB_OUTPUT"
             echo "  $arch: $hash"
           done
 
@@ -562,7 +750,8 @@ jobs:
 
   publish-winget:
     name: Publish to WinGet
-    needs: release
+    needs: [preflight, release]
+    if: ${{ !inputs.dry_run }}
     runs-on: windows-latest
     steps:
       - name: Wait for release assets to stabilize on GitHub CDN

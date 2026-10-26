@@ -152,7 +152,7 @@ Example: `hello\r\n` becomes `%output %0 hello\015\012`.
 
 ## Supported Commands
 
-All standard psmux/tmux commands work in control mode. Here are the most useful ones for plugin development:
+Control mode has its own command dispatcher, so it accepts a deliberate subset of the full psmux command set rather than everything the CLI accepts. Anything outside that subset comes back as `%error unknown command: <name>`. Send `list-commands` to see the catalog. Everything shown below is dispatched in control mode.
 
 ### Session and Window Management
 
@@ -203,24 +203,28 @@ bind-key M-x display-message "pressed!"            # Bind a key
 
 ```
 list-commands      # List all available commands
-server-info        # Server information
+show-messages      # Server information (info and server-info are default aliases)
 kill-server        # Shut down the server
 ```
 
 ### psmux Extension Commands
 
-These commands are available in psmux but do not exist in tmux:
+These commands exist in psmux but not in tmux. The "In control mode" column matters: only the first three are wired into the control mode dispatcher. The rest are server commands, reachable from a key binding, a config line or a raw socket connection, but a control mode client gets `%error unknown command` for them.
 
-| Command | Description |
-|---|---|
-| `dump-state` | Returns the entire session state as a JSON blob (windows, panes, options, sizes, screen content). Invaluable for building rich UIs. |
-| `dump-layout` | Returns the pane layout tree structure |
-| `list-tree` | Returns a hierarchical session/window/pane tree view |
-| `send-text <text>` | Send raw text directly to the active pane (no key name parsing) |
-| `send-paste <text>` | Send text as a bracketed paste sequence |
-| `claim-session` | Claim a warm (pre spawned) session for faster startup |
-| `set-pane-title <title>` | Set the title of the current pane |
-| `toggle-sync` | Toggle synchronized input across all panes in a window |
+| Command | In control mode | Description |
+|---|---|---|
+| `dump-state` (alias `dump`) | Yes | Returns the entire session state as a JSON blob (windows, panes, options, sizes, screen content). Invaluable for building rich UIs. |
+| `zoom-pane` | Yes | Toggle zoom on the active pane |
+| `run-command <cmd>` (alias `runcmd`) | Yes | Run any server command by name and return its output, with a 15 second timeout |
+| `dump-layout` | No | Returns the pane layout tree structure |
+| `list-tree` | No | Returns a hierarchical session/window/pane tree view |
+| `send-text <text>` | No | Send raw text directly to the active pane (no key name parsing) |
+| `send-paste <base64>` | No | Send text as a bracketed paste sequence. The single argument is the text base64 encoded. Also available at the CLI as `psmux send-paste`. |
+| `claim-session` | No | Internal warm pool claim used during session startup |
+| `set-pane-title <title>` | No | Set the title of the current pane |
+| `toggle-sync` | No | Toggle synchronized input across all panes in a window |
+
+`run-command` is the escape hatch, but it only reaches commands that the config file layer also implements, so `run-command toggle-sync` works while `run-command send-text hello` does not. `dump-layout`, `list-tree`, `send-text`, `set-pane-title` and `claim-session` are reachable only over a raw socket connection or from a key binding, and `send-paste` additionally from the CLI.
 
 ## Building a Plugin
 
@@ -353,19 +357,33 @@ setTimeout(() => {
 
 ## Differences from tmux
 
-psmux control mode is wire-compatible with tmux's protocol. A few features that exist in tmux but are not yet implemented in psmux:
+psmux control mode is wire-compatible with tmux's protocol. The flow control and subscription layer is implemented:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `refresh-client -f` flags | Planned | Per-client flags like `no-output`, `pause-after=N` |
-| `refresh-client -A` pane actions | Planned | Per-pane on/off/continue/pause |
-| `refresh-client -B` subscriptions | Planned | Filtered format variable monitoring |
-| `refresh-client -C WxH` | Planned | Client-side size override |
-| `%extended-output` | Planned | Output with age info for flow control |
-| `%subscription-changed` | Planned | Subscription value change events |
-| Unlinked window notifications | N/A | psmux uses one session per server |
+| `refresh-client -f` flags | Implemented | `pause-after=N` and `no-pause` are parsed and honored. Other tmux client flags are ignored. |
+| `refresh-client -A` pane actions | Implemented | `-A '%N:continue'` resumes a paused pane. `pause` is accepted but only `continue` takes effect. |
+| `refresh-client -B` subscriptions | Implemented | `-B 'name:target:format'` adds a subscription, `-B 'name:'` removes it. Values are re-checked at most once per second. |
+| `refresh-client -C w,h` | Implemented | Sets the control client viewport size. Note the argument is comma separated (`-C 120,30`) on the control mode path, which is what iTerm2 sends. |
+| `%extended-output` | Implemented | Emitted instead of `%output` once a client has set `pause-after=N`, carrying the output age in milliseconds. |
+| `%subscription-changed` | Implemented | Emitted when a subscribed format string changes value. |
+| Unlinked window notifications | Not implemented | psmux never emits `%unlinked-window-add`, `%unlinked-window-close` or `%unlinked-window-renamed`. Each psmux server process owns exactly one session, so no window is ever outside the attached session's window list. |
+| Slow client handling | Write timeout | Without `pause-after`, output is not buffered per client. Writes to a control client carry a 5 second timeout, and a client that stalls longer than that is disconnected and must reconnect and resync with `capture-pane`. Set `refresh-client -f pause-after=N` to get `%pause` / `%continue` flow control instead of a drop. |
+| `%output` line size | One line per read | A burst from a pane arrives as one `%output` line per server read, which can be large for a chatty pane. Parse by line, not by fixed buffer. |
 
 The core protocol (framing, notifications, escaping, IDs, command dispatch) is fully compatible. Plugins targeting the basic tmux control mode protocol will work identically on psmux.
+
+### One session per server, many sessions per machine
+
+psmux runs a **separate server process for each session**, unlike tmux where one server holds many sessions. A control mode client therefore sees exactly one session, and `%session-changed` fires only when that client is pointed at a different session.
+
+Multiple sessions still coexist on the machine, each with its own server, and psmux stitches them together:
+
+- `list-sessions` enumerates every session on the machine (or every session in the `-L` namespace), not just the one this client is attached to.
+- `%sessions-changed` fires when a session is created or destroyed anywhere, which is why it carries no session ID.
+- `switch-client -t <other-session>` and cross session `join-pane -s <other-session>:...` reach across server processes.
+
+So "one session per server" is a statement about process topology, not a limit of one session per machine.
 
 ### Windows ConPTY Considerations
 

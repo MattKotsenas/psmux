@@ -14,6 +14,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -24,6 +27,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -58,9 +63,12 @@ fn root_binding_does_not_match_other_command() {
 #[test]
 fn scroll_enter_copy_mode_off_skips_root_pageup_binding() {
     let mut app = mock_app_with_window();
-    // Initialize default key bindings (includes PageUp -> copy-mode -u in root table)
     crate::config::populate_default_bindings(&mut app);
-    
+    // Issue #488 (tmux parity): the root table no longer binds PageUp by
+    // default. The #284 scroll-enter-copy-mode gate now applies to an
+    // EXPLICIT user binding, so create one.
+    crate::config::parse_config_content(&mut app, "bind-key -n PageUp copy-mode -u\n");
+
     // Verify root table has PageUp binding
     let key_tuple = crate::config::normalize_key_for_binding((KeyCode::PageUp, KeyModifiers::NONE));
     let has_pageup_bind = app.key_tables.get("root")
@@ -93,6 +101,8 @@ fn scroll_enter_copy_mode_off_skips_root_pageup_binding() {
 fn handle_key_skips_root_pageup_when_scroll_off() {
     let mut app = mock_app_with_window();
     crate::config::populate_default_bindings(&mut app);
+    // #488: default root PageUp removed; the gate applies to user bindings.
+    crate::config::parse_config_content(&mut app, "bind-key -n PageUp copy-mode -u\n");
     app.scroll_enter_copy_mode = false;
     app.mode = Mode::Passthrough;
 
@@ -120,6 +130,8 @@ fn handle_key_skips_root_pageup_when_scroll_off() {
 fn handle_key_executes_root_pageup_when_scroll_on() {
     let mut app = mock_app_with_window();
     crate::config::populate_default_bindings(&mut app);
+    // #488: default root PageUp removed; the gate applies to user bindings.
+    crate::config::parse_config_content(&mut app, "bind-key -n PageUp copy-mode -u\n");
     app.scroll_enter_copy_mode = true;
     app.mode = Mode::Passthrough;
 
@@ -180,7 +192,9 @@ fn send_key_escape_sequences_correct() {
 fn scroll_enter_copy_mode_on_allows_root_pageup_binding() {
     let mut app = mock_app_with_window();
     crate::config::populate_default_bindings(&mut app);
-    
+    // #488: default root PageUp removed; the gate applies to user bindings.
+    crate::config::parse_config_content(&mut app, "bind-key -n PageUp copy-mode -u\n");
+
     let key_tuple = crate::config::normalize_key_for_binding((KeyCode::PageUp, KeyModifiers::NONE));
     let bind = app.key_tables.get("root")
         .and_then(|t| t.iter().find(|b| b.key == key_tuple))

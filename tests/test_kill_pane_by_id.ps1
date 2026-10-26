@@ -49,7 +49,17 @@ function Get-ActivePaneId {
 }
 
 # Helper: session-qualified pane target (e.g., "killpane101:%2")
-function PaneTarget { param([string]$PaneId) return "${SESSION}:%${PaneId}" }
+# A session-qualified pane target is "session:window.pane", so the pane id goes
+# in the PANE slot after the dot. "session:%id" puts it in the WINDOW slot, and
+# real tmux 3.4 rejects that exactly as psmux does:
+#
+#   tmux  kill-pane -t sp:%1  ->  rc 1, "can't find window: %1"
+#   psmux kill-pane -t sp:%2  ->  rc 1, "psmux: can't find window: %2"
+#
+# while %id, sp:.%id and sp:0.%id all succeed in both. This helper used the one
+# form neither accepts, so every kill here silently did nothing and the suite
+# read it as psmux failing to kill panes.
+function PaneTarget { param([string]$PaneId) return "${SESSION}:.%${PaneId}" }
 
 Cleanup
 

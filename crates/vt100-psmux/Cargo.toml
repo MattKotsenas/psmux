@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "vt100-psmux"
-version = "0.16.8"
+version = "0.16.13"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
 build = false
 include = [
@@ -45,31 +45,82 @@ repository = "https://github.com/psmux/vt100-rust-patched"
 name = "vt100_psmux"
 path = "src/lib.rs"
 
+[[test]]
+name = "width_thai_441"
+path = "tests/width_thai_441.rs"
+
+[[test]]
+name = "issue533_vs16_width"
+path = "tests/issue533_vs16_width.rs"
+
+[[test]]
+name = "issue534_shrink_wide_erase"
+path = "tests/issue534_shrink_wide_erase.rs"
+
+[[test]]
+name = "issue502_altscreen_attrs"
+path = "tests/issue502_altscreen_attrs.rs"
+
+[[test]]
+name = "issue502_decsc_altscreen"
+path = "tests/issue502_decsc_altscreen.rs"
+
+[[test]]
+name = "osc7_windows_path"
+path = "tests/osc7_windows_path.rs"
+
+[[test]]
+name = "issue589_undercurl"
+path = "tests/issue589_undercurl.rs"
+
+[[test]]
+name = "issue641_scrollback_compaction"
+path = "tests/issue641_scrollback_compaction.rs"
+
+[[test]]
+name = "issue685_osc4_palette"
+path = "tests/issue685_osc4_palette.rs"
+
+[[test]]
+name = "issue749_emoji_clusters"
+path = "tests/issue749_emoji_clusters.rs"
+
+[[test]]
+name = "program_status"
+path = "tests/program_status.rs"
+
+[[test]]
+name = "query_detector"
+path = "tests/query_detector.rs"
+
 [dependencies.itoa]
-version = "1.0.15"
+version = "1.0.18"
 
 [dependencies.unicode-width]
-version = "0.2.1"
+version = "0.2.2"
 
 [dependencies.vte]
 version = "0.15.0"
 
 [dev-dependencies.nix]
-version = "0.30.1"
+version = "0.31.3"
 features = ["term"]
 
 [dev-dependencies.quickcheck]
-version = "1.0"
+version = "1.1.0"
 
 [dev-dependencies.rand]
-version = "0.10"
+version = "0.10.3"
 
 [dev-dependencies.serde]
-version = "1.0.219"
+version = "1.0.229"
 features = ["derive"]
 
 [dev-dependencies.serde_json]
-version = "1.0.140"
+version = "1.0.151"
 
 [dev-dependencies.terminal_size]
-version = "0.4.2"
+version = "0.4.4"
+
+
+

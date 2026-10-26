@@ -22,6 +22,26 @@ The `icon.svg` can be used as:
 - Favicon for project websites
 - App icon if building a GUI wrapper
 
+### Executable Icon (`assets/psmux.ico`)
+
+`build.rs` embeds `assets/psmux.ico` and a `VS_VERSIONINFO` block into
+`psmux.exe` (and its `pmux.exe` / `tmux.exe` aliases) via the `winresource`
+crate, so Task Manager, the taskbar, alt+tab and third party consent dialogs
+show a named, icon bearing process instead of a generic one.
+
+`assets/psmux.ico` is generated from `icon.svg` and is checked in so the build
+never needs a rasteriser. Regenerate it after changing `icon.svg`:
+
+```powershell
+winget install ImageMagick.ImageMagick   # needs the rsvg delegate
+magick -background none -density 192 icon.svg -resize 1024x1024 png32:base.png
+magick base.png -filter Lanczos -define icon:auto-resize=256,128,64,48,32,24,16 assets\psmux.ico
+magick identify assets\psmux.ico         # expect 7 frames
+```
+
+The frame list (256, 128, 64, 48, 32, 24, 16) is asserted by
+`tests/test_issue620_version_resource.ps1`.
+
 ### Design Features
 
 **Social Card (`1280x640px`):**

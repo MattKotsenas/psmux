@@ -99,6 +99,18 @@ impl MasterPty for ProxyMasterPty {
             .map(|s| -> Box<dyn Write + Send> { Box::new(s) })
             .ok_or_else(|| anyhow::anyhow!("writer already taken"))
     }
+
+    // The proxied PTY lives in another process; there is no local fd or
+    // termios to expose. `pid_t` is `i32` on every unix target, so the
+    // plain alias is written out to avoid a `libc` dependency here.
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<i32> { None }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> { None }
+
+    #[cfg(unix)]
+    fn tty_name(&self) -> Option<std::path::PathBuf> { None }
 }
 
 // ── ProxyChild ──────────────────────────────────────────────────────────
@@ -111,6 +123,8 @@ pub struct ProxyChild {
     forward_id: u64,
     pid: Option<u32>,
     exited: bool,
+    /// Consecutive status polls without a usable answer.
+    unknown_polls: u32,
 }
 
 impl ProxyChild {
@@ -120,7 +134,7 @@ impl ProxyChild {
         forward_id: u64,
         pid: Option<u32>,
     ) -> Self {
-        Self { control_addr, control_key, forward_id, pid, exited: false }
+        Self { control_addr, control_key, forward_id, pid, exited: false, unknown_polls: 0 }
     }
 
     fn send_control(&self, cmd: &str) -> io::Result<String> {
@@ -148,11 +162,61 @@ impl ProxyChild {
     }
 }
 
+/// What one `pane-forward-status` round trip says about the hosted pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardProbe {
+    Running,
+    /// The host said `exited`, nothing listens on its port any more, or the
+    /// port now belongs to a server that refuses the key: the pane is gone.
+    Exited,
+    /// No usable answer this time (timeout, empty reply while the host is
+    /// busy). Not evidence either way on its own.
+    Unknown,
+}
+
+/// Consecutive [`ForwardProbe::Unknown`] answers taken as the host being gone.
+/// The reaper polls every 100ms, so this is a few hundred milliseconds of a
+/// host that accepts nothing and answers nothing.
+pub(crate) const FORWARD_UNKNOWN_LIMIT: u32 = 5;
+
+pub(crate) fn classify_forward_status(reply: &io::Result<String>) -> ForwardProbe {
+    match reply {
+        Ok(r) => {
+            let r = r.trim();
+            if r == "running" {
+                ForwardProbe::Running
+            } else if r == "exited" || r.starts_with("ERROR: Invalid session key")
+                || r.starts_with("ERROR: Authentication required")
+            {
+                ForwardProbe::Exited
+            } else {
+                ForwardProbe::Unknown
+            }
+        }
+        // Nothing listens on the host's port: the hosting process ended.
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => ForwardProbe::Exited,
+        Err(_) => ForwardProbe::Unknown,
+    }
+}
+
 impl portable_pty::Child for ProxyChild {
     fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
         if self.exited { return Ok(Some(portable_pty::ExitStatus::with_exit_code(0))); }
-        let resp = self.send_control(&format!("pane-forward-status {}", self.forward_id))?;
-        if resp.trim() == "exited" {
+        // A host that is gone used to surface here as an Err, which every
+        // reaper reads as "still running": the target kept a pane with
+        // pane_dead=0 whose keystrokes went nowhere and never fired
+        // pane-exited. A refused connection now means exited, and so does a
+        // host that stays unreachable for FORWARD_UNKNOWN_LIMIT polls.
+        let reply = self.send_control(&format!("pane-forward-status {}", self.forward_id));
+        let gone = match classify_forward_status(&reply) {
+            ForwardProbe::Running => { self.unknown_polls = 0; false }
+            ForwardProbe::Exited => true,
+            ForwardProbe::Unknown => {
+                self.unknown_polls += 1;
+                self.unknown_polls >= FORWARD_UNKNOWN_LIMIT
+            }
+        };
+        if gone {
             self.exited = true;
             Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
         } else {
@@ -250,7 +314,7 @@ pub fn create_proxy_pane(
     let epoch = Instant::now() - Duration::from_secs(2);
     Ok(crate::types::Pane {
         master: Box::new(proxy_master),
-        writer: Box::new(writer),
+        writer: crate::pane::spawn_pane_write_queue(Box::new(writer)),
         child: Box::new(proxy_child),
         term,
         last_rows: rows,
@@ -267,15 +331,25 @@ pub fn create_proxy_pane(
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
+        scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         bell_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // CPR responses written via this field are TCP-forwarded to the source
         // ConPTY via the ProxyMasterPty writer.
         cpr_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        copy_state: None,
+        color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        copy_state: None, live_term: None,
         pane_style: None,
+        pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        // Proxy panes mirror a remote pane's ConPTY; respawning a local shell
+        // here would be wrong, so they are never auto-healed.
+        spawned_at: None,
+        // The command lives on the owning server's pane; a proxy reports no
+        // `#{pane_start_command}` of its own (#580).
+        start_command: String::new(),
+        cwd_hint: None,
     })
 }

@@ -11,7 +11,7 @@
 # Usage:  pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_issue41_btab.ps1
 
 param(
-    [string]$PsmuxBin = ".\target\release\psmux.exe"
+    [string]$PsmuxBin = "$PSScriptRoot\..\target\release\psmux.exe"
 )
 
 $ErrorActionPreference = 'Continue'

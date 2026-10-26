@@ -39,8 +39,10 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# #655: a plain `-w` listing is the target window's OWN table, empty on a window
+# nobody has written to, so the whole catalog is read with -g the way tmux does.
 Write-Test "show-window-options returns window-scoped keys"
-$vals = Psmux show-window-options -t $SESSION | Out-String
+$vals = Psmux show-window-options -g -t $SESSION | Out-String
 if ($vals -match "window-size|window-status-format|automatic-rename") { Write-Pass "window options listed" }
 else { Write-Fail "missing expected window options" }
 

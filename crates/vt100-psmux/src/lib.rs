@@ -57,15 +57,26 @@ mod callbacks;
 mod cell;
 mod grid;
 pub mod image;
+mod palette;
 mod parser;
 mod perform;
+mod program_status;
+mod queries;
 mod row;
 mod screen;
 mod term;
+pub mod width;
 
-pub use attrs::Color;
+pub use attrs::{Color, UnderlineStyle};
 pub use callbacks::Callbacks;
 pub use cell::Cell;
 pub use image::SixelImage;
+pub use palette::{parse_palette_index, parse_x11_colour, ColourPalette};
 pub use parser::Parser;
-pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use queries::QueryDetector;
+pub use program_status::{ProgramKind, ProgramRecord, ProgramState, ProgramStatus, ProgramStatuses, TerminalQuery, PROGRAM_STATUS_REPLY};
+pub use screen::{extended_keys_option, set_extended_keys_option, xtmodkeys_off_mode, xtmodkeys_set_mode, MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use width::{
+    char_width, clear_codepoint_widths, has_overrides, parse_entry as parse_codepoint_width_entry,
+    set_codepoint_widths, str_cells, str_width, WidthOverride, MAX_OVERRIDE_WIDTH,
+};

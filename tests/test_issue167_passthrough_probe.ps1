@@ -60,6 +60,25 @@ class PassthroughProbe {
     const uint CREATE_UNICODE_ENVIRONMENT  = 0x00000400;
     static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = new IntPtr(0x00020016);
 
+    // This probe deliberately spawns children under flag combinations that can
+    // fail to initialize.  Each failure makes Windows raise a modal "unable to
+    // start correctly (0xc0000142)" dialog: 11 to 13 per run of the issue167
+    // probe family, which blocks unattended suite runs.
+    //
+    // A child inherits the parent's error mode UNLESS the parent passes
+    // CREATE_DEFAULT_ERROR_MODE -- and this probe does not.  Setting a silent
+    // error mode here is therefore inherited by every child.  CreateProcessW's
+    // return value and GetLastError, the only things this probe measures, are
+    // unaffected.
+    [DllImport("kernel32.dll")]
+    static extern uint SetErrorMode(uint uMode);
+    const uint SEM_FAILCRITICALERRORS = 0x0001;
+    const uint SEM_NOGPFAULTERRORBOX  = 0x0002;
+    const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+    static void SilenceSpawnFailureDialogs() {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+
     // returns (createPseudoConsoleHr, createProcessErr). HR<0 means CreatePseudoConsole failed.
     static int Spawn(string pwsh, uint conptyFlags, string command, out int hrOut) {
         hrOut = 0;
@@ -122,6 +141,8 @@ class PassthroughProbe {
     static void Main(string[] argv) {
         if (argv.Length < 1) { Console.Error.WriteLine("usage: probe <pwsh>"); Environment.Exit(2); return; }
         string pwsh = argv[0];
+
+        SilenceSpawnFailureDialogs();
 
         string shortCmd = "Start-Sleep -Milliseconds 150";
         // Realistic ~3500-char init (psmux's build_psrl_init produces ~3500 chars).

@@ -103,6 +103,9 @@ if ($found) {
 
 # ─── Test 4: set-option -g status off (global) ───────────────
 Write-Test "set-option -g status off (global)"
+# Tests 2 and 3 gave the session its own status value, which wins over the
+# global as in tmux (#803). Drop it so the session falls back to the global.
+& $PSMUX set-option -u -t $SESSION_NAME status 2>&1
 & $PSMUX set-option -g status off -t $SESSION_NAME 2>&1
 Start-Sleep -Seconds 1
 $found = Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "status" -Expected "off" -TimeoutSec 5

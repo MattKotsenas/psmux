@@ -2,6 +2,11 @@
 # Tests ACTUAL command execution, not just list-keys output
 
 $ErrorActionPreference = "Continue"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and a developer's shell may have it set, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $script:Pass = 0; $script:Fail = 0
 function OK { param($m) Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function FAIL { param($m) Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
@@ -21,6 +26,15 @@ function Cleanup {
 function WinCount { (& $P list-windows 2>&1 | Out-String).Trim().Split("`n").Where({ $_.Trim() -ne "" }).Count }
 function PaneCount { (& $P list-panes 2>&1 | Out-String).Trim().Split("`n").Where({ $_.Trim() -ne "" }).Count }
 function KeyCount { (& $P list-keys 2>&1 | Out-String).Trim().Split("`n").Where({ $_.Trim() -ne "" }).Count }
+# tmux parity (cmd-unbind-key.c): `unbind-key -a` without -T removes ONLY the
+# prefix table (-n: root). copy-mode and copy-mode-vi keep their built in keys
+# and list-keys without -T prints every table (tmux 3.4: `unbind -a; list-keys
+# | wc -l` is 175). Counts that measure what `unbind-key -a` removed therefore
+# look at the prefix and root tables only.
+# The root table's default mouse keys (MouseDown1Pane, WheelUpPane, ...) are
+# not in the prefix table either, so tmux keeps them too: they are left out.
+function PrefixRootKeyCount { @((& $P list-keys 2>&1 | Out-String).Split("`n") | Where-Object { $_ -match '^bind-key\s+(-r\s+)?-T\s+(prefix|root)\s' -and $_ -notmatch '^bind-key\s+(-r\s+)?-T\s+root\s+(Mouse|Wheel|DoubleClick|TripleClick)\S*\s' }).Count }
+function CopyTableKeyCount { @((& $P list-keys 2>&1 | Out-String).Split("`n") | Where-Object { $_ -match '^bind-key\s+(-r\s+)?-T\s+copy-mode(-vi)?\s' }).Count }
 
 function DumpField {
     param([string]$Field)
@@ -37,9 +51,8 @@ function DumpField {
         $w.WriteLine("AUTH $key"); $w.Flush()
         $null = $r.ReadLine()
         $w.WriteLine("dump-state"); $w.Flush()
-        Start-Sleep -Milliseconds 500
-        $buf = ""
-        while ($s.DataAvailable) { $buf += [char]$s.ReadByte() }
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $buf = Read-TcpReplyToEof -Stream $s -TimeoutMs 2000
         $tcp.Close()
         if ($buf -match "`"$Field`":(true|false|`"[^`"]*`"|\d+|\[[^\]]*\])") {
             return $Matches[1]
@@ -208,7 +221,7 @@ bind-key C-r source-file ~/.tmux.conf
 Start-Process -FilePath $P -ArgumentList "new-session -d" -WindowStyle Hidden
 Start-Sleep -Seconds 3
 
-$kc1 = KeyCount
+$kc1 = PrefixRootKeyCount
 if ($kc1 -eq 2) { OK "Initial: $kc1 bindings (unbind active)" } else { FAIL "Initial: expected 2, got $kc1" }
 
 # Change config to comment out unbind, then source-file reload
@@ -249,7 +262,7 @@ bind-key C-r source-file ~/.tmux.conf
 & $P source-file "$env:USERPROFILE\.tmux.conf" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 
-$kc3 = KeyCount
+$kc3 = PrefixRootKeyCount
 if ($kc3 -eq 2) { OK "Re-reload with unbind: $kc3 bindings (suppressed again)" } else { FAIL "Re-reload: expected 2, got $kc3" }
 
 $ds = DumpField "defaults_suppressed"
@@ -303,8 +316,10 @@ $kc1 = KeyCount
 if ($kc1 -gt 50) { OK "Before runtime unbind: $kc1 defaults" } else { FAIL "Before: expected 50+, got $kc1" }
 
 & $P unbind-key -a 2>&1 | Out-Null; Start-Sleep -Milliseconds 500
-$kc2 = KeyCount
-if ($kc2 -eq 0) { OK "After unbind-key -a: $kc2 bindings" } else { FAIL "After unbind-key -a: expected 0, got $kc2" }
+$kc2 = PrefixRootKeyCount
+if ($kc2 -eq 0) { OK "After unbind-key -a: $kc2 prefix/root bindings" } else { FAIL "After unbind-key -a: expected 0 prefix/root, got $kc2" }
+$cc2 = CopyTableKeyCount
+if ($cc2 -gt 40) { OK "unbind-key -a without -T keeps $cc2 copy table keys (tmux parity)" } else { FAIL "copy tables have only $cc2 keys after unbind-key -a (tmux keeps them)" }
 
 $ds = DumpField "defaults_suppressed"
 if ($ds -eq "true") { OK "defaults_suppressed = true after runtime unbind" } else { FAIL "defaults_suppressed = $ds" }
@@ -372,7 +387,7 @@ set -g prefix C-a
 bind-key C-a send-prefix
 "@ | Set-Content -Path "$env:USERPROFILE\.tmux.conf" -Force
 & $P source-file "$env:USERPROFILE\.tmux.conf" 2>&1 | Out-Null; Start-Sleep -Milliseconds 300
-$r1 = KeyCount
+$r1 = PrefixRootKeyCount
 
 @"
 set -g prefix C-a
@@ -388,7 +403,7 @@ set -g prefix C-a
 bind-key C-a send-prefix
 "@ | Set-Content -Path "$env:USERPROFILE\.tmux.conf" -Force
 & $P source-file "$env:USERPROFILE\.tmux.conf" 2>&1 | Out-Null; Start-Sleep -Milliseconds 300
-$r3 = KeyCount
+$r3 = PrefixRootKeyCount
 
 if ($r1 -le 2 -and $r2 -gt 50 -and $r3 -le 2) {
     OK "Rapid toggle: $r1 -> $r2 -> $r3 (suppressed/restored/suppressed)"

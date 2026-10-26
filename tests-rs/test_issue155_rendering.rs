@@ -1,7 +1,7 @@
 // ── Issue #155: End-to-end rendering verification ───────────────────
 //
-// These tests replicate the EXACT cell → span conversion logic from
-// rendering.rs::render_node to prove that:
+// These tests replicate the cell-to-span conversion used by
+// client::render_layout_json to prove that:
 //   1. Hidden cells (SGR 8) render as spaces (workaround for ratatui-crossterm bug)
 //   2. Strikethrough cells (SGR 9) get Modifier::CROSSED_OUT on the Style
 //   3. Color index 7 maps to Color::Gray (palette 7), not Color::White
@@ -43,8 +43,7 @@ fn vt_to_color(c: vt100::Color) -> Color {
     }
 }
 
-/// Replicates exactly the cell → (text, style) logic from render_node
-/// in rendering.rs.  If render_node changes, this must be updated too.
+/// Replicates the cell-to-style behavior used by the active client renderer.
 fn cell_to_text_and_style(cell: &vt100::Cell) -> (String, Style) {
     let fg = vt_to_color(cell.fgcolor());
     let bg = vt_to_color(cell.bgcolor());
@@ -282,7 +281,7 @@ fn ratatui_buffer_hidden_cell_produces_space_in_output() {
     let area = Rect::new(0, 0, 10, 1);
     let mut buf = Buffer::empty(area);
 
-    // Simulate what render_node does: feed parser, extract cells, write to buffer
+    // Simulate the active client renderer: parse cells and write the buffer.
     let mut parser = vt100::Parser::new(1, 10, 0);
     parser.process(b"\x1b[8mSECRET\x1b[28mOK");
     let screen = parser.screen();

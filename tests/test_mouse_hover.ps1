@@ -1,11 +1,9 @@
 #!/usr/bin/env pwsh
-# test_mouse_hover.ps1 - Diagnose and verify mouse hover (Moved) forwarding to child PTY
+# test_mouse_hover.ps1 - Verify mouse hover (Moved) forwarding to a child PTY
 #
-# Root cause under investigation (#60):
-#   MouseEventKind::Moved events are silently discarded in psmux's input handling.
-#   TUI apps (opencode, nvim) that request AnyMotion mouse tracking (DECSET 1003)
-#   expect SGR mouse motion sequences (button 35 = bare hover with no button).
-#   Without forwarding these, hover-dependent UI features don't work.
+# An attached client maps MouseEventKind::Moved to a semantic pane-mouse or
+# mouse-move command. The server forwards SGR button 35 only when the child
+# enables ButtonEventMouseTracking or AnyEventMouseTracking (DECSET 1002/1003).
 #
 # Windows Terminal reference:
 #   WT only sends hover events when:
@@ -13,8 +11,8 @@
 #     - AnyEventMouseTracking (1003): ALL motion (bare hover)
 #   WT uses SGR button encoding: hover adds +0x20; bare move = button 3+32 = 35
 #
-# This test injects mouse-move commands via the TCP control channel and checks
-# whether the pane receives them.
+# This test injects a real console MOUSE_MOVED record into an attached client
+# and requires the exact SGR bytes at a mouse-aware child.
 
 $ErrorActionPreference = "Continue"
 $pass = 0; $fail = 0; $total = 0
@@ -30,221 +28,224 @@ if (-not $psmux) { Write-Host "psmux not found in PATH"; exit 1 }
 $ver = & psmux -V 2>&1 | Out-String
 Write-Host "psmux version: $ver"
 
-# Kill any existing server
-& psmux kill-server 2>$null
-Start-Sleep -Milliseconds 500
-
-# ── Test 1: Verify remote_mouse_motion no-op vs real forwarding ──
-Write-Host "`n=== Test Group 1: Mouse hover event routing ==="
-
-# Start a fresh session
-& psmux new-session -d -s hover_test
-Start-Sleep -Milliseconds 1500
-& psmux set -g mouse on 2>$null
-
-# Get server control port
-$port = $null
+$csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (-not (Test-Path $csc)) {
+    $csc = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) "csc.exe"
+}
+$runId = [guid]::NewGuid().ToString("N")
+$artifactRoot = Join-Path $env:TEMP "psmux-hover-$runId"
+$mouseChild = Join-Path $artifactRoot "mouse_echo_child.exe"
+$mouseInjector = Join-Path $artifactRoot "mouse_move_injector.exe"
+$mouseLog = Join-Path $artifactRoot "mouse_echo.txt"
+$injectorLog = Join-Path $artifactRoot "mouse_move_inject.log"
+$namespace = "hover_$($runId.Substring(0, 12))"
+New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+foreach ($helper in @(
+    @($mouseChild, "mouse_echo_child.cs"),
+    @($mouseInjector, "mouse_move_injector.cs")
+)) {
+    $compilerOutput = & $csc /nologo /optimize /out:$($helper[0]) (Join-Path $PSScriptRoot $helper[1]) 2>&1
+    if (-not (Test-Path $helper[0])) {
+        Write-Host "Failed to compile $($helper[1])" -ForegroundColor Red
+        $compilerOutput | Write-Host
+        Remove-Item $artifactRoot -Recurse -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+}
+$echoLogEnvExisted = Test-Path Env:\PSMUX_MOUSE_ECHO_LOG
+$moveLogEnvExisted = Test-Path Env:\PSMUX_MOUSE_MOVE_LOG
+$previousEchoLog = $env:PSMUX_MOUSE_ECHO_LOG
+$previousMoveLog = $env:PSMUX_MOUSE_MOVE_LOG
 $psmuxDir = "$env:USERPROFILE\.psmux"
-# Port files are stored as {session_name}.port
-$portFile = Join-Path $psmuxDir "hover_test.port"
-if (Test-Path $portFile) { $port = (Get-Content $portFile -Raw).Trim() }
-if (-not $port) {
-    # Try wildcard search for any .port file
-    $portFiles = Get-ChildItem "$psmuxDir\*.port" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-    if ($portFiles.Count -gt 0) { $port = (Get-Content $portFiles[0].FullName -Raw).Trim() }
+$clientProcess = $null
+# Sweep 2026-09-27_02-44-24: this suite failed 3 of 3 with the physical pointer at
+# the screen centre and passed 3 of 3 with it parked in a corner. Windows sends a
+# WM_MOUSEMOVE to a window that appears under the pointer, conhost turns it into a
+# MOUSE_MOVED record, and psmux forwards it as an any-motion hover, which is
+# correct (tmux does the same under 1003) but lands in the child before the
+# injected record and breaks the "exactly one record" assertion. So the pointer
+# is parked in the bottom right corner for the length of the test and put back
+# afterwards. If the desktop refuses the move the assertion falls back to "the
+# injected record arrived" and says so.
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public struct HoverPt { public int X; public int Y; }
+public static class HoverCursor {
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out HoverPt p);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);
 }
-Test "Control port discovered" ($null -ne $port -and $port -match '^\d+$')
-
-# Helper: read session key for auth
-function Get-SessionKey($sessionName) {
-    $keyFile = "$env:USERPROFILE\.psmux\${sessionName}.key"
-    if (Test-Path $keyFile) { return (Get-Content $keyFile -Raw).Trim() }
-    # Fallback: try any .key file
-    $keyFiles = Get-ChildItem "$env:USERPROFILE\.psmux\*.key" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-    if ($keyFiles.Count -gt 0) { return (Get-Content $keyFiles[0].FullName -Raw).Trim() }
-    return $null
-}
-
-# Helper: send authenticated command to psmux server
-function Send-PsmuxCmd($port, $key, $cmds) {
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $tcp.Connect("127.0.0.1", [int]$port)
-        $stream = $tcp.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $writer.AutoFlush = $true
-        if ($key) { $writer.WriteLine("AUTH $key") }
-        foreach ($cmd in $cmds) { $writer.WriteLine($cmd) }
-        Start-Sleep -Milliseconds 300
-        $writer.Close()
-        $tcp.Close()
-        return $true
-    } catch {
-        Write-Host "    TCP error: $_" -ForegroundColor Yellow
-        return $false
+"@
+$pointerSaved = New-Object HoverPt
+$pointerParked = $false
+try {
+    if ([HoverCursor]::GetCursorPos([ref]$pointerSaved)) {
+        $w = [HoverCursor]::GetSystemMetrics(0); $h = [HoverCursor]::GetSystemMetrics(1)
+        $pointerParked = [HoverCursor]::SetCursorPos($w - 2, $h - 2)
     }
-}
+} catch { $pointerParked = $false }
+Write-Host "  [INFO] pointer was at $($pointerSaved.X),$($pointerSaved.Y); parked in the corner: $pointerParked"
 
-if ($port) {
-    $key = Get-SessionKey "hover_test"
-    $sent = Send-PsmuxCmd $port $key @("mouse-move 10 5")
-    Test "mouse-move command sent without error" $sent
-} else {
-    Write-Host "  [SKIP] Cannot test mouse-move - no control port" -ForegroundColor Yellow
-}
+try {
+    $env:PSMUX_MOUSE_ECHO_LOG = $mouseLog
+    $env:PSMUX_MOUSE_MOVE_LOG = $injectorLog
 
-# ── Test 2: Check code paths for MouseEventKind::Moved handling ──
-Write-Host "`n=== Test Group 2: Source code analysis of Moved handling ==="
-
-$srcRoot = Join-Path $PSScriptRoot "..\src"
-
-# Check input.rs for Moved handler
-$inputRs = Get-Content (Join-Path $srcRoot "input.rs") -Raw
-$movedInInput = $inputRs -match 'MouseEventKind::Moved\s*=>\s*\{[^}]*forward|inject|mouse_combined|pane_ex'
-Test "input.rs: Moved handler forwards to child" $movedInInput
-
-$movedNoOp = $inputRs -match "MouseEventKind::Moved\s*=>\s*\{[^}]*Don't forward bare motion"
-Test "input.rs: Moved handler is NOT a no-op" (-not $movedNoOp)
-
-# Check client.rs for Moved handler
-$clientRs = Get-Content (Join-Path $srcRoot "client.rs") -Raw
-$movedInClient = $clientRs -match 'MouseEventKind::Moved\s*=>\s*\{[^}]*mouse-move|forward|cmd_batch'
-Test "client.rs: Moved handler sends mouse-move to server" $movedInClient
-
-$clientNoOp = $clientRs -match "MouseEventKind::Moved\s*=>\s*\{[^}]*Don't send bare mouse-move"
-Test "client.rs: Moved handler is NOT a no-op" (-not $clientNoOp)
-
-# Check window_ops.rs for remote_mouse_motion
-$winOps = Get-Content (Join-Path $srcRoot "window_ops.rs") -Raw
-$motionReal = $winOps -match 'fn remote_mouse_motion\(app.*\{[^}]*inject_mouse_combined|write_mouse_to_pty|inject_sgr_mouse|forward'
-Test "window_ops.rs: remote_mouse_motion is real (not no-op)" $motionReal
-
-$motionNoOp = $winOps -match "fn remote_mouse_motion\(_app.*_x.*_y"
-Test "window_ops.rs: remote_mouse_motion is NOT a no-op" (-not $motionNoOp)
-
-# ── Test 3: Verify SGR button 35 encoding for hover ──
-Write-Host "`n=== Test Group 3: SGR hover encoding ==="
-
-# SGR button 35 = 3 (no-button release code) + 0x20 (motion bit) = 35
-# This matches Windows Terminal's _windowsButtonToSGREncoding:
-#   WM_MOUSEMOVE -> xvalue=3, isHover -> +0x20 -> 35
-$sgrHoverButton = 3 + 0x20
-Test "SGR hover button is 35 (WT parity)" ($sgrHoverButton -eq 35)
-
-# Check that the code uses button 35 for hover
-$uses35 = $winOps -match '35.*true.*MOUSE_MOVED' -or $inputRs -match '35.*true' -or $winOps -match 'inject_mouse_combined.*35'
-Test "Code uses SGR button 35 for bare hover" $uses35
-
-# ── Test 4: Hover gating check ──
-Write-Host "`n=== Test Group 4: Hover gating for mouse-aware panes ==="
-
-# Hover should only be forwarded when the active pane explicitly wants mouse
-# input. In psmux this is unified behind pane_wants_mouse().
-$movedBlockInput = [regex]::Match($inputRs, '(?s)MouseEventKind::Moved\s*=>\s*\{(.+?)(?=MouseEventKind::Scroll)').Groups[1].Value
-$gatedInput = $movedBlockInput -match 'pane_wants_mouse'
-$movedBlockWinOps = [regex]::Match($winOps, '(?s)fn remote_mouse_motion\(.*?\{(.+?)(?=fn\s)').Groups[1].Value
-$gatedWinOps = $movedBlockWinOps -match 'pane_wants_mouse'
-Test "Hover uses pane_wants_mouse gate" ($gatedInput -and $gatedWinOps)
-
-# Verify ConPTY-awareness: must NOT use raw alternate_screen() in hover path
-$rawAltInHover = $movedBlockInput -match 'parser\.screen\(\)\.alternate_screen' -or
-                 $movedBlockWinOps -match 'parser\.screen\(\)\.alternate_screen'
-Test "Hover does NOT use raw alternate_screen() (ConPTY strips it)" (-not $rawAltInHover)
-
-# Verify server sets state_dirty for MouseMove (so client sees frame updates)
-$serverRs = Get-Content (Join-Path $srcRoot "server\mod.rs") -Raw
-$serverMouseMove = [regex]::Match($serverRs, 'MouseMove\([^)]+\)\s*=>\s*\{([^}]+)\}').Groups[1].Value
-$hasStateDirty = $serverMouseMove -match 'state_dirty\s*=\s*true'
-Test "Server MouseMove sets state_dirty for frame updates" $hasStateDirty
-
-# ── Test 5: WT-style dedup (same-coord suppression) ──
-Write-Host "`n=== Test Group 5: Same-coordinate deduplication ==="
-
-# Windows Terminal suppresses consecutive MOUSEMOVE at same position:
-#   const auto sameCoord = (position.x == lastPos.x) && (position.y == lastPos.y)
-# Check if psmux implements similar dedup to avoid PTY flooding
-$hasDedup = ($inputRs -match 'last_hover|prev_move|hover_dedup|same.*coord|last_motion') -or
-            ($winOps -match 'last_hover|prev_move|hover_dedup|same.*coord|last_motion') -or
-            ($clientRs -match 'last_hover|prev_move|hover_dedup|same.*coord|last_motion')
-Test "Mouse move deduplication exists (WT parity)" $hasDedup
-
-# ── Test 6: Functional test with nvim if available ──
-Write-Host "`n=== Test Group 6: Functional hover test ==="
-
-# Note: PSMUX_MOUSE_DEBUG=1 must be in the server process environment.
-$debugLog = "$env:USERPROFILE\.psmux\mouse_debug.log"
-if (Test-Path $debugLog) { Remove-Item $debugLog -Force }
-
-# Check if nvim is available for functional test
-$nvim = Get-Command nvim -ErrorAction SilentlyContinue
-if ($nvim) {
-    Write-Host "  nvim found, running functional hover test..."
-
-    # Kill existing session
-    & psmux kill-server 2>$null
+    # Clean only this test's namespace.
+    & $psmux.Source -L $namespace kill-server 2>$null
     Start-Sleep -Milliseconds 500
 
-    # Start psmux with debug logging enabled (server inherits env)
-    $env:PSMUX_MOUSE_DEBUG = "1"
-    & psmux new-session -d -s nvim_hover "nvim --clean"
-    Start-Sleep -Milliseconds 2500
-    & psmux set -g mouse on 2>$null
-    Start-Sleep -Milliseconds 500
+    # ── Test 1: Start the live attached-client route ──
+    Write-Host "`n=== Test Group 1: Mouse hover event routing ==="
 
-    # Discover port and key
-    $portFile = Join-Path $psmuxDir "nvim_hover.port"
-    $port = $null
-    if (Test-Path $portFile) { $port = (Get-Content $portFile -Raw).Trim() }
-    if (-not $port) {
-        $portFiles = Get-ChildItem "$psmuxDir\*.port" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-        if ($portFiles.Count -gt 0) { $port = (Get-Content $portFiles[0].FullName -Raw).Trim() }
+    $clientProcess = Start-Process `
+        -FilePath $psmux.Source `
+        -ArgumentList "-L",$namespace,"new-session","-s","hover_test",$mouseChild `
+        -PassThru
+    $sessionReady = $false
+    for ($i = 0; $i -lt 20 -and -not $sessionReady; $i++) {
+        Start-Sleep -Milliseconds 250
+        $sessionReady = Test-Path (Join-Path $psmuxDir "${namespace}__hover_test.port")
     }
-    $key = Get-SessionKey "nvim_hover"
+    Test "Attached client session started" $sessionReady
 
-    if ($port -and $key) {
-        # Send mouse-move commands as raw TCP batch
-        $allCmds = "AUTH $key`nmouse-move 10 5`nmouse-move 11 5`nmouse-move 12 5`n"
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($allCmds)
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $tcp.Connect("127.0.0.1", [int]$port)
-            $s = $tcp.GetStream()
-            $s.Write($bytes, 0, $bytes.Length)
-            $s.Flush()
-            Start-Sleep -Milliseconds 500
-            $tcp.Close()
-            Test "mouse-move commands sent to nvim session" $true
-        } catch {
-            Test "mouse-move commands sent to nvim session" $false
-            Write-Host "    TCP error: $_" -ForegroundColor Yellow
+    $mouseChildReady = $false
+    if ($sessionReady) {
+        & $psmux.Source -L $namespace set -g mouse on 2>$null
+        for ($i = 0; $i -lt 20 -and -not $mouseChildReady; $i++) {
+            Start-Sleep -Milliseconds 250
+            $paneText = (& $psmux.Source -L $namespace capture-pane -t hover_test -p 2>&1) | Out-String
+            $mouseChildReady = $paneText -match 'MOUSE_ECHO_READY'
         }
+    }
+    Test "Mouse-reporting child enabled any-motion tracking" $mouseChildReady
 
-        # Check debug log (may not exist if env var didn't propagate to server)
+    $moveInjected = $false
+    if ($mouseChildReady -and -not $clientProcess.HasExited) {
         Start-Sleep -Milliseconds 500
-        if (Test-Path $debugLog) {
-            $log = Get-Content $debugLog -Raw
-            $forwarded = $log -match 'inject_mouse_combined.*35' -or $log -match 'PTY pipe SGR.*35'
-            Test "Debug log confirms SGR button 35 injection" $forwarded
+        Remove-Item $injectorLog -Force -ErrorAction SilentlyContinue
+        $injectorOutput = & $mouseInjector $clientProcess.Id move 1 10 5 0 0 0 2>&1
+        $injectorExitCode = $LASTEXITCODE
+        $injectorEvidence = if (Test-Path $injectorLog) {
+            Get-Content $injectorLog -Raw
         } else {
-            # Server may not have PSMUX_MOUSE_DEBUG -- code analysis tests verify correctness
-            Write-Host "  [INFO] Debug log not created (env may not reach detached server)" -ForegroundColor Cyan
-            Test "Debug log confirms SGR button 35 injection" $true  # Code analysis confirmed
+            ""
         }
-    } else {
-        Test "mouse-move commands sent to nvim session" $false
-        Test "Debug log confirms SGR button 35 injection" $false
-        Write-Host "    [SKIP] No control port/key" -ForegroundColor Yellow
+        $moveInjected = $injectorExitCode -eq 0 -and
+            $injectorEvidence -match 'move\[0\].*ok=True written=1'
+        if (-not $moveInjected) {
+            $injectorOutput | Write-Host
+            if ($injectorEvidence) {
+                $injectorEvidence | Write-Host
+            } else {
+                Write-Host "Mouse injector log was not created" -ForegroundColor Red
+            }
+        }
     }
-} else {
-    Write-Host "  [SKIP] nvim not found - skipping functional hover test" -ForegroundColor Yellow
-    $total += 2  # Count skipped as total
-}
+    Test "Real MOUSE_MOVED record injected into the attached client" $moveInjected
 
-# Cleanup
-& psmux kill-server 2>$null
-$env:PSMUX_MOUSE_DEBUG = $null
+    # ── Test 2: End-to-end PTY delivery ──
+    Write-Host "`n=== Test Group 2: End-to-end PTY delivery ==="
+
+    $expectedHover = '<ESC>[<35;11;6M'
+    $expectedRecord = "RECV $expectedHover  |  1B 5B 3C 33 35 3B 31 31 3B 36 4D"
+    $receiveLines = @()
+    $previousReceiveCount = -1
+    $stablePolls = 0
+    for ($i = 0; $i -lt 28; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (Test-Path $mouseLog) {
+            $receiveLines = @(Get-Content $mouseLog | Where-Object { $_ -like "RECV *" })
+        }
+        if ($receiveLines.Count -eq $previousReceiveCount) {
+            $stablePolls++
+        } else {
+            $previousReceiveCount = $receiveLines.Count
+            $stablePolls = 0
+        }
+        if ($receiveLines.Count -gt 0 -and $stablePolls -ge 8) {
+            break
+        }
+    }
+    if ($pointerParked) {
+        $hoverDelivered = $receiveLines.Count -eq 1 -and $receiveLines[0] -eq $expectedRecord
+        Test "Attached-client hover produces exactly $expectedRecord" $hoverDelivered
+    } else {
+        # The physical pointer could not be moved, so real motion over the new
+        # window may precede the injected record. Require the injected record
+        # and nothing that is not a hover.
+        $hoverDelivered = ($receiveLines -contains $expectedRecord) -and
+            (@($receiveLines | Where-Object { $_ -notmatch "^RECV (<ESC>\[<35;\d+;\d+M)+  \|" }).Count -eq 0)
+        Test "Attached-client hover delivers $expectedRecord (pointer not parked, real motion tolerated)" $hoverDelivered
+    }
+    if (-not $hoverDelivered) {
+        # Sweep 2026-09-27_02-44-24 failed this assertion and the log carried no
+        # evidence of what the child saw, so the artifacts were gone before anyone
+        # could look. Print the whole child log and the injector log on failure.
+        Write-Host "  [INFO] child received $($receiveLines.Count) RECV line(s):"
+        foreach ($line in $receiveLines) { Write-Host "         $line" }
+        if (Test-Path $mouseLog) { Write-Host "  [INFO] child log:"; Get-Content $mouseLog | ForEach-Object { Write-Host "         $_" } }
+        if (Test-Path $injectorLog) { Write-Host "  [INFO] injector log:"; Get-Content $injectorLog | ForEach-Object { Write-Host "         $_" } }
+    }
+}
+finally {
+    if ($pointerParked) { [void][HoverCursor]::SetCursorPos($pointerSaved.X, $pointerSaved.Y) }
+    & $psmux.Source -L $namespace kill-server 2>$null
+    if ($null -ne $clientProcess -and -not $clientProcess.HasExited) {
+        Stop-Process -Id $clientProcess.Id -Force -ErrorAction SilentlyContinue
+        [void]$clientProcess.WaitForExit(3000)
+    }
+
+    $ownedFiles = @()
+    $clientStopped = $false
+    $namespaceClean = $false
+    for ($i = 0; $i -lt 12 -and -not $namespaceClean; $i++) {
+        $ownedFiles = @(Get-ChildItem $psmuxDir -Filter "${namespace}__*" -ErrorAction SilentlyContinue)
+        $clientStopped = $null -eq $clientProcess -or $clientProcess.HasExited
+        $namespaceClean = $clientStopped -and $ownedFiles.Count -eq 0
+        if (-not $namespaceClean) {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    Test "Owned client and namespace cleaned up" $namespaceClean
+    if (-not $namespaceClean) {
+        Write-Host "Client stopped: $clientStopped" -ForegroundColor Red
+        $ownedFiles.FullName | Write-Host
+        $ownedFiles | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    # mouse_echo_child.exe can stay briefly locked after its process exits
+    # (Windows releases the image handle a moment after termination), so a
+    # single Remove-Item races the lock. Retry for up to ~2.5s before asserting.
+    for ($rm = 0; $rm -lt 10; $rm++) {
+        Remove-Item $artifactRoot -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $artifactRoot)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Test "Run-specific artifacts cleaned up" (-not (Test-Path $artifactRoot))
+
+    if ($echoLogEnvExisted) {
+        $env:PSMUX_MOUSE_ECHO_LOG = $previousEchoLog
+    } else {
+        Remove-Item Env:\PSMUX_MOUSE_ECHO_LOG -ErrorAction SilentlyContinue
+    }
+    if ($moveLogEnvExisted) {
+        $env:PSMUX_MOUSE_MOVE_LOG = $previousMoveLog
+    } else {
+        Remove-Item Env:\PSMUX_MOUSE_MOVE_LOG -ErrorAction SilentlyContinue
+    }
+    $environmentRestored = (
+        ($echoLogEnvExisted -and $env:PSMUX_MOUSE_ECHO_LOG -ceq $previousEchoLog) -or
+        (-not $echoLogEnvExisted -and -not (Test-Path Env:\PSMUX_MOUSE_ECHO_LOG))
+    ) -and (
+        ($moveLogEnvExisted -and $env:PSMUX_MOUSE_MOVE_LOG -ceq $previousMoveLog) -or
+        (-not $moveLogEnvExisted -and -not (Test-Path Env:\PSMUX_MOUSE_MOVE_LOG))
+    )
+    Test "Caller log environment restored" $environmentRestored
+}
 
 Write-Host "`n============================================"
 Write-Host "Results: $pass passed, $fail failed, $total total"
 if ($fail -eq 0) { Write-Host "ALL TESTS PASSED" -ForegroundColor Green }
 else { Write-Host "SOME TESTS FAILED" -ForegroundColor Red }
+
+exit $fail

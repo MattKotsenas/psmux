@@ -62,6 +62,18 @@ function Launch-AttachedSession([string]$sess, [string]$configFile = $null) {
         return $null
     }
     Start-Sleep -Milliseconds 800   # let session stabilise
+    # Root-cause note: PSReadLine ships a DEFAULT Ctrl+v = Paste key handler
+    # (confirmed via `Get-PSReadLineKeyHandler -Bound`), completely independent
+    # of psmux. When psmux correctly forwards the raw 0x16 byte to the pane
+    # (paste-detection off / C-v unbound -- proven via PSMUX_INPUT_DEBUG=1
+    # input_debug.log to send exactly one `send-key C-v` and nothing else),
+    # PSReadLine's OWN binding still reads the clipboard and inserts it --
+    # indistinguishable from a real "leak" unless this pane-local binding is
+    # neutralised first. Removing it here means the marker can only appear
+    # via psmux's own mechanism, which is what this test is actually meant
+    # to measure.
+    & $PSMUX send-keys -t $sess "Remove-PSReadLineKeyHandler -Key Ctrl+v" Enter 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 400
     return $proc
 }
 

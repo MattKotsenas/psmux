@@ -93,7 +93,9 @@ if (Test-Path "C:\OpenSSH\sshd.exe") {
 # 4. Install Git
 # ============================================
 Write-Host "=== Installing Git ==="
-Expand-Archive C:\git.zip -DestinationPath C:\git -Force
+# Expand-Archive crashes pwsh inside Hyper-V isolated containers (0xc0000005,
+# observed on Win11 25H2 hosts); use the ZipFile API like the OpenSSH step.
+[System.IO.Compression.ZipFile]::ExtractToDirectory("C:\git.zip", "C:\git")
 Remove-Item C:\git.zip -Force
 [Environment]::SetEnvironmentVariable("PATH", "C:\git\cmd;" + [Environment]::GetEnvironmentVariable("PATH","Machine"), "Machine")
 Write-Host "Git installed."

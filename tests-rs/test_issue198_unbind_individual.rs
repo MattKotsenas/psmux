@@ -292,15 +292,18 @@ fn populate_default_bindings_adds_all_prefix_defaults() {
 }
 
 #[test]
-fn populate_default_bindings_adds_root_bindings() {
+fn populate_default_bindings_leaves_root_table_empty() {
     let mut app = mock_app();
     populate_default_bindings(&mut app);
 
-    // Root table should have default bindings (e.g. PageUp -> copy-mode -u, matching tmux)
-    let root = app.key_tables.get("root");
-    assert!(root.is_some() && !root.unwrap().is_empty(),
-        "root table should have default bindings (e.g. PageUp)");
-    let root_table = root.unwrap();
-    let has_pageup = root_table.iter().any(|b| b.key.0 == crossterm::event::KeyCode::PageUp);
-    assert!(has_pageup, "root table should have PageUp default binding");
+    // Issue #488 (tmux parity): tmux binds NO keys in the root table by
+    // default — in particular PageUp must reach the running application.
+    // PageUp -> copy-mode -u lives in the PREFIX table instead.
+    if let Some(root_table) = app.key_tables.get("root") {
+        let has_pageup = root_table.iter().any(|b| b.key.0 == crossterm::event::KeyCode::PageUp);
+        assert!(!has_pageup, "root table must NOT have a default PageUp binding (issue #488)");
+    }
+    let prefix = app.key_tables.get("prefix").expect("prefix table populated");
+    let has_pageup = prefix.iter().any(|b| b.key.0 == crossterm::event::KeyCode::PageUp);
+    assert!(has_pageup, "prefix table should have PageUp -> copy-mode -u (tmux parity)");
 }

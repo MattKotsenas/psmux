@@ -18,6 +18,7 @@
 # popup_active=true.
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $results = @()
 
 function Add-Result($name, $pass, $detail="") {
@@ -28,7 +29,7 @@ function Add-Result($name, $pass, $detail="") {
     }
 }
 
-$SESSION = "test146popup_$$"
+$SESSION = "test146popup_$PID"
 $h = $env:USERPROFILE
 
 function Get-Port { (Get-Content "$h\.psmux\$SESSION.port").Trim() }
@@ -60,15 +61,10 @@ function Get-DumpState {
     $w.AutoFlush = $true
     $w.WriteLine("AUTH $key")
     $w.WriteLine("dump-state")
-    Start-Sleep -Milliseconds 1500
-    $buf = New-Object byte[] 262144
-    $total = 0
-    while ($s.DataAvailable -and $total -lt 262144) {
-        $n = $s.Read($buf, $total, 262144 - $total)
-        $total += $n
-    }
+    # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+    $resp = Read-TcpReplyToEof -Stream $s -TimeoutMs 5000
     $tcp.Close()
-    return [System.Text.Encoding]::UTF8.GetString($buf, 0, $total)
+    return $resp
 }
 
 function Dismiss-Popup {

@@ -30,10 +30,17 @@ Write-Info "Using tmux binary: $TMUX"
 # ============================================================
 # Test 1: psmux -V (capital) prints version and exits
 # ============================================================
+# NOTE: `-V`/`-v`/`--version` always print "tmux <ver>" (never a "psmux"
+# prefix), even when invoked as psmux.exe. This is deliberate tmux-compat
+# (issue #318, see src/cli.rs print_version()) so libtmux/tmuxp -- which
+# parse the "tmux " prefix from `-V` output to detect a tmux-compatible
+# binary -- work against psmux regardless of which of its three shipped
+# binary names (psmux/pmux/tmux) is invoked. Assertions below intentionally
+# expect the "tmux" prefix, not "psmux" (task #7 batch A bug 5 DECIDE item).
 Write-Test "Test 1: psmux -V prints version"
 $output = & $PSMUX -V 2>&1
-if ($LASTEXITCODE -eq 0 -and $output -match "psmux \d+\.\d+") {
-    Write-Pass "psmux -V prints version: $output"
+if ($LASTEXITCODE -eq 0 -and $output -match "tmux \d+\.\d+") {
+    Write-Pass "psmux -V prints tmux-compat version: $output"
 } else {
     Write-Fail "psmux -V did not print version (exit=$LASTEXITCODE): $output"
 }
@@ -50,8 +57,8 @@ $completed = $job | Wait-Job -Timeout 5
 if ($completed) {
     $output = Receive-Job $job
     $exitCode = $job.ChildJobs[0].JobStateInfo.Reason
-    if ($output -match "psmux \d+\.\d+") {
-        Write-Pass "psmux -v prints version: $output"
+    if ($output -match "tmux \d+\.\d+") {
+        Write-Pass "psmux -v prints tmux-compat version: $output"
     } else {
         Write-Fail "psmux -v unexpected output: $output"
     }
@@ -107,8 +114,8 @@ if (Test-Path $TMUX) {
 # ============================================================
 Write-Test "Test 5: psmux --version prints version"
 $output = & $PSMUX --version 2>&1
-if ($LASTEXITCODE -eq 0 -and $output -match "psmux \d+\.\d+") {
-    Write-Pass "psmux --version prints version: $output"
+if ($LASTEXITCODE -eq 0 -and $output -match "tmux \d+\.\d+") {
+    Write-Pass "psmux --version prints tmux-compat version: $output"
 } else {
     Write-Fail "psmux --version did not print version (exit=$LASTEXITCODE): $output"
 }

@@ -11,8 +11,15 @@ $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "issue24_fixed"
 $psmuxDir = "$env:USERPROFILE\.psmux"
-$AUTOSAVE = "$psmuxDir\plugins\psmux-continuum\scripts\auto_save.ps1"
-$PLUGINCONF = "$psmuxDir\plugins\psmux-continuum\plugin.conf"
+# Resolve the plugin the same way psmux does: src/config.rs searches both
+# ~/.psmux/plugins/<name>/ and ~/.psmux/plugins/psmux-plugins/<name>/, since the
+# collection is normally cloned as one repo with each plugin a level deeper.
+# Hardcoding the flat path aborted the suite before any check ran.
+$PLUGINROOTS = @("$psmuxDir\plugins\psmux-continuum", "$psmuxDir\plugins\psmux-plugins\psmux-continuum")
+$PLUGINDIR = $PLUGINROOTS | Where-Object { Test-Path (Join-Path $_ "plugin.conf") } | Select-Object -First 1
+if (-not $PLUGINDIR) { $PLUGINDIR = $PLUGINROOTS[0] }
+$AUTOSAVE = Join-Path $PLUGINDIR "scripts\auto_save.ps1"
+$PLUGINCONF = Join-Path $PLUGINDIR "plugin.conf"
 $script:Pass = 0; $script:Fail = 0
 function Write-Pass($m){ Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function Write-Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }

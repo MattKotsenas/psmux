@@ -47,8 +47,12 @@ $script:PsmuxDir = Join-Path $env:USERPROFILE ".psmux"
 # Invoke psmux with the rbChurn namespace ALWAYS first. Returns a PSCustomObject
 # with ExitCode + Output so callers can assert on exact outcomes.
 function Invoke-Psmux {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    $out = & psmux -L rbChurn @Args 2>&1
+    # Simple function on purpose: a [Parameter(ValueFromRemainingArguments)]
+    # param turns this into an ADVANCED function whose binder eats -d as the
+    # common -Debug switch, silently making `new-session -d` an ATTACHING
+    # new-session that never returns under output capture. The automatic
+    # $args of a simple function passes every token through verbatim.
+    $out = & psmux -L rbChurn @args 2>&1
     $code = $LASTEXITCODE
     [PSCustomObject]@{
         ExitCode = $code

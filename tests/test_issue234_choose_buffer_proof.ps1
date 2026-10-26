@@ -100,7 +100,7 @@ if ($bufCount -eq 3) {
 # === Test 2: Verify choose-buffer returns structured data ===
 Write-Host "`n[Test 2] choose-buffer returns structured data" -ForegroundColor Yellow
 $resp = & $PSMUX choose-buffer -t $SESSION 2>&1 | Out-String
-if ($resp -match "buffer0:.*bytes:.*Buffer Gamma" -and $resp -match "buffer2:.*bytes:.*Buffer Alpha") {
+if ($resp -match "buffer2:.*bytes:.*Buffer Gamma" -and $resp -match "buffer0:.*bytes:.*Buffer Alpha" -and $resp.IndexOf("Buffer Gamma") -lt $resp.IndexOf("Buffer Alpha")) {
     Write-Pass "choose-buffer returns ordered buffer list (newest first)"
 } else {
     Write-Fail "Unexpected choose-buffer output: $resp"
@@ -151,7 +151,7 @@ if ($keys -match "#.*list-buffers") {
 # === Test 6: Compile WriteConsoleInput injector and test prefix+= ===
 Write-Host "`n[Test 6] WriteConsoleInput: prefix + = (choose-buffer via keystroke)" -ForegroundColor Yellow
 $injectorExe = "$env:TEMP\psmux_injector.exe"
-$injectorSrc = "tests\injector.cs"
+$injectorSrc = "$PSScriptRoot\injector.cs"
 if (-not (Test-Path $injectorSrc)) {
     Write-Host "  [SKIP] injector.cs not found, skipping WriteConsoleInput tests" -ForegroundColor DarkYellow
 } else {

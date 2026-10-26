@@ -148,12 +148,26 @@ foreach ($test in $testTexts) {
     Get-Process tmux, psmux, pmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
     Start-Sleep -Seconds 1
 
-    # Step 1: Set clipboard to the test text
-    Set-Clipboard -Value $pasteText
-    $clipCheck = Get-Clipboard -Raw
-    if ($clipCheck.Trim() -ne $pasteText) {
-        Write-Host "  [FAIL] Clipboard set failed!" -ForegroundColor Red
-        $allPass = $false
+    # Step 1: Set clipboard to the test text.
+    #
+    # The Windows clipboard is a single-owner resource: OpenClipboard fails
+    # while any other process holds it, and Set-Clipboard swallows that, so a
+    # one-shot set-then-read races anything else on the desktop that touches
+    # the clipboard. In a full-suite run that is a real collision, and it
+    # reported "Clipboard set failed" as a psmux defect when psmux had not even
+    # been launched yet. Retry briefly; contention is momentary.
+    $clipOk = $false
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        Set-Clipboard -Value $pasteText -EA SilentlyContinue
+        Start-Sleep -Milliseconds 150
+        $clipCheck = Get-Clipboard -Raw -EA SilentlyContinue
+        if ($null -ne $clipCheck -and $clipCheck.Trim() -eq $pasteText) { $clipOk = $true; break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not $clipOk) {
+        # Still not ours after ~3.5s: another process owns the clipboard. That
+        # says nothing about psmux paste handling, so do not call it a failure.
+        Write-Host "  [SKIP] could not claim the OS clipboard (held by another process); paste not exercised" -ForegroundColor DarkYellow
         continue
     }
     Write-Host "  Clipboard set OK" -ForegroundColor DarkGray

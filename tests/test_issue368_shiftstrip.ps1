@@ -5,6 +5,17 @@ $ErrorActionPreference = "Continue"
 Set-Clipboard -Value "SENTINEL_CLIP"   # known text so any stray paste is identifiable
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $KEYLOG_CHILD = "$env:TEMP\keylog_child.exe"
+if (-not (Test-Path $KEYLOG_CHILD)) {
+    # Auto-compile the keylog helper from source (same pattern as the injector);
+    # it was previously built by hand into TEMP, which gets cleaned periodically.
+    $cscPath = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) "csc.exe"
+    if (-not (Test-Path $cscPath)) { $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" }
+    if (Test-Path $cscPath) { & $cscPath /nologo /optimize /out:$KEYLOG_CHILD "$PSScriptRoot\keylog_child.cs" 2>&1 | Out-Null }
+}
+if (-not (Test-Path $KEYLOG_CHILD)) {
+    Write-Host "[SKIP] keylog_child.exe missing and csc compile unavailable" -ForegroundColor Yellow
+    exit 0
+}
 $INJECTOR = "$env:TEMP\psmux_injector.exe"
 $KEYLOG = "$env:TEMP\psmux_keylog.txt"
 $SESSION = "iss368s"

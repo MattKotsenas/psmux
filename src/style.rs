@@ -1,8 +1,7 @@
 //! Shared color and style parsing utilities.
 //!
-//! This module consolidates ALL tmux-compatible color/style parsing into a
-//! single place, eliminating duplication between rendering.rs and client.rs.
-//! Both the server-side renderer and the remote client import from here.
+//! This module owns tmux-compatible color and style parsing for the active
+//! client renderer and shared terminal helpers.
 
 use ratatui::prelude::*;
 use ratatui::style::{Style, Modifier};
@@ -91,6 +90,178 @@ pub fn parse_tmux_color(s: &str) -> Option<Color> {
     }
 }
 
+// ─── Window content styles (window-style / window-active-style) ─────────────
+
+/// Whether a style attribute actually names a colour.
+///
+/// tmux stores "no colour named" as colour 8 (`COLOUR_DEFAULT`), which
+/// `map_color` turns into `Color::Reset`. A missing attribute is `None`. Both
+/// count as unnamed, so `bg=default` behaves exactly like leaving `bg` out.
+fn style_names_colour(colour: Option<Color>) -> bool {
+    !matches!(colour, None | Some(Color::Reset))
+}
+
+/// Resolve the effective content style for the ACTIVE pane.
+///
+/// tmux `tty.c` `tty_default_colours` (tmux next-3.8) reads:
+///
+/// ```text
+/// if (wp == wp->window->active && wp->cached_active_gc.fg != 8)
+///         gc->fg = wp->cached_active_gc.fg;
+/// else
+///         gc->fg = wp->cached_gc.fg;
+/// if (wp == wp->window->active && wp->cached_active_gc.bg != 8)
+///         gc->bg = wp->cached_active_gc.bg;
+/// else
+///         gc->bg = wp->cached_gc.bg;
+/// ```
+///
+/// So `window-active-style` supplies fg (or bg) only when it actually names
+/// one, and each attribute falls back to `window-style` on its own. That makes
+/// `set -g window-style bg=colour52` tint every pane including the active one,
+/// and makes `window-active-style fg=red` with `window-style bg=blue` paint the
+/// active pane red on blue. It is a per attribute merge, not a whole style
+/// switch.
+pub fn active_window_style_with_fallback(
+    active: Option<Style>,
+    inactive: Option<Style>,
+) -> Option<Style> {
+    match (active, inactive) {
+        (Some(active), Some(inactive)) => {
+            let mut merged = active;
+            if !style_names_colour(active.fg) {
+                merged.fg = inactive.fg;
+            }
+            if !style_names_colour(active.bg) {
+                merged.bg = inactive.bg;
+            }
+            Some(merged)
+        }
+        (Some(active), None) => Some(active),
+        (None, inactive) => inactive,
+    }
+}
+
+/// The xterm 256 colour palette, matching tmux `colour.c` `colour_256toRGB`.
+pub fn colour_256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    const SYSTEM: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00), (0x80, 0x00, 0x00), (0x00, 0x80, 0x00), (0x80, 0x80, 0x00),
+        (0x00, 0x00, 0x80), (0x80, 0x00, 0x80), (0x00, 0x80, 0x80), (0xc0, 0xc0, 0xc0),
+        (0x80, 0x80, 0x80), (0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0xff, 0xff, 0x00),
+        (0x00, 0x00, 0xff), (0xff, 0x00, 0xff), (0x00, 0xff, 0xff), (0xff, 0xff, 0xff),
+    ];
+    const LEVELS: [u8; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    match idx {
+        0..=15 => SYSTEM[idx as usize],
+        16..=231 => {
+            let n = idx - 16;
+            (
+                LEVELS[(n / 36) as usize],
+                LEVELS[((n / 6) % 6) as usize],
+                LEVELS[(n % 6) as usize],
+            )
+        }
+        _ => {
+            let v = 8 + (idx - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// The palette index a named ratatui colour stands for, so it can be forced to
+/// RGB the way tmux `colour_force_rgb` handles colours 0 to 7 and 90 to 97.
+fn named_colour_index(colour: Color) -> Option<u8> {
+    Some(match colour {
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        _ => return None,
+    })
+}
+
+/// Scale a colour toward black by `dim` percent, matching tmux `colour.c`
+/// `colour_dim`: the terminal default colour is left alone, 100 percent is
+/// black, and anything else is forced to RGB and scaled per channel.
+pub fn dim_colour_percent(colour: Color, dim: u8) -> Color {
+    if dim == 0 || colour == Color::Reset {
+        return colour;
+    }
+    if dim >= 100 {
+        return Color::Rgb(0, 0, 0);
+    }
+    let (r, g, b) = match colour {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(idx) => colour_256_to_rgb(idx),
+        other => match named_colour_index(other) {
+            Some(idx) => colour_256_to_rgb(idx),
+            // colour_force_rgb returns -1 and colour_dim leaves the cell alone.
+            None => return colour,
+        },
+    };
+    let keep = 100u16 - dim as u16;
+    Color::Rgb(
+        (r as u16 * keep / 100) as u8,
+        (g as u16 * keep / 100) as u8,
+        (b as u16 * keep / 100) as u8,
+    )
+}
+
+/// Apply `dim` to both colours a window content style names.
+///
+/// Used for the paths that paint straight from the window style (background
+/// fill, row padding, the clock overlay), where the style IS the cell colour.
+pub fn dim_window_style(style: Option<Style>, dim: u8) -> Option<Style> {
+    if dim == 0 {
+        return style;
+    }
+    style.map(|mut style| {
+        if let Some(fg) = style.fg {
+            style.fg = Some(dim_colour_percent(fg, dim));
+        }
+        if let Some(bg) = style.bg {
+            style.bg = Some(dim_colour_percent(bg, dim));
+        }
+        style
+    })
+}
+
+/// Read the `dim=N` percentage out of a style string.
+///
+/// tmux `style.c` accepts `dim=N` and `dim=N%` with `N` in 0 to 100 and is case
+/// insensitive. An out of range or unparseable value leaves the style at 0,
+/// matching tmux rejecting the whole style string rather than half applying it.
+pub fn parse_style_dim(style_str: &str) -> u8 {
+    let mut dim = 0u8;
+    for part in style_str.split(',') {
+        let part = part.trim();
+        // Split on the first '=' by char, never by byte offset: a style
+        // part such as "aéé" has no char boundary at byte 4 and a byte slice
+        // there panics.
+        let Some((name, value)) = part.split_once('=') else { continue };
+        if name.eq_ignore_ascii_case("dim") {
+            let value = value.trim_end_matches('%');
+            match value.parse::<u16>() {
+                Ok(n) if n <= 100 => dim = n as u8,
+                _ => return 0,
+            }
+        }
+    }
+    dim
+}
+
 // ─── Style parsing ──────────────────────────────────────────────────────────
 
 /// Parse a tmux style string (e.g. `"bg=green,fg=black,bold"`) into a ratatui `Style`.
@@ -103,6 +274,8 @@ pub fn parse_tmux_style(style_str: &str) -> Style {
         let p = part.trim();
         if p.starts_with("fg=") { style = style.fg(map_color(&p[3..])); }
         else if p.starts_with("bg=") { style = style.bg(map_color(&p[3..])); }
+        // tmux style.c:236 accepts `us=` for the underscore colour.
+        else if p.starts_with("us=") { style = style.underline_color(map_color(&p[3..])); }
         else { apply_modifier(p, &mut style); }
     }
     style
@@ -143,14 +316,32 @@ fn apply_modifier(token: &str, style: &mut Style) {
         "hidden" => { *style = style.add_modifier(Modifier::HIDDEN); }
         "strikethrough" => { *style = style.add_modifier(Modifier::CROSSED_OUT); }
         "overline" => { /* ratatui doesn't support overline natively */ }
-        "double-underscore" | "curly-underscore" | "dotted-underscore" | "dashed-underscore" => {
-            *style = style.add_modifier(Modifier::UNDERLINED);
+        // tmux's styled underscores (attributes.c: double-underscore,
+        // curly-underscore, dotted-underscore, dashed-underscore).  The
+        // extended style rides in the smuggled high modifier bits that
+        // `PsmuxBackend::draw` turns into `CSI 4:N m` (issue #589).
+        "double-underscore" => {
+            *style = crate::rendering::with_underline(*style, 2, None);
+        }
+        "curly-underscore" => {
+            *style = crate::rendering::with_underline(*style, 3, None);
+        }
+        "dotted-underscore" => {
+            *style = crate::rendering::with_underline(*style, 4, None);
+        }
+        "dashed-underscore" => {
+            *style = crate::rendering::with_underline(*style, 5, None);
         }
         "default" | "none" => { *style = Style::default(); }
         "nobold" => { *style = style.remove_modifier(Modifier::BOLD); }
         "nodim" => { *style = style.remove_modifier(Modifier::DIM); }
         "noitalics" | "noitalic" => { *style = style.remove_modifier(Modifier::ITALIC); }
-        "nounderline" | "nounderscore" => { *style = style.remove_modifier(Modifier::UNDERLINED); }
+        "nounderline" | "nounderscore" => {
+            *style = style.remove_modifier(Modifier::UNDERLINED);
+            *style = style.remove_modifier(
+                Modifier::from_bits_retain(crate::rendering::UL_STYLE_MASK),
+            );
+        }
         "noblink" => { *style = style.remove_modifier(Modifier::SLOW_BLINK); }
         "noreverse" => { *style = style.remove_modifier(Modifier::REVERSED); }
         "nohidden" => { *style = style.remove_modifier(Modifier::HIDDEN); }
@@ -191,6 +382,8 @@ pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> 
                     let p = part.trim();
                     if p.starts_with("fg=") { cur_style = cur_style.fg(map_color(&p[3..])); }
                     else if p.starts_with("bg=") { cur_style = cur_style.bg(map_color(&p[3..])); }
+                    // tmux style.c:236 accepts `us=` for the underscore colour.
+                    else if p.starts_with("us=") { cur_style = cur_style.underline_color(map_color(&p[3..])); }
                     else if p == "default" || p == "none" { cur_style = base_style; }
                     else if p == "push-default" { style_stack.push(cur_style); }
                     else if p == "pop-default" {
@@ -230,8 +423,7 @@ pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> 
 
 /// Calculate the visual display width of styled spans.
 pub fn spans_visual_width(spans: &[Span]) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
+    spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum()
 }
 
 /// Truncate a list of styled spans so their total visual width fits within
@@ -239,7 +431,6 @@ pub fn spans_visual_width(spans: &[Span]) -> usize {
 /// trimmed character by character and a trailing ellipsis is NOT added (to
 /// match tmux behaviour).  Returns the mutated vector in place.
 pub fn truncate_spans_to_width(spans: &mut Vec<Span<'static>>, max_width: usize) {
-    use unicode_width::UnicodeWidthChar;
     let mut remaining = max_width;
     let mut keep = 0;
     for (i, span) in spans.iter().enumerate() {
@@ -251,7 +442,7 @@ pub fn truncate_spans_to_width(spans: &mut Vec<Span<'static>>, max_width: usize)
             // Partially truncate this span
             let mut truncated = String::new();
             for ch in span.content.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let cw = vt100::char_width(ch).unwrap_or(0);
                 if cw > remaining {
                     break;
                 }
@@ -466,7 +657,6 @@ pub fn parse_format_segments(text: &str, base_style: Style) -> Vec<FormatToken> 
 ///
 /// Returns spans whose visible content falls within `[col_start, col_start + max_width)`.
 fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usize) -> Vec<Span<'static>> {
-    use unicode_width::UnicodeWidthChar;
     let mut result = Vec::new();
     let mut col = 0usize;
     let mut remaining = max_width;
@@ -480,7 +670,7 @@ fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usiz
         // This span overlaps with our range
         let mut text = String::new();
         for ch in span.content.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let cw = vt100::char_width(ch).unwrap_or(0);
             if col < col_start {
                 col += cw;
                 continue;
@@ -503,7 +693,6 @@ fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usiz
 /// This is the primary entry point for rendering `status-format[]` lines.
 /// Returns styled spans fitting within `width` plus clickable range regions.
 pub fn layout_format_line(text: &str, width: usize, base_style: Style) -> LayoutResult {
-    use unicode_width::UnicodeWidthStr;
 
     let tokens = parse_format_segments(text, base_style);
 
@@ -567,7 +756,7 @@ pub fn layout_format_line(text: &str, width: usize, base_style: Style) -> Layout
     for token in &tokens {
         match token {
             FormatToken::Text(span) => {
-                let w = UnicodeWidthStr::width(span.content.as_ref());
+                let w = vt100::str_width(span.content.as_ref());
                 match list_state {
                     ListSt::LeftMarker => { list_left_marker.push(span.clone()); }
                     ListSt::RightMarker => { list_right_marker.push(span.clone()); }

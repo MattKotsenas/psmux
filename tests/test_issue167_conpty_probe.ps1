@@ -72,6 +72,27 @@ class ConPtyProbe {
         ref STARTUPINFOEX lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
+    // This probe deliberately spawns children that cannot initialize (that is
+    // the whole point -- it is hunting which flag combination trips err 87).
+    // Every such child makes Windows raise a modal "The application was unable
+    // to start correctly (0xc0000142)" dialog.  Measured: 11 to 13 popups per
+    // run of the issue167 probe family, which blocks unattended suite runs and
+    // buries the desktop.
+    //
+    // A child inherits the parent's error mode UNLESS the parent passes
+    // CREATE_DEFAULT_ERROR_MODE -- and this probe does not.  So setting a
+    // silent error mode here is inherited by every child we spawn.  The
+    // CreateProcessW return value and GetLastError, which is the only thing
+    // this probe actually measures, are completely unaffected.
+    [DllImport("kernel32.dll")]
+    static extern uint SetErrorMode(uint uMode);
+    const uint SEM_FAILCRITICALERRORS = 0x0001;
+    const uint SEM_NOGPFAULTERRORBOX  = 0x0002;
+    const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+    static void SilenceSpawnFailureDialogs() {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+
     [DllImport("kernel32.dll", SetLastError=true)]
     static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint flags, out IntPtr hpc);
 
@@ -167,6 +188,8 @@ class ConPtyProbe {
     static void Main(string[] argv) {
         if (argv.Length < 1) { Console.Error.WriteLine("usage: probe <pwsh>"); Environment.Exit(2); return; }
         string pwsh = argv[0];
+
+        SilenceSpawnFailureDialogs();
 
         Console.WriteLine("[1] STARTF_USESTDHANDLES=ON,  bInheritHandles=FALSE (current psmux code)");
         int e1 = Spawn(pwsh, true, false);

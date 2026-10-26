@@ -57,7 +57,7 @@ fn changing_prefix_to_c_a_auto_binds_c_a_to_send_prefix() {
     let c_a = (KeyCode::Char('a'), KeyModifiers::CONTROL);
 
     // Simulate the option change.
-    app.prefix_key = c_a;
+    app.prefix_key = Some(c_a);
     ensure_prefix_self_binding(&mut app);
 
     let send_prefix_keys = prefix_table_send_prefix_keys(&app);
@@ -74,7 +74,7 @@ fn ensure_prefix_self_binding_does_not_clobber_user_override() {
     // we must NOT overwrite it with send-prefix.
     let mut app = fresh_app();
     let c_a = (KeyCode::Char('a'), KeyModifiers::CONTROL);
-    app.prefix_key = c_a;
+    app.prefix_key = Some(c_a);
 
     // User binds C-a to a custom command first.
     let table = app.key_tables.entry("prefix".to_string()).or_default();
@@ -82,6 +82,7 @@ fn ensure_prefix_self_binding_does_not_clobber_user_override() {
         key: c_a,
         action: Action::Command("display-message custom".into()),
         repeat: false,
+        note: None,
     });
 
     ensure_prefix_self_binding(&mut app);
@@ -113,6 +114,9 @@ fn send_prefix_command_dispatches_with_c_a_prefix() {
         active_path: vec![],
         name: "shell".into(),
         id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -123,8 +127,10 @@ fn send_prefix_command_dispatches_with_c_a_prefix() {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     });
-    app.prefix_key = (KeyCode::Char('a'), KeyModifiers::CONTROL);
+    app.prefix_key = Some((KeyCode::Char('a'), KeyModifiers::CONTROL));
 
     crate::commands::execute_command_string(&mut app, "send-prefix").unwrap();
 }

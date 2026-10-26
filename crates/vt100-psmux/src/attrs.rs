@@ -14,6 +14,60 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// The style of underline drawn under a cell.
+///
+/// SGR 4 selects a single underline; the SGR 4 subparameter forms `4:0`
+/// through `4:5` (and the legacy SGR 21) select the extended styles that
+/// terminals such as Windows Terminal, `WezTerm` and `kitty` render.  tmux
+/// models the same set as `GRID_ATTR_UNDERSCORE_2` through
+/// `GRID_ATTR_UNDERSCORE_5` (tmux `input.c`, `grid.h`).
+#[derive(Eq, PartialEq, Debug, Copy, Clone, Default)]
+pub enum UnderlineStyle {
+    /// No underline at all (SGR 24 or SGR 4:0).
+    #[default]
+    None,
+    /// A single straight underline (SGR 4 or SGR 4:1).
+    Single,
+    /// A double straight underline (SGR 4:2 or SGR 21).
+    Double,
+    /// A curly (wavy) underline, commonly called undercurl (SGR 4:3).
+    Curly,
+    /// A dotted underline (SGR 4:4).
+    Dotted,
+    /// A dashed underline (SGR 4:5).
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Maps an SGR 4 subparameter (`0` through `5`) onto a style.  Any other
+    /// value is treated as a plain single underline, matching how terminals
+    /// degrade unknown extended styles.
+    #[must_use]
+    pub fn from_sgr_subparam(n: u16) -> Self {
+        match n {
+            0 => Self::None,
+            2 => Self::Double,
+            3 => Self::Curly,
+            4 => Self::Dotted,
+            5 => Self::Dashed,
+            _ => Self::Single,
+        }
+    }
+
+    /// The SGR 4 subparameter that selects this style.
+    #[must_use]
+    pub fn sgr_subparam(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Single => 1,
+            Self::Double => 2,
+            Self::Curly => 3,
+            Self::Dotted => 4,
+            Self::Dashed => 5,
+        }
+    }
+}
+
 const TEXT_MODE_INTENSITY: u8 = 0b0000_0011;
 const TEXT_MODE_BOLD: u8 = 0b0000_0001;
 const TEXT_MODE_DIM: u8 = 0b0000_0010;
@@ -28,6 +82,13 @@ const TEXT_MODE_STRIKETHROUGH: u8 = 0b1000_0000;
 pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
+    /// The underline colour set by SGR 58 (`Default` until SGR 58 is seen, and
+    /// reset by SGR 59 or SGR 0).  Mirrors tmux's `grid_cell.us`.
+    pub ulcolor: Color,
+    /// The extended underline style selected by SGR `4:0` through `4:5` (and
+    /// SGR 21).  `TEXT_MODE_UNDERLINE` stays the "any underline at all" bit so
+    /// every existing caller of `underline()` keeps working.
+    pub ul_style: UnderlineStyle,
     pub mode: u8,
     /// OSC 8 hyperlink id (index into the screen's hyperlink store, +1).
     /// 0 means no hyperlink.  Part of Attrs so a link change is reflected in
@@ -84,9 +145,35 @@ impl Attrs {
     pub fn set_underline(&mut self, underline: bool) {
         if underline {
             self.mode |= TEXT_MODE_UNDERLINE;
+            self.ul_style = UnderlineStyle::Single;
         } else {
             self.mode &= !TEXT_MODE_UNDERLINE;
+            self.ul_style = UnderlineStyle::None;
         }
+    }
+
+    pub fn underline_style(&self) -> UnderlineStyle {
+        self.ul_style
+    }
+
+    /// Selects an extended underline style.  `UnderlineStyle::None` clears the
+    /// underline bit, everything else sets it, so the plain `underline()`
+    /// predicate keeps reporting "this cell has some underline".
+    pub fn set_underline_style(&mut self, style: UnderlineStyle) {
+        self.ul_style = style;
+        if style == UnderlineStyle::None {
+            self.mode &= !TEXT_MODE_UNDERLINE;
+        } else {
+            self.mode |= TEXT_MODE_UNDERLINE;
+        }
+    }
+
+    pub fn ulcolor(&self) -> Color {
+        self.ulcolor
+    }
+
+    pub fn set_ulcolor(&mut self, color: Color) {
+        self.ulcolor = color;
     }
 
     pub fn inverse(&self) -> bool {
@@ -174,10 +261,15 @@ impl Attrs {
         } else {
             attrs.italic(self.italic())
         };
-        let attrs = if self.underline() == other.underline() {
+        let attrs = if self.ul_style == other.ul_style {
             attrs
         } else {
-            attrs.underline(self.underline())
+            attrs.underline_style(self.ul_style)
+        };
+        let attrs = if self.ulcolor == other.ulcolor {
+            attrs
+        } else {
+            attrs.ulcolor(self.ulcolor)
         };
         let attrs = if self.inverse() == other.inverse() {
             attrs

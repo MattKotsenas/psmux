@@ -4,7 +4,7 @@
 $exe = "$PSScriptRoot\..\target\release\tmux.exe"
 
 # Clean up first
-taskkill /f /im psmux.exe 2>$null
+taskkill /f /im tmux.exe 2>$null
 Start-Sleep 2
 Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
@@ -70,7 +70,7 @@ if ($code -eq 0 -and $lines -eq 3) {
 Write-Host "`n=== Test 5: tmux new -d -s alpha (duplicate) ===" -ForegroundColor Cyan
 $out = & $exe new -d -s alpha 2>&1 | Out-String
 $code = $LASTEXITCODE
-if ($out -match "already exists") {
+if ($out -match "duplicate session") {
     Write-Host "PASS: Duplicate detected: $($out.Trim())" -ForegroundColor Green
     $pass++
 } else {
@@ -108,7 +108,7 @@ if ($code -eq 0 -and $lines -eq 4) {
 }
 
 # Clean up for next batch
-taskkill /f /im psmux.exe 2>$null
+taskkill /f /im tmux.exe 2>$null
 Start-Sleep 2
 Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
@@ -130,7 +130,7 @@ if ($code -eq 0 -and (Test-Path "$env:USERPROFILE\.psmux\-d.port")) {
 }
 
 # Clean up
-taskkill /f /im psmux.exe 2>$null
+taskkill /f /im tmux.exe 2>$null
 Start-Sleep 2
 Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
@@ -191,7 +191,7 @@ if ($code -eq 0 -and $lines -eq 3 -and $out2 -match "^\d+:") {
 }
 
 # Final clean up
-taskkill /f /im psmux.exe 2>$null
+taskkill /f /im tmux.exe 2>$null
 Start-Sleep 1
 Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
@@ -199,3 +199,6 @@ Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
 Write-Host "`n========================================" -ForegroundColor Yellow
 Write-Host "Results: $pass PASS, $fail FAIL out of $total tests" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
+
+if ($fail -gt 0) { exit 1 }
+exit 0

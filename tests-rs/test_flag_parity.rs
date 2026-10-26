@@ -28,6 +28,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -38,6 +41,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -95,14 +100,15 @@ fn set_option_flag_g_global() {
 #[test]
 fn set_option_flag_u_unset_resets_default() {
     let mut app = mock_app_with_window();
-    // -u sets value to empty; for numeric options the empty string can't parse,
-    // so the field keeps its last value.  Verify the unset path executes
-    // without error (user options DO get cleared to "").
+    // -u clears the option. For numeric options the empty string cannot parse,
+    // so the field keeps its last value; user options are REMOVED outright
+    // (#619, tmux options_remove_or_default), not blanked in place, so that a
+    // later `set -o` sees nothing set and applies.
     execute_command_string(&mut app, "set-option -g @unset-probe hello").unwrap();
     assert_eq!(app.user_options.get("@unset-probe").map(|s| s.as_str()), Some("hello"));
     execute_command_string(&mut app, "set-option -gu @unset-probe").unwrap();
-    assert_eq!(app.user_options.get("@unset-probe").map(|s| s.as_str()), Some(""),
-        "-u flag: should unset (set to empty)");
+    assert_eq!(app.user_options.get("@unset-probe").map(|s| s.as_str()), None,
+        "-u flag: should remove the user option");
 }
 
 #[test]
@@ -150,12 +156,12 @@ fn set_option_flag_F_format_expand() {
 #[test]
 fn set_option_combined_flags_gu() {
     let mut app = mock_app_with_window();
-    // Combined -gu: global unset.  For user options, verify reset to empty.
+    // Combined -gu: global unset. For user options the key is removed (#619).
     execute_command_string(&mut app, "set-option -g @gu-probe value").unwrap();
     assert_eq!(app.user_options.get("@gu-probe").map(|s| s.as_str()), Some("value"));
     execute_command_string(&mut app, "set-option -gu @gu-probe").unwrap();
-    assert_eq!(app.user_options.get("@gu-probe").map(|s| s.as_str()), Some(""),
-        "combined -gu: should unset to empty");
+    assert_eq!(app.user_options.get("@gu-probe").map(|s| s.as_str()), None,
+        "combined -gu: should remove the user option");
 }
 
 #[test]
@@ -186,9 +192,10 @@ fn set_option_user_at_option_unset() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "set-option -g @test-opt hello").unwrap();
     execute_command_string(&mut app, "set-option -gu @test-opt").unwrap();
-    // psmux -u sets value to empty string rather than removing the key
-    assert_eq!(app.user_options.get("@test-opt").map(|s| s.as_str()), Some(""),
-        "@option unset should set to empty");
+    // -u removes the key, matching tmux (#619). It used to blank it in place,
+    // which kept the option looking set to the `-o` guard for ever.
+    assert_eq!(app.user_options.get("@test-opt").map(|s| s.as_str()), None,
+        "@option unset should remove the key");
 }
 
 #[test]
@@ -670,11 +677,16 @@ fn set_environment_basic() {
     assert_eq!(app.environment.get("MY_VAR").map(|s| s.as_str()), Some("my_value"));
 }
 
+/// tmux refuses a name with no value (cmd-set-environment.c: "no value
+/// specified") and sets nothing; an empty value has to be given explicitly
+/// (#775). psmux used to store `NAME=` here.
 #[test]
-fn set_environment_empty_value() {
+fn set_environment_without_value_is_refused_like_tmux() {
     let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "set-environment EMPTY_VAR").unwrap();
-    assert!(app.environment.contains_key("EMPTY_VAR"), "single arg should set with empty value");
+    let _ = execute_command_string(&mut app, "set-environment EMPTY_VAR");
+    assert!(!app.environment.contains_key("EMPTY_VAR"), "a bare name must not set anything");
+    execute_command_string(&mut app, "set-environment EMPTY_VAR \"\"").unwrap();
+    assert_eq!(app.environment.get("EMPTY_VAR").map(|s| s.as_str()), Some(""), "an explicit empty value is set");
 }
 
 #[test]
@@ -907,8 +919,12 @@ fn split_window_flag_P_print() {
 #[test]
 fn split_window_flag_Z_zoom() {
     let mut app = mock_app_with_window();
+    assert!(app.windows[0].zoom_saved.is_none());
     execute_command_string(&mut app, "split-window -Z").unwrap();
-    // -Z should zoom the new pane after split
+    assert!(app.windows[0].zoom_saved.is_some(), "-Z should zoom the active pane after splitting");
+    assert_eq!(app.windows[0].active_path, vec![1], "-Z should leave the new pane active");
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 #[test]
@@ -1274,12 +1290,16 @@ fn display_popup_flag_w_percent() {
 fn link_window_flag_s_source() {
     let mut app = mock_app_with_windows(&["w0", "w1"]);
     execute_command_string(&mut app, "link-window -s 0").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 #[test]
 fn link_window_flag_t_target() {
     let mut app = mock_app_with_windows(&["w0", "w1"]);
     execute_command_string(&mut app, "link-window -s 0 -t 2").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1520,7 +1540,7 @@ fn copy_mode_dispatches() {
 #[test]
 fn paste_buffer_dispatches() {
     let mut app = mock_app_with_window();
-    app.paste_buffers.push("test paste".to_string());
+    app.paste_add("test paste".to_string());
     execute_command_string(&mut app, "paste-buffer").unwrap();
 }
 
@@ -1545,7 +1565,7 @@ fn show_buffer_dispatches() {
 #[test]
 fn delete_buffer_dispatches() {
     let mut app = mock_app_with_window();
-    app.paste_buffers.push("to delete".to_string());
+    app.paste_add("to delete".to_string());
     execute_command_string(&mut app, "delete-buffer").unwrap();
 }
 
@@ -1947,6 +1967,8 @@ fn alias_swapw() {
 fn alias_linkw() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "linkw -s 0").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 #[test]
@@ -2168,4 +2190,17 @@ fn command_chain_three_commands() {
     assert_eq!(app.user_options.get("@a").map(|s| s.as_str()), Some("1"));
     assert_eq!(app.user_options.get("@b").map(|s| s.as_str()), Some("2"));
     assert_eq!(app.user_options.get("@c").map(|s| s.as_str()), Some("3"));
+}
+
+/// The in-process path (command prompt, key bindings with no server) splits
+/// its arguments quote aware, like the server does (#775 follow up): a quoted
+/// value with a space used to reach the parser as two tokens with the quotes
+/// attached, and nothing was set.
+#[test]
+fn set_environment_quoted_values_on_the_local_path() {
+    let mut app = mock_app_with_window();
+    execute_command_string(&mut app, "set-environment QV \"a b\"").unwrap();
+    execute_command_string(&mut app, "set-environment QS 'c d'").unwrap();
+    assert_eq!(app.environment.get("QV").map(|s| s.as_str()), Some("a b"));
+    assert_eq!(app.environment.get("QS").map(|s| s.as_str()), Some("c d"));
 }

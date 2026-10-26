@@ -60,8 +60,13 @@ $env:PSMUX_MOUSE_DEBUG = "1"
 
 # ── Create session ───────────────────────────────────────────────────────
 Write-Info "Creating session '$SESSION'..."
+# Cold spawn on purpose: PSMUX_MOUSE_DEBUG is read by the SERVER, and a server
+# claimed from the warm pool was spawned earlier without it, so the debug log
+# never appeared and Part 4 silently skipped (it read as 17P/0F for weeks).
+$env:PSMUX_NO_WARM = "1"
 Start-Process -FilePath $PSMUX -ArgumentList "new-session -s $SESSION -d" -WindowStyle Hidden
 Start-Sleep -Seconds 4
+Remove-Item Env:\PSMUX_NO_WARM -ErrorAction SilentlyContinue
 
 & $PSMUX has-session -t $SESSION 2>$null
 if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: Cannot create session" -ForegroundColor Red; exit 1 }
@@ -189,7 +194,7 @@ if (-not $portFile -or -not $keyFile) {
     Write-Test "3.1 Send scroll-down events to nvim pane"
     # Send multiple scroll-down events — nvim should scroll its buffer
     for ($i = 0; $i -lt 10; $i++) {
-        Send-PsmuxCmd "mouse-scroll-down 20 15"
+        Send-PsmuxCmd "scroll-down 20 15"
         Start-Sleep -Milliseconds 100
     }
     Start-Sleep -Seconds 1
@@ -238,7 +243,7 @@ if (-not $portFile -or -not $keyFile) {
 
     Write-Test "3.5 Send scroll-up events to nvim pane"
     for ($i = 0; $i -lt 10; $i++) {
-        Send-PsmuxCmd "mouse-scroll-up 20 15"
+        Send-PsmuxCmd "scroll-up 20 15"
         Start-Sleep -Milliseconds 100
     }
     Start-Sleep -Seconds 1
@@ -295,6 +300,10 @@ if (Test-Path $debugLogPath) {
     # After fix: should see "SGR VT injection" or "Console VT injection" for native ConPTY
     if ($debugLog -match "Console VT injection.*KEY_EVENT") {
         Write-Pass "Found SGR VT injection via KEY_EVENTs in debug log (fix working!)"
+    } elseif ($debugLog -match "PTY pipe SGR mouse") {
+        # 357a26b (#60) moved the native TUI path from KEY_EVENT records to
+        # writing the SGR report into the ConPTY input pipe; this is that path.
+        Write-Pass "Found SGR mouse written to the ConPTY input pipe (fix working!)"
     } elseif ($debugLog -match "SGR VT injection") {
         Write-Pass "Found SGR VT injection in debug log (fix working!)"
     } else {

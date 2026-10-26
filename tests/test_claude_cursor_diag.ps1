@@ -97,9 +97,11 @@ if ($capture2 -match "hello cursor test") {
 # Check cursor shape via dump-state
 Log ""
 Log "=== Test 4: Cursor shape via dump-state ==="
-$home = $env:USERPROFILE
-$portFile = "$home\.psmux\$SESSION.port"
-$keyFile = "$home\.psmux\$SESSION.key"
+# $home is a read-only automatic variable in pwsh 7; assigning to it throws
+# and fails the whole script with every test already passed.
+$profileDir = $env:USERPROFILE
+$portFile = "$profileDir\.psmux\$SESSION.port"
+$keyFile = "$profileDir\.psmux\$SESSION.key"
 if (Test-Path $portFile) {
     $port = (Get-Content $portFile).Trim()
     $key = (Get-Content $keyFile).Trim()
@@ -129,13 +131,26 @@ if (Test-Path $portFile) {
             
             $json = $jsonLine | ConvertFrom-Json -ErrorAction SilentlyContinue
             if ($json) {
-                $leaf = $null
-                if ($json.type -eq "leaf") { $leaf = $json }
-                elseif ($json.children) {
-                    foreach ($c in $json.children) {
-                        if ($c.type -eq "leaf") { $leaf = $c; break }
+                # The pane tree hangs off dump-state's `layout` field, and it
+                # nests: a split's children can themselves be splits. This looked
+                # for `$json.type` and `$json.children` at the TOP level, where
+                # neither exists (the top level holds layout, windows, prefix,
+                # session_name, ...), so the leaf was never found and every run
+                # reported "Could not find leaf node".
+                #
+                # Confirmed by dumping a one-pane session: $json.layout.type is
+                # "leaf" and it carries cursor_row, cursor_col, cursor_shape,
+                # hide_cursor and alternate_screen.
+                function Find-Leaf($node) {
+                    if ($null -eq $node) { return $null }
+                    if ($node.type -eq "leaf") { return $node }
+                    foreach ($c in @($node.children)) {
+                        $hit = Find-Leaf $c
+                        if ($hit) { return $hit }
                     }
+                    return $null
                 }
+                $leaf = Find-Leaf $json.layout
                 
                 if ($leaf) {
                     Log "  cursor_row=$($leaf.cursor_row), cursor_col=$($leaf.cursor_col)"
@@ -144,11 +159,23 @@ if (Test-Path $portFile) {
                     Log "  alternate_screen=$($leaf.alternate_screen)"
                     Log "  active=$($leaf.active)"
                     
+                    # 255 is not a defect, it is the documented sentinel:
+                    #
+                    #   src/pane.rs:13
+                    #   /// Sentinel value for cursor_shape: means "no DECSCUSR
+                    #   /// received from child yet".
+                    #   pub const CURSOR_SHAPE_UNSET: u8 = 255;
+                    #
+                    # A freshly spawned shell that has never emitted DECSCUSR
+                    # legitimately reports it, so failing on 255 failed on correct
+                    # behaviour. What is worth asserting is the opposite: that a
+                    # shape the child actually REQUESTS gets recorded. That is
+                    # checked below by emitting one.
                     if ($null -ne $leaf.cursor_shape) {
-                        if ($leaf.cursor_shape -ge 0 -and $leaf.cursor_shape -le 6) {
+                        if ($leaf.cursor_shape -eq 255) {
+                            Pass "cursor_shape is UNSET (255) before any DECSCUSR, as documented"
+                        } elseif ($leaf.cursor_shape -ge 0 -and $leaf.cursor_shape -le 6) {
                             Pass "cursor_shape is valid ($($leaf.cursor_shape))"
-                        } elseif ($leaf.cursor_shape -eq 255) {
-                            Fail "cursor_shape" "Still UNSET (255)"
                         } else {
                             Fail "cursor_shape" "Unexpected value: $($leaf.cursor_shape)"
                         }

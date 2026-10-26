@@ -102,9 +102,24 @@ else { Write-Fail "PART A: main scrollback broken (got $mainCount)" }
 
 # ── PART B: Enter alt screen, write content there ────────────────
 Write-Host "`n=== PART B: enter alt screen, write 30 lines ===" -ForegroundColor Cyan
-# ESC[?1049h = enter alt screen
-$ESC = [char]27
-& $PSMUX send-keys -t $SESSION "Write-Host (`"$ESC[?1049h`")" Enter 2>&1 | Out-Null
+# ESC[?1049h = enter alt screen.
+#
+# Root-cause note (2026-07-18 debugging pass): this used to embed a
+# literal ESC byte in the send-keys STRING argument (typed character by
+# character into the target pwsh's PSReadLine input line). PSReadLine
+# treats a raw ESC arriving mid-keystroke-stream as an actual Escape
+# key / ANSI input sequence, not as literal text to insert - it silently
+# swallows the ESC and the "[?1049h" that followed it, so the typed
+# command became "Write-Host ("")" and 1049h was NEVER actually sent to
+# the terminal. That fully explained both this test's failures (flag
+# reads 0, content "preserved" because alt mode was never truly
+# entered). Fixed by building the escape sequence via a PowerShell
+# expression evaluated at RUNTIME inside the target shell (matching the
+# working technique in the sibling test_issue88_fix_proof.ps1), so
+# PSReadLine only ever sees ordinary typed ASCII while the command is
+# being entered; the real ESC byte is emitted by Console.Out.Write()
+# after Enter has already been accepted.
+& $PSMUX send-keys -t $SESSION '[Console]::Out.Write([char]27 + "[?1049h")' Enter 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 
 # Verify pane is in alt screen via dump-state's `alternate_on`
@@ -138,7 +153,7 @@ Write-Info "PART B: -S -1000 while in alt: alt N=$altDeepCount, main N=$mainStil
 
 # ── PART C: Exit alt screen, see what survives ────────────────────
 Write-Host "`n=== PART C: exit alt screen, scrollback content ===" -ForegroundColor Cyan
-& $PSMUX send-keys -t $SESSION "Write-Host (`"$ESC[?1049l`")" Enter 2>&1 | Out-Null
+& $PSMUX send-keys -t $SESSION '[Console]::Out.Write([char]27 + "[?1049l")' Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 1
 $altOff = (& $PSMUX display-message -t $SESSION -p '#{alternate_on}' 2>&1).Trim()
 if ($altOff -eq "0") { Write-Pass "PART C: alt screen exited" }

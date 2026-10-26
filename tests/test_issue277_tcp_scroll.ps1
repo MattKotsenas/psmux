@@ -3,9 +3,11 @@
 # server-side scroll handling directly via TCP commands.
 
 $ErrorActionPreference = "Continue"
-$PSMUX = (Get-Command psmux -EA Stop).Source
+# Binary and data root are overridable so this suite can be pointed at a build
+# under test without disturbing the installed psmux or its sessions.
+$PSMUX = if ($env:PSMUX_BIN) { $env:PSMUX_BIN } else { (Get-Command psmux -EA Stop).Source }
 $SESSION = "scroll_direct_277"
-$psmuxDir = "$env:USERPROFILE\.psmux"
+$psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -113,23 +115,32 @@ Write-Host "`n[Test 3] pane-scroll down in copy mode -> scrolls content" -Foregr
 Send-TcpCommand -Session $SESSION -Command "pane-scroll 0 up" | Out-Null
 Start-Sleep -Seconds 1
 
-# Capture in copy mode
-$capCopy1 = & $PSMUX capture-pane -t $SESSION -p 2>&1 | Out-String
+# The copy mode view is observed through #{scroll_position}, not a plain
+# capture-pane: since PR #671 copy mode scrolls a snapshot of the grid and
+# capture-pane answers with the LIVE screen, as tmux's capture reads wp->base.
+$posCopy1 = [int](& $PSMUX display-message -t $SESSION -p '#{scroll_position}' 2>&1 | Out-String).Trim()
 
 # Scroll down
 Send-TcpCommand -Session $SESSION -Command "pane-scroll 0 down" | Out-Null
 Start-Sleep -Seconds 1
 
-$capCopy2 = & $PSMUX capture-pane -t $SESSION -p 2>&1 | Out-String
-if ($capCopy2 -ne $capCopy1) {
-    Write-Pass "pane-scroll down changed content in copy mode"
+$posCopy2 = [int](& $PSMUX display-message -t $SESSION -p '#{scroll_position}' 2>&1 | Out-String).Trim()
+if ($posCopy2 -lt $posCopy1) {
+    Write-Pass "pane-scroll down moved the copy mode view toward the bottom ($posCopy1 -> $posCopy2)"
 } else {
-    Write-Fail "pane-scroll down had no effect in copy mode"
+    Write-Fail "pane-scroll down had no effect in copy mode (scroll_position $posCopy1 -> $posCopy2)"
 }
 
-# Exit copy mode
-& $PSMUX send-keys -t $SESSION "q" 2>&1 | Out-Null
-Start-Sleep -Seconds 1
+# Exit copy mode -- ONLY if still in it.  Scrolling up 3 then back down 3
+# returns copy_scroll_offset to 0, which auto-exits copy mode already (tmux
+# parity, see handle_pane_scroll in window_ops.rs).  Blindly sending "q"
+# here without checking would type a literal 'q' into the live shell prompt
+# and corrupt every test that runs after this one.
+$stillInCopy = (& $PSMUX display-message -t $SESSION -p '#{pane_in_mode}' 2>&1 | Out-String).Trim()
+if ($stillInCopy -eq "1") {
+    & $PSMUX send-keys -t $SESSION "q" 2>&1 | Out-Null
+    Start-Sleep -Seconds 1
+}
 
 # ============================================================
 # TEST 4: scroll with mouse-selection OFF still works

@@ -75,7 +75,12 @@ $backspace = $src -match 'KeyCode::Backspace\s+if\s+session_chooser\s*=>\s*\{\s*
 Add-Result "Backspace pops buffer" $backspace ""
 
 Write-Test "Handler: Esc clears the buffer on close"
-$escClears = $src -match '(?s)KeyCode::Esc\s+if\s+session_chooser\s*=>\s*\{[^}]*session_chooser\s*=\s*false;[^}]*session_num_buffer\.clear\(\)'
+# Post-ea71e75 Esc is handled in a shared matches!() guard (filter-aware branch);
+# the close path sets session_chooser = false, drops the filter state, and
+# clears session_num_buffer in the same block.
+# The guard's condition list now nests parentheses (the command prompt term
+# is itself a group), so match up to the arm's opening brace instead.
+$escClears = ($src -match 'matches!\(key\.code,\s*KeyCode::Esc\)\s*&&[^{]*session_chooser') -and ($src -match '(?s)session_chooser\s*=\s*false;\s*session_filter_active\s*=\s*false;\s*session_filter\.clear\(\);[^}]*session_num_buffer\.clear\(\)')
 Add-Result "Esc clears buffer" $escClears ""
 
 Write-Test "Handler: catch-all absorbs remaining Char keys while picker is open"
@@ -83,12 +88,14 @@ $absorber = $src -match 'KeyCode::Char\(_\)\s+if\s+session_chooser\s*=>\s*\{\s*\
 Add-Result "leak-guard catch-all present" $absorber ""
 
 Write-Test "Renderer: overlay title advertises digits+enter workflow"
-$titleHint = $src -match 'choose-session\s*\(digits\+enter=jump'
+$titleHint = $src -match 'choose-session\s*\(f=filter,\s*digits\+enter=jump'
 Add-Result "overlay title advertises digits+enter=jump" $titleHint ""
 
 Write-Test "Renderer: all rows numbered with a dynamic-width column"
-# Width adapts to the largest index so 1..N stay aligned.
-$rowNumbered = $src -match 'num_width\s*=\s*session_entries\.len\(\)\.to_string\(\)\.len\(\)'
+# Width adapts to the largest index so 1..N stay aligned. Post-ea71e75 the
+# rendered rows come from session_filtered_indices(), so the width is sized
+# on the filtered list (with .max(1) so the empty list still gets a column).
+$rowNumbered = $src -match 'num_width\s*=\s*filtered_indices\.len\(\)\.max\(1\)\.to_string\(\)\.len\(\)'
 Add-Result "row numbering uses dynamic column width" $rowNumbered ""
 
 Write-Test "Renderer: jump-buffer indicator drawn at the bottom when non-empty"
@@ -96,7 +103,9 @@ $bufferDrawn = $src -match '(?s)if\s+!session_num_buffer\.is_empty\(\).*?format!
 Add-Result "buffer preview rendered at bottom" $bufferDrawn ""
 
 Write-Test "Renderer: overlay height adapts to entry count"
-$dynamicHeight = $src -match '(?s)session_entries\.len\(\)[^;]*saturating_add\(2\)[^;]*\.max\(5\)[^;]*\.min\(content_chunk\.height'
+# Post-ea71e75 the compact (no-preview) popup height is sized on the filtered
+# entry list plus reserved indicator rows (buffer_rows), clamped to the frame.
+$dynamicHeight = $src -match '(?s)\(filtered_indices\.len\(\)\s+as\s+u16\)\s*\.saturating_add\(2\)\s*\.saturating_add\(buffer_rows\)\s*\.max\(5\)\s*\.min\(content_chunk\.height'
 Add-Result "overlay uses dynamic content-sized height" $dynamicHeight ""
 
 # ════════════════════════════════════════════════════════════════════

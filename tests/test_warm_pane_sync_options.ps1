@@ -45,7 +45,16 @@ function Wait-Output {
 function Reset-Server {
     & $PSMUX kill-server 2>&1 | Out-Null
     Start-Sleep -Seconds 1
-    Remove-Item "$psmuxDir\*.port","$psmuxDir\*.key","$psmuxDir\*.sess" -Force -EA SilentlyContinue
+    # Only the DEFAULT namespace's registry, which is what the bare kill-server
+    # above tore down. A namespaced file is "<ns>__<session>.<ext>" with a
+    # non-empty ns that does not start with an underscore ("__warm__" itself is
+    # the default namespace's standby). The old "*.port" wildcard deleted every
+    # -L namespace's registry too, and on 2026-09-16 that made every sibling
+    # agent's server on this machine report "no server running" once per
+    # round of a loop running this suite.
+    Get-ChildItem "$psmuxDir\*.port","$psmuxDir\*.key","$psmuxDir\*.sess" -EA SilentlyContinue |
+        Where-Object { $_.BaseName -notmatch '^[^_].*?__' } |
+        Remove-Item -Force -EA SilentlyContinue
 }
 
 # ── Scenario 1: history-limit (Patch path) ──────────────────────────

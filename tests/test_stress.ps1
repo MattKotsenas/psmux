@@ -196,25 +196,32 @@ for ($w = 1; $w -le 5; $w++) {
 $barrageMs = $barrageStart.ElapsedMilliseconds
 Log "  Barrage complete in ${barrageMs}ms (6 windows × 3 panes each = 18 panes)"
 
-# Verify all windows
+# Verify every pane that ACTUALLY exists.
+#
+# This used to walk windows 0..5 x panes 0..2 and probe each index blind. Window
+# 0 is the session's original window and was never split, so it has ONE pane:
+# stress3:0.1 and stress3:0.2 do not exist. The guard meant to skip them asked
+# capture-pane whether the pane was there and treated any output as proof, but
+# capture-pane returns content for a target it cannot resolve, so both phantom
+# panes were counted DEAD. Same two every run, w0p1 and w0p2, which is what a
+# real defect never looks like.
+#
+# The header count was wrong for the same reason: 5 new windows x 3 panes plus
+# window 0's single pane is 16, not 18.
+#
+# Asking the server which panes exist removes the guesswork entirely.
 $bAlive = 0
 $bDead = 0
-for ($w = 0; $w -le 5; $w++) {
-    # Check up to 3 panes per window
-    for ($p = 0; $p -lt 3; $p++) {
-        $r = Wait-Prompt "stress3:$w.$p"
-        if ($r.Found) { $bAlive++ }
-        else {
-            # Some panes might not exist (window 0 has no splits)
-            # Only count as dead if capture-pane returns something (pane exists)
-            try {
-                $check = & $PSMUX capture-pane -t "stress3:$w.$p" -p 2>&1 | Out-String
-                if ($check -and $check.Length -gt 0) {
-                    $bDead++
-                    Fail "Barrage w${w}p${p}" "Pane exists but no PS prompt"
-                }
-            } catch {}
-        }
+$realPanes = @(& $PSMUX list-panes -s -t stress3 -F '#{window_index}.#{pane_index}' 2>$null |
+               ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+$' })
+Log "  panes reported by the server: $($realPanes.Count) [$($realPanes -join ' ')]"
+foreach ($wp in $realPanes) {
+    $r = Wait-Prompt "stress3:$wp"
+    if ($r.Found) {
+        $bAlive++
+    } else {
+        $bDead++
+        Fail "Barrage $wp" "Pane exists but no PS prompt"
     }
 }
 $bTotal = $bAlive + $bDead

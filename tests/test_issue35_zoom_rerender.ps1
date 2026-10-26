@@ -157,11 +157,17 @@ if ($maxColsZ -ge ($cols0Pre + $cols1Pre - 5)) {
     Write-Fail "BUG #35: Zoomed pane cols=$maxColsZ, expected ~$($cols0Pre + $cols1Pre). Pane did NOT expand (re-render missing)"
 }
 
-# The other pane should be collapsed to near-zero
-if ($minColsZ -le 5) {
-    Write-Pass "Non-zoomed pane collapsed to cols=$minColsZ (expected near 0)"
+# The hidden pane must RETAIN its pre-zoom dimensions while the other pane is
+# zoomed. This matches real tmux (hidden panes keep their layout size; only the
+# zoomed pane temporarily takes the full window) and is load-bearing for
+# issues #44/#45: the old behavior of shrinking hidden panes toward 0 columns
+# resized their ConPTY + vt100 parser down to ~1-2 cols, reflowing and
+# corrupting their buffers. The original near-0 assertion here encoded exactly
+# that buffer-destroying behavior.
+if ($minColsZ -ge ($cols0Pre - 5) -or $minColsZ -ge ($cols1Pre - 5)) {
+    Write-Pass "Non-zoomed pane retained cols=$minColsZ during zoom (tmux parity; protects hidden-pane buffer per #44/#45)"
 } else {
-    Write-Fail "Non-zoomed pane still has cols=$minColsZ (expected near 0 when other pane is zoomed)"
+    Write-Fail "Non-zoomed pane cols=$minColsZ during zoom; expected it to RETAIN its pre-zoom width (~$cols0Pre/$cols1Pre)"
 }
 
 # --- Test 6: unzoom reverts both panes to split dimensions ---

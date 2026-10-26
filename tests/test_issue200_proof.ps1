@@ -103,7 +103,7 @@ $w2.Write("new-session -d -s $tcpSess`n"); $w2.Flush()
 $st2.ReadTimeout = 5000
 try { $dupResp = $r2.ReadLine(); Write-Host "  Response: $dupResp" } catch { $dupResp = "timeout" }
 $tcp2.Close()
-Result "Duplicate: correctly rejected" ($dupResp -match "already exists") "Got: $dupResp"
+Result "Duplicate: correctly rejected" ($dupResp -match "duplicate session") "Got: $dupResp"
 
 # Cleanup
 Write-Host "`nCleaning up..." -ForegroundColor Yellow

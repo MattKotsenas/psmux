@@ -56,6 +56,25 @@ class EnvBlockProbe {
     const uint CREATE_UNICODE_ENVIRONMENT  = 0x00000400;
     static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = new IntPtr(0x00020016);
 
+    // This probe deliberately feeds CreateProcessW malformed env blocks, so
+    // some children are created but cannot initialize.  Each one makes Windows
+    // raise a modal "unable to start correctly (0xc0000142)" dialog: 11 to 13
+    // per run of the issue167 probe family, which blocks unattended suite runs.
+    //
+    // A child inherits the parent's error mode UNLESS the parent passes
+    // CREATE_DEFAULT_ERROR_MODE -- and this probe does not.  Setting a silent
+    // error mode here is therefore inherited by every child.  CreateProcessW's
+    // return value and GetLastError, the only things this probe measures, are
+    // unaffected.
+    [DllImport("kernel32.dll")]
+    static extern uint SetErrorMode(uint uMode);
+    const uint SEM_FAILCRITICALERRORS = 0x0001;
+    const uint SEM_NOGPFAULTERRORBOX  = 0x0002;
+    const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+    static void SilenceSpawnFailureDialogs() {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+
     // Build a UTF-16 env block from raw entries (each entry already "KEY=VALUE",
     // may contain interior \0 to simulate corruption). Double-null terminated.
     static IntPtr BuildBlock(List<string> entries) {
@@ -129,6 +148,8 @@ class EnvBlockProbe {
 
     static void Main(string[] argv) {
         string pwsh = argv[0];
+
+        SilenceSpawnFailureDialogs();
 
         Console.WriteLine("Baselines and malformations (ConPTY passthrough 0xF, bInheritHandles=FALSE):");
 

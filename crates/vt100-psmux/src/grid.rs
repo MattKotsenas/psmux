@@ -10,7 +10,20 @@ pub struct Grid {
     scroll_bottom: u16,
     origin_mode: bool,
     saved_origin_mode: bool,
-    scrollback: std::collections::VecDeque<crate::row::Row>,
+    /// Retained history, shared copy on write.
+    ///
+    /// A row becomes history exactly once, is compacted on the way in
+    /// (`scroll_up`, issue #641) and is never written to again, so every copy
+    /// of this grid can read the same allocation.  That is what makes psmux's
+    /// copy mode snapshot (`Parser::snapshot`, issue #673) cost the visible
+    /// screen rather than the whole scrollback: a 50000 line history used to
+    /// be deep copied on every entry into copy mode, 186 MB of private bytes
+    /// measured at 200 columns.
+    ///
+    /// Anything that ever needs to CHANGE a retained row must take its own
+    /// copy first (`std::sync::Arc::make_mut`), or it would rewrite history
+    /// under every snapshot that still holds it.
+    scrollback: std::collections::VecDeque<std::sync::Arc<crate::row::Row>>,
     scrollback_len: usize,
     scrollback_offset: usize,
     /// Absolute line number of the OLDEST row currently retained (the front of
@@ -20,6 +33,12 @@ pub struct Grid {
     /// that survives scrolling (see `crate::image`).  MUST be bumped at every
     /// front-eviction site, so all of them funnel through `evict_front`.
     first_line: u64,
+    /// Copy-mode freeze (psmux issue #494): when set, the visible region is
+    /// anchored to its current content even at `scrollback_offset == 0` —
+    /// rows pushed into scrollback bump the offset so the view does not
+    /// follow new output, matching tmux's frozen copy-mode screen.  (At
+    /// offset > 0 this anchoring always happens, frozen or not.)
+    frozen: bool,
 }
 
 impl Grid {
@@ -37,6 +56,7 @@ impl Grid {
             scrollback_len,
             scrollback_offset: 0,
             first_line: 0,
+            frozen: false,
         }
     }
 
@@ -46,7 +66,7 @@ impl Grid {
     /// that removes a row from the front of `scrollback` MUST go through here,
     /// otherwise `first_line` drifts and sixel anchors are computed against the
     /// wrong absolute line forever (see the sixel design, risk 3).
-    fn evict_front(&mut self) -> Option<crate::row::Row> {
+    fn evict_front(&mut self) -> Option<std::sync::Arc<crate::row::Row>> {
         let row = self.scrollback.pop_front();
         if row.is_some() {
             self.first_line += 1;
@@ -74,6 +94,14 @@ impl Grid {
         self.first_line
             + u64::try_from(self.scrollback.len()).unwrap_or(u64::MAX)
             + u64::from(self.pos.row)
+    }
+
+    pub fn frozen(&self) -> bool {
+        self.frozen
+    }
+
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
     }
 
     pub fn allocate_rows(&mut self) {
@@ -170,6 +198,9 @@ impl Grid {
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
         let scrollback_len = self.scrollback.len();
         let rows_len = self.rows.len();
+        // The `map` that hands out the shared rows comes AFTER the `skip`, so
+        // the skip still lands on the deque's own fast path instead of stepping
+        // through the history one row at a time.
         self.scrollback
             .iter()
             .skip(scrollback_len - self.scrollback_offset)
@@ -178,6 +209,7 @@ impl Grid {
             // will take 9 rows instead of 3. we need to set
             // the upper bound to rows_len (e.g. 3)
             .take(rows_len)
+            .map(|r| &**r)
             // same for rows_len - scrollback_offset (e.g. 3 - 9).
             // it'll panic with overflow. we have to saturate the subtraction.
             .chain(
@@ -197,8 +229,26 @@ impl Grid {
         self.rows.iter_mut()
     }
 
+    /// The `row`th row of the visible region, indexed rather than walked.
+    ///
+    /// This is the same sequence `visible_rows` yields, and it has to stay O(1):
+    /// `capture-pane -S` asks for one row at a time, so a linear walk per row
+    /// turns a 50000 line history into a quadratic read.  (Handing the shared
+    /// scrollback rows out through a `map` adaptor did exactly that, and a
+    /// capture that took 363 ms started timing out.)
     pub fn visible_row(&self, row: u16) -> Option<&crate::row::Row> {
-        self.visible_rows().nth(usize::from(row))
+        let row = usize::from(row);
+        let rows_len = self.rows.len();
+        if row >= rows_len {
+            return None;
+        }
+        let from_scrollback = self.scrollback_offset.min(rows_len);
+        if row < from_scrollback {
+            let start = self.scrollback.len() - self.scrollback_offset;
+            self.scrollback.get(start + row).map(|r| &**r)
+        } else {
+            self.rows.get(row - from_scrollback)
+        }
     }
 
     pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row> {
@@ -249,8 +299,51 @@ impl Grid {
         self.scrollback.len()
     }
 
+    /// Approximate resident size of the scrollback in bytes: the cells the
+    /// history rows actually store plus the per-row bookkeeping.  Trailing
+    /// blank columns are not stored and so do not count, which is the whole
+    /// point of the compaction in `scroll_up` (issue #641).  This is what
+    /// `#{history_bytes}` reports, matching tmux's field of the same name.
+    /// A retained row is shared with every snapshot taken of this grid, so this
+    /// is what the history costs once, not once per reader (issue #673).  The
+    /// reference counts in front of a shared row are not counted, just as tmux
+    /// counts the line struct and its cells and never the allocator's own
+    /// bookkeeping, which keeps a fully blank compacted row cheaper than one
+    /// cell (issue #641).
+    pub fn history_bytes(&self) -> usize {
+        let cell = std::mem::size_of::<crate::Cell>();
+        let row = std::mem::size_of::<crate::row::Row>();
+        self.scrollback
+            .iter()
+            .map(|r| row + r.stored_cells() * cell)
+            .sum()
+    }
+
     /// Updates the scrollback buffer's maximum size.  When `new_len` is
     /// smaller than the current fill, the oldest rows are trimmed away.
+    /// Move the retained history out of this grid, leaving it empty.  The
+    /// rows are shared (`Arc`), so this moves pointers, never cells.
+    pub fn take_scrollback(
+        &mut self,
+    ) -> std::collections::VecDeque<std::sync::Arc<crate::row::Row>> {
+        self.scrollback_offset = 0;
+        std::mem::take(&mut self.scrollback)
+    }
+
+    /// Install history taken from another grid with `take_scrollback`,
+    /// replacing whatever this grid held and trimming the oldest rows to this
+    /// grid's limit.
+    pub fn put_scrollback(
+        &mut self,
+        history: std::collections::VecDeque<std::sync::Arc<crate::row::Row>>,
+    ) {
+        self.scrollback = history;
+        self.scrollback_offset = 0;
+        while self.scrollback.len() > self.scrollback_len {
+            self.evict_front();
+        }
+    }
+
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.scrollback_len = new_len;
         while self.scrollback.len() > self.scrollback_len {
@@ -265,15 +358,19 @@ impl Grid {
     /// the cap is reached.  Used by the alt-screen-to-scrollback copy
     /// path (psmux issue #88).  Honours `scrollback_len = 0` (no-op),
     /// matching how the normal in-flow scrolling treats that case.
-    pub fn push_row_to_scrollback(&mut self, row: crate::row::Row) {
+    pub fn push_row_to_scrollback(&mut self, mut row: crate::row::Row) {
         if self.scrollback_len == 0 {
             return;
         }
-        self.scrollback.push_back(row);
+        // Scrollback rows are never mutated again, so drop the trailing blank
+        // padding before it becomes resident for the life of the history
+        // (issue #641).
+        row.compact();
+        self.scrollback.push_back(std::sync::Arc::new(row));
         while self.scrollback.len() > self.scrollback_len {
             self.evict_front();
         }
-        if self.scrollback_offset > 0 {
+        if self.scrollback_offset > 0 || self.frozen {
             self.scrollback_offset =
                 self.scrollback.len().min(self.scrollback_offset + 1);
         }
@@ -653,13 +750,18 @@ impl Grid {
         for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
-            let removed = self.rows.remove(usize::from(self.scroll_top));
+            let mut removed = self.rows.remove(usize::from(self.scroll_top));
             if self.scrollback_len > 0 && !self.scroll_region_active() {
-                self.scrollback.push_back(removed);
+                // The row stops being mutable the moment it becomes history,
+                // so this is the point to give its trailing blank columns back
+                // to the allocator.  tmux does the same in
+                // `grid_scroll_history` (grid.c:508).
+                removed.compact();
+                self.scrollback.push_back(std::sync::Arc::new(removed));
                 while self.scrollback.len() > self.scrollback_len {
                     self.evict_front();
                 }
-                if self.scrollback_offset > 0 {
+                if self.scrollback_offset > 0 || self.frozen {
                     self.scrollback_offset =
                         self.scrollback.len().min(self.scrollback_offset + 1);
                 }
@@ -767,18 +869,27 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        // `cols - width` underflows for a glyph wider than the row, which a
+        // pane shrunk to one column produces (#534). Screen::text drops such a
+        // glyph before reaching here, but col_wrap is reachable from elsewhere,
+        // so keep the arithmetic safe at the source too.
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            // On a ONE row screen the row that wrapped has just scrolled off
+            // (0 - 1): it is history now, or gone with no scrollback, and
+            // there is no visible row to flag. The bare subtraction here
+            // underflowed and the unwrap below panicked the pane's reader
+            // thread (found under #708; psmux allows one row panes, #644).
+            let Some(prev_row) = prev_pos.row.checked_sub(scrolled) else {
+                return;
+            };
+            prev_pos.row = prev_row;
+            if let Some(row) = self.drawing_row_mut(prev_pos.row) {
+                row.wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            }
         }
     }
 
@@ -831,3 +942,7 @@ pub struct Pos {
     pub row: u16,
     pub col: u16,
 }
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue673_scrollback_cow.rs"]
+mod test_issue673_scrollback_cow;

@@ -119,6 +119,8 @@ pub struct Attrs {
     intensity: Option<Intensity>,
     italic: Option<bool>,
     underline: Option<bool>,
+    underline_style: Option<crate::attrs::UnderlineStyle>,
+    ulcolor: Option<crate::Color>,
     inverse: Option<bool>,
     blink: Option<bool>,
     hidden: Option<bool>,
@@ -148,6 +150,19 @@ impl Attrs {
 
     pub fn underline(mut self, underline: bool) -> Self {
         self.underline = Some(underline);
+        self
+    }
+
+    pub fn underline_style(
+        mut self,
+        style: crate::attrs::UnderlineStyle,
+    ) -> Self {
+        self.underline_style = Some(style);
+        self
+    }
+
+    pub fn ulcolor(mut self, ulcolor: crate::Color) -> Self {
+        self.ulcolor = Some(ulcolor);
         self
     }
 
@@ -181,6 +196,8 @@ impl BufWrite for Attrs {
             && self.intensity.is_none()
             && self.italic.is_none()
             && self.underline.is_none()
+            && self.underline_style.is_none()
+            && self.ulcolor.is_none()
             && self.inverse.is_none()
             && self.blink.is_none()
             && self.hidden.is_none()
@@ -271,11 +288,48 @@ impl BufWrite for Attrs {
             }
         }
 
-        if let Some(underline) = self.underline {
+        // The extended style wins when both are present: `4:3` already
+        // implies an underline, and emitting a bare `4` after it would
+        // downgrade the curl back to a straight line.
+        if let Some(style) = self.underline_style {
+            match style {
+                crate::attrs::UnderlineStyle::None => write_param!(24),
+                crate::attrs::UnderlineStyle::Single => write_param!(4),
+                other => {
+                    if first {
+                        first = false;
+                    } else {
+                        buf.push(b';');
+                    }
+                    buf.extend_from_slice(b"4:");
+                    extend_itoa(buf, other.sgr_subparam());
+                }
+            }
+        } else if let Some(underline) = self.underline {
             if underline {
                 write_param!(4);
             } else {
                 write_param!(24);
+            }
+        }
+
+        if let Some(ulcolor) = self.ulcolor {
+            match ulcolor {
+                crate::Color::Default => {
+                    write_param!(59);
+                }
+                crate::Color::Idx(i) => {
+                    write_param!(58);
+                    write_param!(5);
+                    write_param!(i);
+                }
+                crate::Color::Rgb(r, g, b) => {
+                    write_param!(58);
+                    write_param!(2);
+                    write_param!(r);
+                    write_param!(g);
+                    write_param!(b);
+                }
             }
         }
 

@@ -135,65 +135,105 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
             }
         }
 
-        if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
-            .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
-        {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if name.eq_ignore_ascii_case("username") {
-                        continue;
-                    }
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
-                }
+        let read_key = |root, sub: &str| -> Vec<(String, OsString)> {
+            match RegKey::predef(root).open_subkey(sub) {
+                Ok(key) => key
+                    .enum_values()
+                    .flatten()
+                    .filter_map(|(name, value)| {
+                        reg_value_to_string(&value).ok().map(|v| (name, v))
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
             }
-        }
-
-        if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        // Merge the system and user paths together
-                        let value = if name.eq_ignore_ascii_case("path") {
-                            match env.get(&EnvEntry::map_key(name.clone().into())) {
-                                Some(entry) => {
-                                    let mut result = OsString::new();
-                                    result.push(&entry.value);
-                                    result.push(";");
-                                    result.push(&value);
-                                    result
-                                }
-                                None => value,
-                            }
-                        } else {
-                            value
-                        };
-
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
-                }
-            }
-        }
+        };
+        let machine = read_key(
+            HKEY_LOCAL_MACHINE,
+            "System\\CurrentControlSet\\Control\\Session Manager\\Environment",
+        );
+        let user = read_key(HKEY_CURRENT_USER, "Environment");
+        fill_from_registry(&mut env, machine, user);
     }
 
     env
+}
+
+/// Fill the variables the process environment LACKS from the registry
+/// environment (`HKLM\...\Session Manager\Environment`, then
+/// `HKCU\Environment`).
+///
+/// A pane inherits the environment of the process that started the server,
+/// as in tmux, where `global_environ` is filled from the server's start
+/// environment and passed through unchanged. The registry used to be laid
+/// OVER the inherited environment (wezterm's portable-pty does that because a
+/// GUI terminal started from Explorer wants a freshly read environment), which
+/// replaced the launching shell's deliberate `PATH`, `TEMP`, `GOPATH`, `OS`
+/// and anything else the registry also defines (#773). The registry now only
+/// supplies keys the process environment does not have at all, so a server
+/// started with a stripped environment still gets usable values.
+///
+/// `PATH` keeps the registry's own merge rule for the fill case: machine
+/// `PATH`, then `;`, then user `PATH`. An inherited `PATH` is never touched,
+/// so no entry is dropped and nothing is duplicated. The machine `USERNAME`
+/// is skipped, as before: the machine key holds `SYSTEM` there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn fill_from_registry(
+    env: &mut BTreeMap<OsString, EnvEntry>,
+    machine: Vec<(String, OsString)>,
+    user: Vec<(String, OsString)>,
+) {
+    let inherited: std::collections::BTreeSet<OsString> = env.keys().cloned().collect();
+
+    for (name, value) in machine {
+        if name.eq_ignore_ascii_case("username") {
+            continue;
+        }
+        let key = EnvEntry::map_key(name.clone().into());
+        if inherited.contains(&key) {
+            continue;
+        }
+        log::trace!("filling SYS env: {:?} {:?}", name, value);
+        env.insert(
+            key,
+            EnvEntry {
+                is_from_base_env: true,
+                preferred_key: name.into(),
+                value,
+            },
+        );
+    }
+
+    for (name, value) in user {
+        let key = EnvEntry::map_key(name.clone().into());
+        if inherited.contains(&key) {
+            continue;
+        }
+        // Merge the system and user paths together (both came from the
+        // registry here: an inherited PATH was skipped above).
+        let value = if name.eq_ignore_ascii_case("path") {
+            match env.get(&key) {
+                Some(entry) => {
+                    let mut result = OsString::new();
+                    result.push(&entry.value);
+                    result.push(";");
+                    result.push(&value);
+                    result
+                }
+                None => value,
+            }
+        } else {
+            value
+        };
+        log::trace!("filling USER env: {:?} {:?}", name, value);
+        env.insert(
+            key,
+            EnvEntry {
+                is_from_base_env: true,
+                preferred_key: name.into(),
+                value,
+            },
+        );
+    }
 }
 
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
@@ -308,7 +348,7 @@ impl CommandBuilder {
             EnvEntry {
                 is_from_base_env: false,
                 preferred_key: key,
-                value: value,
+                value,
             },
         );
     }
@@ -583,7 +623,7 @@ impl CommandBuilder {
             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
             for path in std::env::split_paths(&path) {
                 // Check for exactly the user's string in this path dir
-                let candidate = path.join(&exe);
+                let candidate = path.join(exe);
                 if candidate.exists() {
                     return candidate.into_os_string();
                 }
@@ -595,7 +635,7 @@ impl CommandBuilder {
                     // PATHEXT includes the leading `.`, but `with_extension`
                     // doesn't want that
                     let ext = ext.to_str().expect("PATHEXT entries must be utf8");
-                    let path = path.join(&exe).with_extension(&ext[1..]);
+                    let path = path.join(exe).with_extension(&ext[1..]);
                     if path.exists() {
                         return path.into_os_string();
                     }
@@ -785,3 +825,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../../../tests-rs/test_issue167_envblock.rs"]
 mod tests_issue167_envblock;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue773_registry_fill.rs"]
+mod tests_issue773_registry_fill;

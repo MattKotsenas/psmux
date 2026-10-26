@@ -210,10 +210,32 @@ class Probe {
     [DllImport("kernel32.dll")]
     static extern uint GetCurrentProcessId();
 
+    // This probe deliberately spawns children under conditions that can fail to
+    // initialize (oversized env blocks, WindowsApps alias paths).  Each failure
+    // makes Windows raise a modal "unable to start correctly (0xc0000142)"
+    // dialog: 11 to 13 per run of the issue167 probe family, which blocks
+    // unattended suite runs.
+    //
+    // A child inherits the parent's error mode UNLESS the parent passes
+    // CREATE_DEFAULT_ERROR_MODE -- and this probe does not.  Setting a silent
+    // error mode here is therefore inherited by every child.  CreateProcessW's
+    // return value and GetLastError, the only things this probe measures, are
+    // unaffected.
+    [DllImport("kernel32.dll")]
+    static extern uint SetErrorMode(uint uMode);
+    const uint SEM_FAILCRITICALERRORS = 0x0001;
+    const uint SEM_NOGPFAULTERRORBOX  = 0x0002;
+    const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
     static void Main(string[] argv) {
         if (argv.Length < 1) { Console.Error.WriteLine("usage: probe <pwsh_path> [synthbig]"); return; }
         string pwsh = argv[0];
         bool synthBig = argv.Length > 1 && argv[1] == "synthbig";
+
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 
         // Mirror psmux's invocation pattern.
         string command = "Write-Host PROBE_OK; Start-Sleep 1";
@@ -260,6 +282,12 @@ class Probe {
             Environment.Exit(err);
         }
         Console.WriteLine("[probe] CreateProcessW OK pid={0}", pi.dwProcessId);
+        // The child is spawned with -NoExit, so once its command finishes it
+        // sits at a prompt forever.  Two leaked per run and accumulated across
+        // days (survivors found up to 84h old, each holding a conhost and its
+        // share of desktop heap).  Reap it: this probe only needs to know
+        // whether CreateProcessW succeeded, not to keep the shell around.
+        TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         if (envBlock != IntPtr.Zero) Marshal.FreeHGlobal(envBlock);

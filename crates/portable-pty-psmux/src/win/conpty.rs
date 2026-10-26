@@ -13,10 +13,24 @@ use winapi::um::wincon::COORD;
 /// kernel transitions during high-throughput output (e.g. `cat large_file`).
 /// Using 64 KB matches Windows Terminal's approach and reduces syscall
 /// overhead for both input (mouse/keyboard) and output.
-fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
+///
+/// Both ends are created NON inheritable.  Nothing needs them inheritable:
+/// CreatePseudoConsole duplicates the conhost side ends into the conhost it
+/// starts, and pane children are created with bInheritHandles=FALSE.  What
+/// an inheritable end did do is ride along into every child the server
+/// spawns with bInheritHandles=TRUE (std::process::Command always passes
+/// TRUE: pipe-pane, run-shell, if-shell, `#()` status jobs, hooks), so a
+/// long running job child held the master ends of every pane that existed
+/// when it started, and passed them on to its own children.  Measured on
+/// cb783dc: a server with three panes held 22 inheritable pipe handles and
+/// a `pipe-pane` child (pwsh, then its PING) held copies of 6 of them.
+/// The same rule as the socket fix: every handle the server keeps must
+/// have HANDLE_FLAG_INHERIT clear.
+#[doc(hidden)]
+pub fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
-    use winapi::shared::minwindef::TRUE;
+    use winapi::shared::minwindef::FALSE;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
     use winapi::um::namedpipeapi::CreatePipe;
@@ -25,7 +39,7 @@ fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDes
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
-        bInheritHandle: TRUE as _,
+        bInheritHandle: FALSE as _,
     };
     let mut read: HANDLE = INVALID_HANDLE_VALUE;
     let mut write: HANDLE = INVALID_HANDLE_VALUE;
@@ -46,9 +60,12 @@ impl PtySystem for ConPtySystem {
         // Use 64KB pipe buffers (Windows Terminal uses 128KB).
         // Default CreatePipe(..., 0) = ~4KB, causing frequent kernel round-trips.
         const PIPE_BUF: u32 = 64 * 1024;
+        let t_pipes = super::spawn_trace::now_us();
         let (stdin_read, stdin_write) = create_pipe_with_buffer(PIPE_BUF)?;
         let (stdout_read, stdout_write) = create_pipe_with_buffer(PIPE_BUF)?;
+        super::spawn_trace::step(t_pipes, || "openpty.pipes");
 
+        let t_con = super::spawn_trace::now_us();
         let con = PsuedoCon::new(
             COORD {
                 X: size.cols as i16,
@@ -57,6 +74,7 @@ impl PtySystem for ConPtySystem {
             stdin_read,
             stdout_write,
         )?;
+        super::spawn_trace::step(t_con, || "openpty.CreatePseudoConsole");
 
         let master = ConPtyMasterPty {
             inner: Arc::new(Mutex::new(Inner {
@@ -124,7 +142,7 @@ impl MasterPty for ConPtyMasterPty {
 
     fn get_size(&self) -> Result<PtySize, Error> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.size.clone())
+        Ok(inner.size)
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
@@ -141,11 +159,18 @@ impl MasterPty for ConPtyMasterPty {
                 .ok_or_else(|| anyhow::anyhow!("writer already taken"))?,
         ))
     }
+
+    fn conpty_passthrough_mode(&self) -> Option<bool> {
+        Some(self.inner.lock().unwrap().con.used_passthrough)
+    }
 }
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
+        crate::reset_spawn_create_us();
+        let t_lock = super::spawn_trace::now_us();
         let mut inner = self.inner.lock().unwrap();
+        super::spawn_trace::step(t_lock, || "spawn.inner_mutex_wait");
         match inner.con.spawn_command(cmd.clone()) {
             Ok(child) => Ok(Box::new(child)),
             Err(e) if inner.con.used_passthrough && is_invalid_parameter(&e) => {
@@ -196,4 +221,39 @@ impl SlavePty for ConPtySlavePty {
 fn is_invalid_parameter(e: &anyhow::Error) -> bool {
     let msg = format!("{}", e);
     msg.contains("os error 87")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    const CHILD_ENV: &str = "PORTABLE_PTY_CONPTY_PASSTHROUGH_TEST_CHILD";
+
+    #[test]
+    fn reports_when_passthrough_is_disabled_by_environment() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let pair = ConPtySystem::default().openpty(PtySize::default()).unwrap();
+
+            assert_eq!(pair.master.conpty_passthrough_mode(), Some(false));
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "win::conpty::tests::reports_when_passthrough_is_disabled_by_environment",
+            ])
+            .env("PSMUX_NO_PASSTHROUGH", "1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

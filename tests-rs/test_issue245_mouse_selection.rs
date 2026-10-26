@@ -21,6 +21,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -31,6 +34,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -45,6 +50,48 @@ fn default_mouse_selection_is_on() {
     let app = mock_app();
     assert!(app.mouse_selection,
         "mouse-selection must default to true (on) for backwards compatibility");
+}
+
+#[test]
+fn default_mouse_selection_force_is_off() {
+    let app = mock_app();
+    assert!(!app.mouse_selection_force);
+}
+
+#[test]
+fn config_and_server_options_support_mouse_selection_force() {
+    let mut app = mock_app_with_window();
+    crate::config::parse_config_content(&mut app, "set -g mouse-selection-force on\n");
+    assert!(app.mouse_selection_force);
+    assert_eq!(
+        crate::server::options::get_option_value(&app, "mouse-selection-force"),
+        "on"
+    );
+
+    crate::server::options::apply_set_option(
+        &mut app,
+        "mouse-selection-force",
+        "off",
+        false,
+    );
+    assert!(!app.mouse_selection_force);
+}
+
+#[test]
+fn option_catalog_registers_mouse_selection_force() {
+    let entry = crate::server::option_catalog::OPTION_CATALOG
+        .iter()
+        .find(|o| o.name == "mouse-selection-force")
+        .expect("mouse-selection-force must be in catalog");
+    assert_eq!(entry.default, "off");
+    assert_eq!(
+        entry.option_type,
+        crate::server::option_catalog::OptionType::Boolean
+    );
+    assert_eq!(
+        entry.scope,
+        crate::server::option_catalog::OptionScope::Session,
+    );
 }
 
 #[test]
@@ -136,8 +183,14 @@ fn option_catalog_default_is_on() {
         .expect("mouse-selection must be in catalog");
     assert_eq!(entry.default, "on",
         "Catalog default for mouse-selection must be 'on' (preserves existing behavior)");
-    assert_eq!(entry.option_type, "boolean");
-    assert_eq!(entry.scope, "session");
+    assert_eq!(
+        entry.option_type,
+        crate::server::option_catalog::OptionType::Boolean
+    );
+    assert_eq!(
+        entry.scope,
+        crate::server::option_catalog::OptionScope::Session,
+    );
 }
 
 #[test]

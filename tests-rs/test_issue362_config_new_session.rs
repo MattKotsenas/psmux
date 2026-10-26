@@ -1,11 +1,12 @@
 // Issue #362: detect a top-level `new-session` directive in the user's config
 // so `attach-session` can bootstrap a session when no server is running, matching
 // tmux (which runs new-session from the config at server start).
-use std::sync::Mutex;
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn with_config<T>(content: &str, f: impl FnOnce() -> T) -> T {
-    let _g = ENV_LOCK.lock().unwrap();
+    // The shared lock, not a private one: PSMUX_CONFIG_FILE is process wide, so
+    // a mutex of our own serialises these tests against each other and against
+    // nothing else (src/util.rs).
+    let _g = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join(format!("psmux_test362_{}.conf", std::process::id()));
     std::fs::write(&tmp, content).unwrap();
     let prev = std::env::var("PSMUX_CONFIG_FILE").ok();

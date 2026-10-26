@@ -101,6 +101,16 @@ pub trait MasterPty: Downcast + Send {
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
 
+    /// Whether this is a ConPTY created with passthrough mode enabled.
+    ///
+    /// `None` means that the pty implementation is not ConPTY, or does not
+    /// expose this implementation-specific detail.  The result should be
+    /// queried after spawning a child: ConPTY can fall back to a newly-created
+    /// non-passthrough console when process creation rejects passthrough mode.
+    fn conpty_passthrough_mode(&self) -> Option<bool> {
+        None
+    }
+
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
     #[cfg(unix)]
@@ -124,6 +134,18 @@ pub trait MasterPty: Downcast + Send {
     }
 }
 impl_downcast!(MasterPty);
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_conpty_master_reports_no_passthrough_mode() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+
+        assert_eq!(pair.master.conpty_passthrough_mode(), None);
+    }
+}
 
 /// Represents a child process spawned into the pty.
 /// This handle can be used to wait for or terminate that child process.
@@ -270,10 +292,7 @@ impl_downcast!(PtySystem);
 
 impl Child for std::process::Child {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        std::process::Child::try_wait(self).map(|s| match s {
-            Some(s) => Some(s.into()),
-            None => None,
-        })
+        std::process::Child::try_wait(self).map(|status| status.map(Into::into))
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
@@ -399,6 +418,168 @@ impl ChildKiller for std::process::Child {
 
 pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
     Box::new(NativePtySystem::default())
+}
+
+/// The one process-global lock that orders console identity changes against
+/// ConPTY spawns.
+///
+/// On Windows, FreeConsole/AttachConsole swap the whole process's console
+/// connection and its std handle slots.  CreateProcessW for a ConPTY child
+/// (bInheritHandles=FALSE, no STARTF_USESTDHANDLES) stamps the parent's
+/// std handle *values* into the child's ProcessParameters at that instant;
+/// a spawn landing inside another thread's FreeConsole/AttachConsole window
+/// gives the child freed, recycled handle values and the shell dies at its
+/// first console read (psmux issue #450).  Every FreeConsole/AttachConsole
+/// dance and every ConPTY spawn must hold this lock.
+///
+/// Identity changes take it EXCLUSIVELY ([`console_state_lock`]); spawns take
+/// it SHARED ([`conpty_spawn_guard`]).  See `conpty_spawn_guard` for why two
+/// spawns may safely overlap.
+static CONSOLE_STATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Exclusive hold on the process console identity: FreeConsole/AttachConsole,
+/// and anything else that swaps the process's console connection or its std
+/// handle slots.  Blocks, and is blocked by, every in flight ConPTY spawn.
+///
+/// A panic while holding the lock leaves console state possibly odd but the
+/// lock itself must keep working (see psmux issue #446).
+pub fn console_state_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    CONSOLE_STATE.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How long the last ConPTY spawn on THIS thread spent waiting to get into the
+/// console state, in microseconds.  Diagnostics only: psmux reads it for its
+/// `PSMUX_WARM_TRACE` spawn line so a serialised surge is visible as wait time
+/// rather than guessed at.
+pub fn last_spawn_console_wait_us() -> u64 {
+    SPAWN_WAIT_US.with(|c| c.get())
+}
+
+/// How long the last ConPTY spawn on THIS thread spent inside CreateProcessW
+/// itself (every attempt it made), in microseconds.  Diagnostics only: the
+/// rest of a spawn is psmux's own work and waits, this part is the operating
+/// system's.  They must be told apart because the OS part does not scale with
+/// concurrency for a Store packaged shell: measured on Windows 11 26200 from an
+/// unpackaged caller with no psmux code and no job object at all, eight
+/// concurrent CreateProcessW calls of the Store pwsh each took about 300 ms
+/// (one alone takes about 50 ms) and returned in batches at the same instant,
+/// with a straggler finishing 90 to 250 ms after the rest, while eight of
+/// cmd.exe took 2 to 17 ms.  A surge of spares therefore shows a spread of
+/// whole spawn times that psmux neither causes nor can remove, and only the
+/// time OUTSIDE CreateProcessW says whether psmux serialised its spawns
+/// (issue #686).
+pub fn last_spawn_create_us() -> u64 {
+    SPAWN_CREATE_US.with(|c| c.get())
+}
+
+/// Start a new spawn's CreateProcessW account on this thread.
+pub fn reset_spawn_create_us() {
+    SPAWN_CREATE_US.with(|c| c.set(0));
+}
+
+thread_local! {
+    static SPAWN_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SPAWN_CREATE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds the time until it drops to this thread's CreateProcessW account.
+#[cfg(windows)]
+pub(crate) struct SpawnCreateTimer(std::time::Instant);
+
+#[cfg(windows)]
+impl SpawnCreateTimer {
+    pub(crate) fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpawnCreateTimer {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros() as u64;
+        SPAWN_CREATE_US.with(|c| c.set(c.get().saturating_add(us)));
+    }
+}
+
+/// Shared, refcounted entry into the console state for a ConPTY spawn.
+///
+/// Two ConPTY spawns do NOT conflict with each other.  Both want the exact
+/// same process-global state for the duration of their `CreateProcessW`: the
+/// three std handle slots parked on NULL, so the child is born with the
+/// GUI-parent handle set that conhost fills in itself (issue #450).  Holding
+/// them apart therefore bought nothing and cost everything: a surge of eight
+/// spares queued one whole `CreateProcessW` behind another, so the eighth paid
+/// about 45ms times eight before its shell even began starting (issue #686).
+///
+/// What must still be exclusive is an *identity change* (FreeConsole /
+/// AttachConsole), because that one wants the slots to hold something else.
+/// So identity changes take [`console_state_lock`] for write and spawns take
+/// the read side here, and the NULL parking is refcounted: the first spawn in
+/// saves the real handles and parks the slots, the last one out restores them.
+/// While any spawn is inside, an identity change is blocked, so nothing can
+/// alter the slots underneath the refcount.
+pub struct ConPtySpawnGuard {
+    _shared: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+/// Saved std handles plus how many spawns are currently parked on NULL.
+/// Handles are kept as `usize` because a raw `HANDLE` is not `Send`.
+static STD_PARK: std::sync::Mutex<(usize, [usize; 3])> = std::sync::Mutex::new((0, [0; 3]));
+
+impl ConPtySpawnGuard {
+    /// Enter the console state for a spawn and park the std handle slots on
+    /// NULL.  Blocks only while an identity change is in flight.
+    pub fn acquire() -> Self {
+        let t0 = std::time::Instant::now();
+        let shared = CONSOLE_STATE.read().unwrap_or_else(|e| e.into_inner());
+        SPAWN_WAIT_US.with(|c| c.set(t0.elapsed().as_micros() as u64));
+        #[cfg(windows)]
+        {
+            let mut park = STD_PARK.lock().unwrap_or_else(|e| e.into_inner());
+            if park.0 == 0 {
+                park.1 = unsafe { save_and_null_std_handles() };
+            }
+            park.0 += 1;
+        }
+        Self { _shared: shared }
+    }
+}
+
+impl Drop for ConPtySpawnGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            let mut park = STD_PARK.lock().unwrap_or_else(|e| e.into_inner());
+            park.0 = park.0.saturating_sub(1);
+            if park.0 == 0 {
+                unsafe { restore_std_handles(park.1) };
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn save_and_null_std_handles() -> [usize; 3] {
+    use winapi::um::processenv::{GetStdHandle, SetStdHandle};
+    use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    let saved = [
+        GetStdHandle(STD_INPUT_HANDLE) as usize,
+        GetStdHandle(STD_OUTPUT_HANDLE) as usize,
+        GetStdHandle(STD_ERROR_HANDLE) as usize,
+    ];
+    SetStdHandle(STD_INPUT_HANDLE, std::ptr::null_mut());
+    SetStdHandle(STD_OUTPUT_HANDLE, std::ptr::null_mut());
+    SetStdHandle(STD_ERROR_HANDLE, std::ptr::null_mut());
+    saved
+}
+
+#[cfg(windows)]
+unsafe fn restore_std_handles(saved: [usize; 3]) {
+    use winapi::um::processenv::SetStdHandle;
+    use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    SetStdHandle(STD_INPUT_HANDLE, saved[0] as _);
+    SetStdHandle(STD_OUTPUT_HANDLE, saved[1] as _);
+    SetStdHandle(STD_ERROR_HANDLE, saved[2] as _);
 }
 
 #[cfg(unix)]

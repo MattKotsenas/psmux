@@ -48,10 +48,9 @@ function Send-Tcp($session, $cmd, [int]$TimeoutMs = 5000) {
                 $line = $reader.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if (-not $stream.DataAvailable) {
-                    Start-Sleep -Milliseconds 100
-                    if (-not $stream.DataAvailable) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $client.Close()
@@ -98,7 +97,7 @@ $bools = @(
     'allow-rename', 'monitor-activity',
     'remain-on-exit', 'destroy-unattached', 'exit-empty',
     'set-titles',
-    'scroll-enter-copy-mode', 'pwsh-mouse-selection',
+    'scroll-enter-copy-mode', 'pwsh-mouse-selection', 'mouse-selection-force',
     'synchronize-panes', 'warm',
     'allow-predictions', 'claude-code-fix-tty', 'claude-code-force-interactive'
 )
@@ -119,7 +118,7 @@ foreach ($opt in $bools) {
 # ============================================================
 
 $nums = @(
-    @{n='escape-time'; v='100'; d='500'},
+    @{n='escape-time'; v='100'; d='10'},  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
     @{n='history-limit'; v='50000'; d='2000'},
     @{n='display-time'; v='3000'; d='750'},
     @{n='display-panes-time'; v='5000'; d='1000'},
@@ -195,14 +194,15 @@ Test-Result "flag-g" ($show -match '\b42\b') "show='$show'"
 # -a (append) using SEPARATE -a flag
 Send-Tcp $sess "set-option -g status-right AAA" | Out-Null
 Send-Tcp $sess "set-option -a status-right BBB" | Out-Null
-$show = Send-Tcp $sess "show-options -g status-right"
+# -a without -g appends to the session's own value; the global stays AAA (tmux, #803)
+$show = Send-Tcp $sess "show-options status-right"
 Test-Result "flag-a-append" ($show -match 'AAABBB') "show='$show'"
 
 # Triple append using separate flags
 Send-Tcp $sess "set-option -g status-left X" | Out-Null
 Send-Tcp $sess "set-option -a status-left Y" | Out-Null
 Send-Tcp $sess "set-option -a status-left Z" | Out-Null
-$show = Send-Tcp $sess "show-options -g status-left"
+$show = Send-Tcp $sess "show-options status-left"
 Test-Result "flag-a-triple" ($show -match 'XYZ') "show='$show'"
 
 # -u (unset) on @user option using separate -u flag
@@ -219,7 +219,8 @@ Test-Result "flag-q-silent" ($resp -notmatch 'unknown option') "resp='$resp'"
 
 # -w (window scope) + verify accepted
 Send-Tcp $sess "set-option -w mouse on" | Out-Null
-$show = Send-Tcp $sess "show-options -g mouse"
+# mouse is a session option, so -w sets the session's value (tmux options_scope_from_name)
+$show = Send-Tcp $sess "show-options mouse"
 Test-Result "flag-w-accepted" ($show -match '\bon\b') "show='$show'"
 
 # -t target + verify applied
@@ -228,7 +229,7 @@ $show = Send-Tcp $sess "show-options -g escape-time"
 Test-Result "flag-t-target" ($show -match '99') "show='$show'"
 
 # Restore
-Send-Tcp $sess "set-option -g escape-time 500" | Out-Null
+Send-Tcp $sess "set-option -g escape-time 10" | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ============================================================
 # SECTION 5: User/@- options full lifecycle (all verified)
@@ -285,7 +286,8 @@ $env_out = Send-Tcp $sess "show-environment"
 Test-Result "env-alias-verify" ($env_out -match 'TCP_ENV_V2.*beta') "env contains TCP_ENV_V2"
 
 Send-Tcp $sess "set-environment -g TCP_ENV_G gamma" | Out-Null
-$env_out = Send-Tcp $sess "show-environment"
+# -g is the global environment, read back with -g like tmux (#775).
+$env_out = Send-Tcp $sess "show-environment -g TCP_ENV_G"
 Test-Result "env-global-verify" ($env_out -match 'TCP_ENV_G.*gamma') "env contains TCP_ENV_G"
 
 # ============================================================
@@ -402,7 +404,7 @@ $show = Send-Tcp $sess "show-options -g base-index"
 Test-Result "source-bi-5" ($show -match '\b5\b') "show='$show'"
 
 # Restore
-Send-Tcp $sess "set-option -g escape-time 500" | Out-Null
+Send-Tcp $sess "set-option -g escape-time 10" | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 Send-Tcp $sess "set-option -g base-index 0" | Out-Null
 Remove-Item $tempSrc -Force -ErrorAction SilentlyContinue
 
@@ -465,7 +467,7 @@ $cli = & $psmux show-options -t $sess -g @cross-test 2>&1 | Out-String
 Test-Result "cross-tcp-cli-user" ($cli -match 'tcpval') "CLI verify: '$cli'"
 
 # Restore
-Send-Tcp $sess "set-option -g escape-time 500" | Out-Null
+Send-Tcp $sess "set-option -g escape-time 10" | Out-Null  # escape-time default is 10 since the #841 follow up (tmux 3.5+), 500 before
 
 # ============================================================
 # Cleanup

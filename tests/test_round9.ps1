@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 $PSMUX = Join-Path $PSScriptRoot "..\target\release\psmux.exe"
-if (!(Test-Path $PSMUX)) { $PSMUX = ".\target\release\psmux.exe" }
+if (!(Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe" }
 if (!(Test-Path $PSMUX)) { Write-Host "ERROR: psmux not found"; exit 1 }
 $S = "r9test"
 $S2 = "r9test2"

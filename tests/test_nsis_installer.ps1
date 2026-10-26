@@ -48,6 +48,12 @@ foreach ($path in @(
         break
     }
 }
+if (-not $makensis) {
+    # Missing NSIS = missing prerequisite, not a psmux defect: skip the whole
+    # suite cleanly so unattended sweeps count only real failures.
+    Write-Host "[SKIP] NSIS (makensis) not installed - install NSIS to run the installer suite" -ForegroundColor Yellow
+    exit 0
+}
 
 Write-Host "=" * 60
 Write-Host "PSMUX NSIS INSTALLER TEST"
@@ -196,8 +202,24 @@ if (-not $makensis) {
             Write-Test "Silent install /S /D=<tmpdir>"
             $testDir = Join-Path $env:TEMP "psmux-installer-test-$(Get-Random)"
             try {
-                # Run installer silently to a temp directory
-                $proc = Start-Process -FilePath $installerExe -ArgumentList "/S", "/D=$testDir" -Wait -PassThru -NoNewWindow
+                # Run installer silently to a temp directory. NOTE: pwsh7's
+                # Start-Process -Wait blocks on the ENTIRE process tree, and the
+                # installer's post-install step spawns a detached __warm__ psmux
+                # server that never exits -- which hung this to the harness
+                # timeout. Wait only on the installer's own PID, then reap any
+                # warm server it spawned.
+                $proc = Start-Process -FilePath $installerExe -ArgumentList "/S", "/D=$testDir" -PassThru -NoNewWindow
+                # The installer's post-install ExecWait's on `psmux warmup`, which
+                # spawns a persistent warm server that never exits -> the installer
+                # process itself blocks. Reap warm servers in a poll loop so the
+                # ExecWait returns and the installer exits promptly.
+                $deadline = [DateTime]::Now.AddSeconds(30)
+                while (-not $proc.HasExited -and [DateTime]::Now -lt $deadline) {
+                    Get-Process psmux,pmux,tmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+                    Start-Sleep -Milliseconds 400
+                }
+                if (-not $proc.HasExited) { try { $proc.Kill() } catch {} }
+                Get-Process psmux,pmux,tmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
                 if ($proc.ExitCode -eq 0) {
                     Write-Pass "Silent install completed (exit code 0)"
                 } else {
@@ -248,39 +270,87 @@ if (-not $makensis) {
                 Write-Test "Silent uninstall"
                 $uninstaller = Join-Path $testDir "uninstall.exe"
                 if (Test-Path $uninstaller) {
-                    $proc = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-                    Start-Sleep -Seconds 2
+                    # Kill any warm server holding the installed exes open BEFORE
+                    # uninstalling, so the uninstaller can delete them. Do NOT kill
+                    # during the uninstall (that interrupts its file/registry
+                    # cleanup); the uninstaller does not itself spawn a warmup, so
+                    # a plain bounded WaitForExit on its own PID is enough.
+                    Get-Process psmux,pmux,tmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+                    Start-Sleep -Seconds 1
+                    $proc = Start-Process -FilePath $uninstaller -ArgumentList "/S" -PassThru -NoNewWindow
+                    if (-not $proc.WaitForExit(60000)) { try { $proc.Kill() } catch {} }
                     if ($proc.ExitCode -eq 0) {
-                        Write-Pass "Silent uninstall completed (exit code 0)"
+                        Write-Pass "Silent uninstall launched (exit code 0)"
                     } else {
                         Write-Fail "Silent uninstall exited with code: $($proc.ExitCode)"
                     }
 
                     # ── Test 14: Files removed after uninstall ─────────
+                    # CRITICAL: an NSIS uninstaller copies itself to %TEMP% and
+                    # re-execs, so it can delete its own install dir. The launched
+                    # process exits immediately; the real file/registry removal
+                    # happens ASYNC in that temp copy ~several seconds later.
+                    # Poll for actual completion instead of checking immediately.
                     Write-Test "Files removed after uninstall"
-                    $cleanedUp = $true
-                    foreach ($bin in @("psmux.exe", "pmux.exe", "tmux.exe")) {
-                        if (Test-Path (Join-Path $testDir $bin)) {
-                            Write-Fail "File still exists after uninstall: $bin"
-                            $cleanedUp = $false
-                        }
+                    $bins = @("psmux.exe", "pmux.exe", "tmux.exe")
+                    $cleanedUp = $false
+                    for ($w = 0; $w -lt 20; $w++) {
+                        $anyLeft = $false
+                        foreach ($bin in $bins) { if (Test-Path (Join-Path $testDir $bin)) { $anyLeft = $true; break } }
+                        if (-not $anyLeft) { $cleanedUp = $true; break }
+                        Start-Sleep -Seconds 1
                     }
                     if ($cleanedUp) {
                         Write-Pass "All binaries removed by uninstaller"
+                    } else {
+                        foreach ($bin in $bins) {
+                            if (Test-Path (Join-Path $testDir $bin)) { Write-Fail "File still exists after uninstall: $bin" }
+                        }
                     }
 
-                    # ── Test 15: Registry cleaned up ───────────────────
+                    # ── Test 15: Registry cleaned up (also part of the async pass) ─
                     Write-Test "Registry cleaned after uninstall"
-                    if (-not (Test-Path $regPath)) {
+                    $regGone = $false
+                    for ($w = 0; $w -lt 10; $w++) {
+                        if (-not (Test-Path $regPath)) { $regGone = $true; break }
+                        Start-Sleep -Seconds 1
+                    }
+                    if ($regGone) {
                         Write-Pass "Registry uninstall key removed"
                     } else {
                         Write-Fail "Registry key still present after uninstall"
+                    }
+
+                    # ── Test 16: user PATH entry removed by the uninstaller ─
+                    # Same async caveat as Tests 14/15. Verified live 2026-08-20:
+                    # the release uninstaller removes its entry correctly; this
+                    # assertion keeps it that way.
+                    Write-Test "User PATH entry removed after uninstall"
+                    $pathGone = $false
+                    for ($w = 0; $w -lt 10; $w++) {
+                        $up = [Environment]::GetEnvironmentVariable("Path", "User")
+                        if (($up -split ';') -notcontains $testDir) { $pathGone = $true; break }
+                        Start-Sleep -Seconds 1
+                    }
+                    if ($pathGone) {
+                        Write-Pass "User PATH entry removed"
+                    } else {
+                        Write-Fail "User PATH still contains the install dir after uninstall"
                     }
                 }
             } finally {
                 # Cleanup temp dir if it still exists
                 if (Test-Path $testDir) {
                     Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "rd", "/s", "/q", $testDir -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                }
+                # Scrub the user PATH entry the installer added, plus any stale
+                # entries older aborted runs left behind. A run that died before
+                # its uninstaller finished leaked a psmux-installer-test-* PATH
+                # entry that dangled forever (found live on the dev machine).
+                $up = [Environment]::GetEnvironmentVariable("Path", "User")
+                if ($up -match 'psmux-installer-test-') {
+                    $cleanPath = ($up -split ';' | Where-Object { $_ -notmatch 'psmux-installer-test-' }) -join ';'
+                    [Environment]::SetEnvironmentVariable("Path", $cleanPath, "User")
                 }
             }
         } else {

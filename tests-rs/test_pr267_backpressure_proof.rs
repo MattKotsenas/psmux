@@ -24,7 +24,12 @@ fn push_frame_slot_holds_only_newest_after_burst() {
     // Clean up any prior registration
     shutdown_client_stream(client_id);
 
-    let slot = register_frame_channel(client_id);
+    // The writer thread's wake channel. `register_frame_channel` pokes it on
+    // every empty->full transition so the writer does not have to wait out its
+    // own response-channel timeout to notice a frame. The receiver is held for
+    // the life of the test so the sender stays live.
+    let (poke_tx, poke_rx) = std::sync::mpsc::channel::<WriterWake>();
+    let slot = register_frame_channel(client_id, poke_tx);
 
     // Push a burst of stale frames, then the one we care about.
     assert!(BURST_SIZE > 1, "precondition: burst must exceed slot capacity (1)");
@@ -47,6 +52,18 @@ fn push_frame_slot_holds_only_newest_after_burst() {
         second.is_none(),
         "slot should hold at most one frame; second take must be empty",
     );
+
+    // A burst must not queue one wake per push. The writer reads the slot, not
+    // the messages, so a poke per frame would be pure wakeups: 21 pushes here
+    // deliver one frame and must cost one wake.
+    let pokes = poke_rx.try_iter().count();
+    assert_eq!(
+        pokes, 1,
+        "{} pushes into an unread slot queued {} wakes; only the empty->full \
+         transition may poke, or a flooding pane wakes the writer per batch",
+        BURST_SIZE + 1,
+        pokes,
+    );
 }
 
 /// PR #267's original intent: saturated frame queue delivers latest snapshot.
@@ -58,7 +75,8 @@ fn push_frame_replaces_stale_backlog() {
     let client_id = u64::MAX - 246;
     shutdown_client_stream(client_id);
 
-    let slot = register_frame_channel(client_id);
+    let (poke_tx, _poke_rx) = std::sync::mpsc::channel::<WriterWake>();
+    let slot = register_frame_channel(client_id, poke_tx);
     assert!(BURST_SIZE > 1, "precondition: burst must exceed slot capacity (1)");
     for idx in 0..BURST_SIZE {
         push_frame(&format!("stale-{idx}"));

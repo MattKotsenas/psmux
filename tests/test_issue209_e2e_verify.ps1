@@ -216,17 +216,18 @@ if ($out -eq "hello world") { Write-Pass "Message is 'hello world', -d consumed 
 elseif ($out -match "5000") { Write-Fail "BUG: -d value '5000' leaked into message: $out" }
 else { Write-Fail "Unexpected output: $out" }
 
-# 5b: -p -I: the -I value must NOT appear in message
-Write-Host "[5b] CLI: display-message -p -I /dev/stdin 'test msg'" -ForegroundColor Yellow
-$out = (& $PSMUX display-message -t $SESSION -p -I "/dev/stdin" "test msg" 2>&1 | Out-String).Trim()
+# 5b: -p -I: -I is a boolean in tmux ("aCc:d:lINpt:F:v", cmd-display-message.c),
+# so it takes no value and the message is the one argument after it.
+Write-Host "[5b] CLI: display-message -p -I 'test msg'" -ForegroundColor Yellow
+$out = (& $PSMUX display-message -t $SESSION -p -I "test msg" 2>&1 | Out-String).Trim()
 Write-Host "     Output: [$out]"
-if ($out -eq "test msg") { Write-Pass "Message is 'test msg', -I consumed correctly" }
-elseif ($out -match "/dev/stdin") { Write-Fail "BUG: -I value leaked into message: $out" }
+if ($out -eq "test msg") { Write-Pass "Message is 'test msg', -I consumed as a flag" }
+elseif ($out -match "-I") { Write-Fail "BUG: -I leaked into message: $out" }
 else { Write-Fail "Unexpected output: $out" }
 
 # 5c: Both -d and -I together
-Write-Host "[5c] CLI: display-message -p -d 1000 -I input 'combo test'" -ForegroundColor Yellow
-$out = (& $PSMUX display-message -t $SESSION -p -d 1000 -I "input" "combo test" 2>&1 | Out-String).Trim()
+Write-Host "[5c] CLI: display-message -p -d 1000 -I 'combo test'" -ForegroundColor Yellow
+$out = (& $PSMUX display-message -t $SESSION -p -d 1000 -I "combo test" 2>&1 | Out-String).Trim()
 Write-Host "     Output: [$out]"
 if ($out -eq "combo test") { Write-Pass "Both -d and -I consumed, message correct" }
 else { Write-Fail "Combined flags failed: $out" }
@@ -245,11 +246,14 @@ Write-Host "`n=== TEST 6: send-keys -X ===" -ForegroundColor Cyan
 
 # 6a: send-keys -X should NOT send literal "-X" to the pane
 Write-Host "[6a] CLI: send-keys -X cancel" -ForegroundColor Yellow
-& $PSMUX send-keys -t $SESSION -X cancel 2>&1 | Out-Null
+# The pane is in no mode here, so tmux (cmd-send-keys.c) answers
+# "not in a mode" at exit 1; psmux does the same since the copy mode parity
+# batch. Before that it silently entered copy mode and exited 0.
+$err6a = (& $PSMUX send-keys -t $SESSION -X cancel 2>&1 | Out-String).Trim()
 $rc = $LASTEXITCODE
-Write-Host "     Exit code: $rc"
-if ($rc -eq 0) { Write-Pass "send-keys -X exits cleanly" }
-else { Write-Fail "send-keys -X exited with $rc" }
+Write-Host "     Exit code: $rc  stderr: $err6a"
+if ($rc -eq 1 -and $err6a -match 'not in a mode') { Write-Pass "send-keys -X outside a mode is refused like tmux" }
+else { Write-Fail "send-keys -X outside a mode: rc $rc '$err6a' (tmux: 1 'not in a mode')" }
 
 # 6b: Verify -X didn't type literal "-X" into the pane
 Write-Host "[6b] Proof: capture-pane should not have literal '-X'" -ForegroundColor Yellow
@@ -348,13 +352,15 @@ Write-Host "     Lines: $gvSepCount"
 if ($gvSepCount -eq $gvCount) { Write-Pass "Separate -g -v matches combined -gv ($gvSepCount lines)" }
 else { Write-Fail "Mismatch: -gv=$gvCount lines, -g -v=$gvSepCount lines" }
 
-# 8e: -wv (window options, values only)
-Write-Host "[8e] CLI: show-options -wv" -ForegroundColor Yellow
-$wvOut = (& $PSMUX show-options -wv -t $SESSION 2>&1 | Out-String).Trim()
+# 8e: -wgv (window options, values only)
+# #655: a plain -wv is the target window's OWN table, empty until something is
+# written to that window, so the full window catalog is read with -g.
+Write-Host "[8e] CLI: show-options -wgv" -ForegroundColor Yellow
+$wvOut = (& $PSMUX show-options -wgv -t $SESSION 2>&1 | Out-String).Trim()
 $wvCount = ($wvOut -split "`n" | Where-Object { $_.Trim() -ne "" }).Count
 Write-Host "     Lines: $wvCount"
-if ($wvCount -gt 0) { Write-Pass "show-options -wv returns $wvCount window option values" }
-else { Write-Fail "show-options -wv returned empty" }
+if ($wvCount -gt 0) { Write-Pass "show-options -wgv returns $wvCount window option values" }
+else { Write-Fail "show-options -wgv returned empty" }
 
 # 8f: -gv with specific option name
 Write-Host "[8f] CLI: show-options -gv prefix" -ForegroundColor Yellow

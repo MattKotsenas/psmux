@@ -2,16 +2,20 @@
 #
 # IMPORTANT: `send-keys` modified-Enter is a SEPARATE code path from the
 # interactive keypress fix.  send-keys is dispatched server-side
-# (server/mod.rs -> parse_modified_special_key) and has always emitted xterm
-# CSI 13;N~ for every modified Enter (Ctrl, Shift, Alt), independent of the
-# interactive path's native injection.  The #409 fix targets the INTERACTIVE
-# path (a user pressing Ctrl+Enter); see test_issue409_ctrl_enter.ps1 for that
-# proof.  This test locks in the send-keys route so the interactive fix does
-# NOT accidentally change scripted send-keys behavior.
+# (server/mod.rs -> parse_modified_special_key).  This test locks in the bytes
+# that route delivers so an interactive change cannot silently alter scripted
+# send-keys behaviour.
+#
+# History: until #611 the route emitted xterm CSI 13;N~ for every modified
+# Enter.  Measured in #611, a ReadConsoleInput reader gets ZERO records for
+# that form and a VT-input (node raw mode) reader gets the raw CSI bytes,
+# which no node TUI maps to a modified Enter.  Since #611 the route mirrors
+# encode_key_event, i.e. what a real keystroke produces and what tmux writes
+# for M-Enter (`` prefix then CR):
 #   send-keys Enter    -> 0x0D (CR)            plain Enter
-#   send-keys C-Enter  -> CSI 13;5~            server-side xterm encoding (unchanged)
-#   send-keys S-Enter  -> CSI 13;2~            server-side xterm encoding (unchanged)
-#   send-keys M-Enter  -> CSI 13;3~            server-side xterm encoding (unchanged)
+#   send-keys C-Enter  -> 0x0A (LF)            same as the interactive #409 fix
+#   send-keys S-Enter  -> 1b 0d                ESC CR, what libuv reports as meta+return
+#   send-keys M-Enter  -> 1b 0d                ESC CR, tmux M-Enter parity
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "issue409sk"
@@ -43,10 +47,10 @@ function SendKeyCheck($key,$expectHex,$label){
 }
 
 Write-Host "`n=== #409 send-keys path (server-side, separate from interactive fix) ===" -ForegroundColor Cyan
-SendKeyCheck "Enter"   "0d"                      "Enter"
-SendKeyCheck "C-Enter" "1b 5b 31 33 3b 35 7e"    "C-Enter (CSI 13;5~)"
-SendKeyCheck "S-Enter" "1b 5b 31 33 3b 32 7e"    "S-Enter (CSI 13;2~)"
-SendKeyCheck "M-Enter" "1b 5b 31 33 3b 33 7e"    "M-Enter (CSI 13;3~)"
+SendKeyCheck "Enter"   "^BYTES: 0d$"                    "Enter"
+SendKeyCheck "C-Enter" "^BYTES: 0a$"                    "C-Enter (LF, #409)"
+SendKeyCheck "S-Enter" "^BYTES: 1b 0d$"                 "S-Enter (ESC CR, #611)"
+SendKeyCheck "M-Enter" "^BYTES: 1b 0d$"                 "M-Enter (ESC CR, tmux parity)"
 
 & $PSMUX kill-session -t $SESSION 2>&1 | Out-Null
 try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}

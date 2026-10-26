@@ -86,18 +86,19 @@ Write-Host "`n=== Issue #242: PageUp enters copy mode ===" -ForegroundColor Cyan
 # ============================================================
 Write-Host "`n--- Part A: list-keys verification ---" -ForegroundColor Yellow
 
-# Test 1: PageUp binding appears in root table via list-keys
-Write-Host "[Test 1] PageUp root table binding in list-keys" -ForegroundColor Yellow
+# Test 1: PageUp binding lives in the PREFIX table, not root (issue #488,
+# tmux parity: tmux binds PPage only in the prefix table, so a bare PageUp
+# reaches the running application).
+Write-Host "[Test 1] PageUp prefix table binding in list-keys (tmux parity, #488)" -ForegroundColor Yellow
 $keys = & $PSMUX list-keys -t $SESSION 2>&1 | Out-String
-if ($keys -match "bind-key.*-T root.*PageUp.*copy-mode -u") {
-    Write-Pass "PageUp -> copy-mode -u found in root table"
+$inPrefix = $keys -match "(?i)prefix.*(PageUp|PPage).*copy-mode"
+$inRoot = $keys -match "(?i)-T root.*(PageUp|PPage).*copy-mode"
+if ($inPrefix -and -not $inRoot) {
+    Write-Pass "PageUp -> copy-mode -u in prefix table only (tmux default)"
+} elseif ($inRoot) {
+    Write-Fail "PageUp must NOT be bound in root table by default (issue #488). Keys output:`n$keys"
 } else {
-    # Also check for PPage or page-up variants
-    if ($keys -match "(?i)root.*(PageUp|PPage|page-up).*copy-mode") {
-        Write-Pass "PageUp -> copy-mode found in root table (alternate name)"
-    } else {
-        Write-Fail "PageUp binding not found in root table. Keys output:`n$keys"
-    }
+    Write-Fail "PageUp binding not found in prefix table. Keys output:`n$keys"
 }
 
 # Test 2: prefix [ still works for copy-mode
@@ -278,13 +279,14 @@ if ($LASTEXITCODE -eq 0) {
     & $PSMUX send-keys -t $SESSION_TUI Escape 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
     
-    # Test 10: list-keys from TUI session shows root PageUp binding
-    Write-Host "[Test 10] TUI list-keys includes root PageUp" -ForegroundColor Yellow
+    # Test 10: list-keys from TUI session shows the PREFIX PageUp binding
+    # (issue #488 tmux parity: no root PageUp default).
+    Write-Host "[Test 10] TUI list-keys includes prefix PageUp" -ForegroundColor Yellow
     $tuiKeys = & $PSMUX list-keys -t $SESSION_TUI 2>&1 | Out-String
-    if ($tuiKeys -match "(?i)root.*(PageUp|PPage)") {
-        Write-Pass "TUI root table has PageUp binding"
+    if ($tuiKeys -match "(?i)prefix.*(PageUp|PPage)") {
+        Write-Pass "TUI prefix table has PageUp binding (tmux parity)"
     } else {
-        Write-Fail "TUI root table missing PageUp binding"
+        Write-Fail "TUI prefix table missing PageUp binding"
     }
 } else {
     Write-Fail "TUI session failed to start"

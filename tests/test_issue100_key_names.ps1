@@ -8,6 +8,10 @@
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_issue100_key_names.ps1
 
 $ErrorActionPreference = "Continue"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and a developer's shell may have it set, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 

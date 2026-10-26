@@ -15,7 +15,7 @@ $SESSION = "issue380_esc"
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $injectorExe = "$env:TEMP\psmux_injector.exe"
 $readerLog = "$env:TEMP\esc_reader_380.log"
-$readerPy = (Resolve-Path "tests\esc_reader.py").Path
+$readerPy = (Resolve-Path "$PSScriptRoot\esc_reader.py").Path
 $py = (Get-Command python -EA Stop).Source
 
 $script:Pass = 0; $script:Fail = 0

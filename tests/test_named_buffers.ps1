@@ -106,7 +106,7 @@ psmux set-buffer "POSITIONAL_DATA"
 $lb = psmux list-buffers -t $session
 Info "list-buffers:"
 $lb -split "`n" | ForEach-Object { Info "  $_" }
-$has_positional = $lb -match "buffer0"
+$has_positional = $lb -match 'buffer\d+: \d+ bytes: "POSITIONAL_DATA"'
 $has_named = $lb -match "mybuf|buf_one"
 if ($has_positional -and $has_named) {
     Pass "list-buffers shows both positional and named buffers"

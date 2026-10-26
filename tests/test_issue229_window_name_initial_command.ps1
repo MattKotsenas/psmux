@@ -642,7 +642,21 @@ Cleanup -Name $SESSION_TUI
 # Start-Process with -PassThru creates a new console window (separate process)
 # Use -d (detached) for server launch, then attach in a separate visible window
 # Note: using array form for ArgumentList; Start-Process joins with spaces
-& $PSMUX new-session -d -s $SESSION_TUI "timeout /T 120"
+#
+# NOTE on /nobreak: attaching a separate client to an already-running detached
+# session sends `client-size` for the client's real terminal dimensions, which
+# resizes the ConPTY pane. That resize is a genuine Windows console input
+# event (WINDOW_BUFFER_SIZE_EVENT), and plain `timeout /T N` (without
+# /nobreak) aborts on ANY console input event, not just real keypresses --
+# this is a well-known standalone Windows `timeout.exe` quirk, reproducible
+# with no psmux involved at all (e.g. resizing a normal cmd.exe window while
+# `timeout /T 30` counts down also cancels it). Without /nobreak, that early
+# exit (combined with the tmux-parity default `remain-on-exit off`) destroyed
+# the whole session milliseconds after attach, which surfaced here as
+# "TUI: Session creation failed" even though session creation itself was
+# fine. /nobreak makes the countdown immune to non-Ctrl+C input so the
+# window-name check below observes the pane actually alive.
+& $PSMUX new-session -d -s $SESSION_TUI "timeout /T 120 /nobreak"
 Start-Sleep -Seconds 3
 # Now launch a visible TUI that attaches to this session
 $proc = Start-Process -FilePath $PSMUX -ArgumentList 'attach-session','-t',$SESSION_TUI -PassThru

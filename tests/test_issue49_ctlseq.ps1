@@ -31,7 +31,14 @@ function Wait-For-Psmux {
 
 function Send-Keys {
     param([string]$Keys, [int]$DelayMs = 200)
-    psmux send-keys -t $script:SESSION $Keys 2>$null
+    # #490: send-keys no longer splits an argument on whitespace, so a
+    # trailing " Enter" INSIDE the string would be typed literally (matching
+    # tmux). Split the trailing key name off and pass it as its own argument.
+    if ($Keys -match '^(.*)\s+(Enter|C-m|Escape|Tab)$') {
+        psmux send-keys -t $script:SESSION $Matches[1] $Matches[2] 2>$null
+    } else {
+        psmux send-keys -t $script:SESSION $Keys 2>$null
+    }
     Start-Sleep -Milliseconds $DelayMs
 }
 

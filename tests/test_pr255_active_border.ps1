@@ -85,13 +85,28 @@ try {
     $activeId = (& $psmux display-message -t $session -p '#{pane_id}' 2>$null).Trim()
     if ($activeId) { Pass "TUI: select-pane works in 4-pane layout (active=$activeId)" } else { Fail "TUI: no active pane id reported" }
 
-    # Verify capture-pane works for each pane (proves no rendering crash)
-    $allCaptured = $true
+    # Verify capture-pane works for each pane (proves no rendering crash).
+    #
+    # The plain capture path trims trailing blank rows, so a pane whose shell
+    # has not printed its prompt yet captures as NOTHING with exit 0. One read
+    # 600 ms after the third split read that as a failure whenever that shell
+    # was still booting inside the pool's refill surge (sweeps 2026-10-05 and
+    # 2026-10-06, 0 of 6 standalone), which is not a rendering crash. So each
+    # pane is polled for its prompt, and only a non zero exit or a pane that
+    # never shows one fails.
+    $allCaptured = $true; $slow = @()
     foreach ($p in (& $psmux list-panes -t $session -F '#{pane_id}' 2>$null)) {
-        $cap = & $psmux capture-pane -t $p -p 2>$null
-        if ($null -eq $cap) { $allCaptured = $false; break }
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $false
+        while ($sw.ElapsedMilliseconds -lt 8000) {
+            $cap = & $psmux capture-pane -t $p -p 2>$null
+            if ($LASTEXITCODE -ne 0) { break }
+            if (($cap -join "`n") -match '\S') { $ok = $true; break }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $ok) { $allCaptured = $false; $slow += "$p rc=$LASTEXITCODE after $($sw.ElapsedMilliseconds)ms"; break }
+        if ($sw.ElapsedMilliseconds -gt 1500) { $slow += "$p prompt after $($sw.ElapsedMilliseconds)ms" }
     }
-    if ($allCaptured) { Pass "TUI: capture-pane works for all 4 panes" } else { Fail "TUI: capture-pane failed for some pane" }
+    if ($allCaptured) { Pass "TUI: capture-pane shows content for all 4 panes$(if ($slow) { ' (' + ($slow -join ', ') + ')' })" } else { Fail "TUI: capture-pane failed for some pane ($($slow -join ', '))" }
 
     if ($proc -and -not $proc.HasExited) { $proc | Stop-Process -Force }
 

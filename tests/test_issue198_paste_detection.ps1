@@ -165,7 +165,7 @@ Write-Host "`n[Test 8] WriteConsoleInput: characters with paste-detection off" -
 $injectorExe = "$env:TEMP\psmux_injector.exe"
 if (-not (Test-Path $injectorExe)) {
     $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-    & $csc /nologo /optimize /out:$injectorExe "C:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs" 2>&1 | Out-Null
+    & $csc /nologo /optimize /out:$injectorExe "$PSScriptRoot\injector.cs" 2>&1 | Out-Null
 }
 
 $injectSession = "test_198_inject"

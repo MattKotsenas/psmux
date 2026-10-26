@@ -55,20 +55,26 @@ if ($bytes.Length -eq 0) {
     Write-Pass "Got $($bytes.Length) bytes of output - reporter's claim REFUTED"
 }
 
-# === Test 2: First bytes are DCS opener \x1bP1000p\n ===
+# === Test 2: First bytes are DCS opener \x1bP1000p (no trailing newline) ===
 Write-Host "`n[Test 2] DCS opener bytes" -ForegroundColor Yellow
-$dcsExpected = [byte[]]@(0x1B, 0x50, 0x31, 0x30, 0x30, 0x30, 0x70, 0x0A)
-if ($bytes.Length -ge 8) {
-    $first8 = $bytes[0..7]
+# Real tmux (tmux/control.c control_start()) writes exactly 7 bytes for the
+# DCS opener with NO trailing newline -- the next byte on the wire is '%'
+# from the immediately-following "%begin ..." line (see
+# src/server/connection.rs's own comment on this). This was previously
+# expecting an 8th byte of 0x0A that tmux never sends, which made every
+# real (correct) response -- e.g. "...70 25" ('%') -- look like a mismatch.
+$dcsExpected = [byte[]]@(0x1B, 0x50, 0x31, 0x30, 0x30, 0x30, 0x70)
+if ($bytes.Length -ge 7) {
+    $first7 = $bytes[0..6]
     $match = $true
-    for ($i = 0; $i -lt 8; $i++) {
-        if ($first8[$i] -ne $dcsExpected[$i]) { $match = $false; break }
+    for ($i = 0; $i -lt 7; $i++) {
+        if ($first7[$i] -ne $dcsExpected[$i]) { $match = $false; break }
     }
     if ($match) {
-        Write-Pass "DCS opener \x1bP1000p\n found at byte 0"
+        Write-Pass "DCS opener \x1bP1000p found at byte 0"
     } else {
-        $hex = ($first8 | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
-        Write-Fail "DCS opener not found. First 8 bytes: $hex"
+        $hex = ($first7 | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+        Write-Fail "DCS opener not found. First 7 bytes: $hex"
     }
 } else {
     Write-Fail "Not enough bytes for DCS check (got $($bytes.Length))"
@@ -141,17 +147,17 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 $ccBytes = $ms.ToArray()
 Write-Host "  Received $($ccBytes.Length) bytes within 3 seconds"
 
-if ($ccBytes.Length -ge 8) {
-    $first8cc = $ccBytes[0..7]
+if ($ccBytes.Length -ge 7) {
+    $first7cc = $ccBytes[0..6]
     $matchDCS = $true
-    for ($i = 0; $i -lt 8; $i++) {
-        if ($first8cc[$i] -ne $dcsExpected[$i]) { $matchDCS = $false; break }
+    for ($i = 0; $i -lt 7; $i++) {
+        if ($first7cc[$i] -ne $dcsExpected[$i]) { $matchDCS = $false; break }
     }
     if ($matchDCS) {
         Write-Pass "DCS emitted immediately on interactive -CC attach (NOT frozen)"
     } else {
-        $hex = ($first8cc | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
-        Write-Fail "First 8 bytes not DCS: $hex"
+        $hex = ($first7cc | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+        Write-Fail "First 7 bytes not DCS: $hex"
     }
 } elseif ($ccBytes.Length -eq 0) {
     Write-Fail "ZERO bytes in 3 seconds - process froze before DCS (reporter's claim CONFIRMED)"
@@ -285,17 +291,17 @@ if ((Test-Path $portFile) -and (Test-Path $keyFile)) {
         $tcpBytes = $allBytes.ToArray()
         Write-Host "  Received $($tcpBytes.Length) bytes after CONTROL_NOECHO"
         
-        if ($tcpBytes.Length -ge 8) {
-            $tcpFirst8 = $tcpBytes[0..7]
+        if ($tcpBytes.Length -ge 7) {
+            $tcpFirst7 = $tcpBytes[0..6]
             $tcpDCS = $true
-            for ($i = 0; $i -lt 8; $i++) {
-                if ($tcpFirst8[$i] -ne $dcsExpected[$i]) { $tcpDCS = $false; break }
+            for ($i = 0; $i -lt 7; $i++) {
+                if ($tcpFirst7[$i] -ne $dcsExpected[$i]) { $tcpDCS = $false; break }
             }
             if ($tcpDCS) {
                 Write-Pass "TCP: DCS opener emitted after CONTROL_NOECHO"
             } else {
-                $hex = ($tcpFirst8 | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
-                Write-Fail "TCP: First 8 bytes not DCS: $hex"
+                $hex = ($tcpFirst7 | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+                Write-Fail "TCP: First 7 bytes not DCS: $hex"
             }
         } elseif ($tcpBytes.Length -eq 0) {
             Write-Fail "TCP: ZERO bytes after CONTROL_NOECHO (no DCS emitted)"
@@ -334,8 +340,14 @@ if ((Test-Path $portFile) -and (Test-Path $keyFile)) {
     Write-Fail "Port/key files not found"
 }
 
-# === Test 9: No bootstrap notification burst between DCS and first command ===
-Write-Host "`n[Test 9] No spurious notification burst after DCS (tmux doesn't send one)" -ForegroundColor Yellow
+# === Test 9: Only the documented bootstrap burst appears between DCS and
+# the first command -- %window-add / %sessions-changed / %session-changed
+# ARE expected here (src/control.rs emit_initial_state()): its own comment
+# explains that without them "iTerm2 sits forever on -CC attach because it
+# expects %session-changed / %window-add up front." What must NOT appear
+# this early is anything gated on iTerm's acceptNotifications_ (e.g.
+# %layout-change), which only opens after the kickoff command sequence.
+Write-Host "`n[Test 9] Only the documented initial-state burst appears after DCS" -ForegroundColor Yellow
 try {
     $tcp2 = [System.Net.Sockets.TcpClient]::new("127.0.0.1", [int]$port)
     $tcp2.NoDelay = $true; $tcp2.ReceiveTimeout = 5000
@@ -362,12 +374,15 @@ try {
     } catch {}
     
     $initText = [System.Text.Encoding]::UTF8.GetString($initBytes.ToArray())
-    # DCS opener is binary, strip it. Check for notification keywords
-    $hasNotifBurst = ($initText -match '%sessions-changed') -or ($initText -match '%window-add') -or ($initText -match '%layout-change')
-    if (-not $hasNotifBurst) {
-        Write-Pass "No bootstrap notification burst after DCS (matches real tmux)"
+    # %window-add / %sessions-changed / %session-changed are the documented,
+    # required initial-state burst (see src/control.rs emit_initial_state).
+    # Anything gated behind iTerm's acceptNotifications_ flag (e.g.
+    # %layout-change) must NOT show up this early.
+    $hasGatedNotif = $initText -match '%layout-change'
+    if (-not $hasGatedNotif) {
+        Write-Pass "No prematurely-gated notifications after DCS (matches real tmux)"
     } else {
-        Write-Fail "Spurious notification burst detected after DCS (tmux doesn't do this)"
+        Write-Fail "Gated notification (%layout-change) leaked before acceptNotifications_ opens"
     }
     
     $tcp2.Close()

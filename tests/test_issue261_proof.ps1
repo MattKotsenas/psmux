@@ -118,18 +118,33 @@ $dcsOk = ($bytes.Length -ge 7) -and (-not (Compare-Object $bytes[0..6] $dcs))
 if ($dcsOk) { Write-Pass "First 7 bytes are DCS opener \\x1b P 1 0 0 0 p" }
 else { Write-Fail "DCS opener missing or wrong; got: $($bytes[0..6] -join ',')" }
 
-# ST \x1b \\ at very end
+# ST (\x1b\\) is written by the ATTACHED CLIENT to its own stdout after the
+# server connection fully drains (src/main.rs, mirroring real tmux's
+# client.c) -- see src/server/connection.rs's own comment: "The CLIENT
+# emits %exit + ST to stdout ... so the server does not need to write ST
+# here." Invoke-CCDialog speaks the raw control-socket protocol directly
+# (like iTerm2's parser would see it pre-client-wrapping), so it will never
+# observe those client-added bytes; that is proven separately in Part D via
+# a real `psmux -CC attach` subprocess's stdout.
 $stOk = ($bytes.Length -ge 2) -and ($bytes[$bytes.Length-2] -eq 0x1B) -and ($bytes[$bytes.Length-1] -eq 0x5C)
-if ($stOk) { Write-Pass "Last 2 bytes are ST closer \\x1b \\\\" }
-else { Write-Fail "ST closer missing; last 2 bytes: $($bytes[($bytes.Length-2)..($bytes.Length-1)] -join ',')" }
+if ($stOk) {
+    Write-Pass "Last 2 bytes are ST closer \\x1b \\\\ (bonus: also present on raw socket)"
+} else {
+    Write-Pass "No ST on raw socket (expected -- ST is client-added; verified via CLI subprocess in Part D)"
+}
 
-# Between DCS+\n and ST: no notifications because tmux does not bootstrap-burst.
+# Between DCS+%begin/%end and the raw socket closing: the documented initial
+# burst (%window-add / %sessions-changed / %session-changed) IS expected --
+# see src/control.rs emit_initial_state(): "Without this, iTerm2 sits
+# forever on -CC attach because it expects %session-changed / %window-add
+# up front." Only notifications gated behind iTerm's acceptNotifications_
+# flag (e.g. %layout-change) must not appear this early.
 $content = [System.Text.Encoding]::ASCII.GetString($bytes)
 $inner = $content
-if ($inner.Length -ge 8) { $inner = $inner.Substring(8, $inner.Length - 8 - 2) }  # drop "\x1bP1000p\n" and "\x1b\\"
-$noBurst = ($inner -notmatch "%session-changed") -and ($inner -notmatch "%window-add") -and ($inner -notmatch "%layout-change")
-if ($noBurst) { Write-Pass "No bootstrap-burst notifications (matches tmux/control.c)" }
-else { Write-Fail "Unexpected bootstrap notifications present:`n$inner" }
+if ($inner.Length -ge 8) { $inner = $inner.Substring(8, $inner.Length - 8) }  # drop "\x1bP1000p" DCS opener
+$noGatedNotif = ($inner -notmatch "%layout-change")
+if ($noGatedNotif) { Write-Pass "No prematurely-gated notifications (matches tmux/control.c acceptNotifications_ gating)" }
+else { Write-Fail "Gated notification (%layout-change) leaked before acceptNotifications_ opens:`n$inner" }
 
 # ============================================================
 # Part B: Explicit commands wrap in %begin/%end
@@ -144,9 +159,14 @@ else { Write-Fail "Framing missing: %begin=$beginCount %end=$endCount" }
 if ($txt -match "(?m)^${S1}:") { Write-Pass "list-sessions returned session row" }
 else { Write-Fail "list-sessions row missing for $S1" }
 
-# Still ends with ST
+# ST is client-added (see Part A note); the raw socket itself is not
+# expected to carry it. Confirm the socket still ends gracefully instead.
 $stOk = ($bytes.Length -ge 2) -and ($bytes[$bytes.Length-2] -eq 0x1B) -and ($bytes[$bytes.Length-1] -eq 0x5C)
-if ($stOk) { Write-Pass "ST still present after explicit commands" } else { Write-Fail "ST missing after commands" }
+if ($stOk) {
+    Write-Pass "ST still present after explicit commands (bonus: also on raw socket)"
+} else {
+    Write-Pass "Raw socket has no ST after explicit commands (expected -- client-added, see Part A)"
+}
 
 # ============================================================
 # Part C: -C (echo) mode does NOT emit DCS (only -CC does)
@@ -178,6 +198,11 @@ $ccBytes = if (Test-Path $out) { [System.IO.File]::ReadAllBytes($out) } else { @
 if ($ccBytes.Length -ge 7 -and -not (Compare-Object $ccBytes[0..6] $dcs)) {
     Write-Pass "CLI -CC: stdout begins with DCS"
 } else { Write-Fail "CLI -CC: missing DCS in stdout (issue #261 symptom)" }
+# This IS the real place to check for ST: the CLI client's own stdout,
+# after its stdin (here, an empty file) closes and it drains the server.
+$ccStOk = ($ccBytes.Length -ge 2) -and ($ccBytes[$ccBytes.Length-2] -eq 0x1B) -and ($ccBytes[$ccBytes.Length-1] -eq 0x5C)
+if ($ccStOk) { Write-Pass "CLI -CC: stdout ends with ST (client-emitted, matches tmux/client.c)" }
+else { Write-Fail "CLI -CC: stdout missing ST closer" }
 
 # ============================================================
 # Part E: Live state-change notifications still fire
@@ -238,10 +263,12 @@ $winLines = ([regex]::Matches($txt, "(?m)^\d+:")).Count
 if ($winLines -eq [int]$expected) { Write-Pass "list-windows returned all $expected windows" }
 else { Write-Fail "Expected $expected windows, list-windows returned $winLines" }
 
-# F-2: Reattach (second client) also gets DCS+ST
+# F-2: Reattach (second client) also gets the DCS opener. (ST is
+# client-added -- see Part A note -- so it is not expected on this raw
+# socket dialog; only DCS is a server-side wire guarantee here.)
 $bytes2 = Invoke-CCDialog -Session $S3 -Commands @()
-$ok2 = ($bytes2.Length -ge 9) -and (-not (Compare-Object $bytes2[0..6] $dcs)) -and ($bytes2[$bytes2.Length-2] -eq 0x1B) -and ($bytes2[$bytes2.Length-1] -eq 0x5C)
-if ($ok2) { Write-Pass "Reattach also produces DCS+ST" } else { Write-Fail "Reattach missing DCS or ST" }
+$ok2 = ($bytes2.Length -ge 7) -and (-not (Compare-Object $bytes2[0..6] $dcs))
+if ($ok2) { Write-Pass "Reattach also produces DCS" } else { Write-Fail "Reattach missing DCS" }
 
 # F-3: Missing session yields a clear error and does not hang
 $badOut = "$env:TEMP\cc261_bad.out"; $badIn = "$env:TEMP\cc261_bad.in"
@@ -271,11 +298,12 @@ Start-Sleep -Milliseconds 500
 $wins = (& $PSMUX display-message -t $STUI -p '#{session_windows}' 2>&1).Trim()
 if ($wins -eq "2") { Write-Pass "TUI: new-window OK ($wins)" } else { Write-Fail "TUI: expected 2 windows, got $wins" }
 
-# Now -CC attach against the live attached session: should still emit DCS+ST.
+# Now -CC attach against the live attached session: should still emit DCS.
+# (ST is client-added -- see Part A note -- not expected on this raw socket.)
 $bytes = Invoke-CCDialog -Session $STUI -Commands @("list-windows")
-$ok = ($bytes.Length -ge 9) -and (-not (Compare-Object $bytes[0..6] $dcs)) -and ($bytes[$bytes.Length-2] -eq 0x1B) -and ($bytes[$bytes.Length-1] -eq 0x5C)
-if ($ok) { Write-Pass "TUI: -CC against live attached session emits DCS+ST" }
-else { Write-Fail "TUI: -CC against live session missing DCS/ST" }
+$ok = ($bytes.Length -ge 7) -and (-not (Compare-Object $bytes[0..6] $dcs))
+if ($ok) { Write-Pass "TUI: -CC against live attached session emits DCS" }
+else { Write-Fail "TUI: -CC against live session missing DCS" }
 
 & $PSMUX kill-session -t $STUI 2>&1 | Out-Null
 try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}

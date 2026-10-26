@@ -27,6 +27,36 @@
 !ifndef REPO_DIR
   !define REPO_DIR ".."
 !endif
+; VIProductVersion must be numeric X.Y.Z.W, so a prerelease VERSION such as
+; 3.4.0-signtest passes its numeric part as VI_VERSION.
+!ifndef VI_VERSION
+  !define VI_VERSION "${VERSION}"
+!endif
+
+; ── Uninstaller signing (optional) ───────────────────────────────────────
+; WriteUninstaller emits uninstall.exe from inside makensis, so it cannot be
+; signed after the build. !uninstfinalize (NSIS 3.08+) runs a command on the
+; uninstaller before it is packed; %1 is the uninstaller's path.
+;
+;   SIGNTOOL + SIGN_THUMBPRINT  signtool.exe path and certificate SHA1; the
+;                               release workflow passes these after the
+;                               Certum login. Nothing here needs quoting on
+;                               the makensis command line.
+;   SIGN_CMD                    any full command containing "%1", for other
+;                               signers or for testing the hook locally.
+;
+; With none of them defined the installer builds unsigned, as before.
+!ifdef SIGNTOOL & SIGN_THUMBPRINT
+  !ifndef SIGN_CMD
+    !define SIGN_CMD '"${SIGNTOOL}" sign /sha1 ${SIGN_THUMBPRINT} /tr http://time.certum.pl /td SHA256 /fd SHA256 /d "psmux" "%1"'
+  !endif
+!endif
+!ifdef SIGN_CMD
+  !uninstfinalize '${SIGN_CMD}' = 0
+  !ifdef SIGNTOOL
+    !uninstfinalize '"${SIGNTOOL}" verify /pa /q "%1"' = 0
+  !endif
+!endif
 
 ; ── General ──────────────────────────────────────────────────────────────
 Name "psmux ${VERSION}"
@@ -35,10 +65,15 @@ InstallDir "$LOCALAPPDATA\psmux"
 InstallDirRegKey HKCU "Software\psmux" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
+; The three binaries are near identical copies. LZMA can only reuse the
+; first one inside its dictionary, and the default 8 MB is smaller than the
+; x64 psmux.exe (9.45 MB at 3.3.8+), so all three were stored in full: 6.8 MB
+; instead of 2.6 MB. 32 MB covers them (about 32 MB RAM while unpacking).
+SetCompressorDictSize 32
 Unicode True
 
 ; ── Version info embedded in the .exe ────────────────────────────────────
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${VI_VERSION}.0"
 VIAddVersionKey "ProductName" "psmux"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileDescription" "psmux - Terminal Multiplexer for Windows"
@@ -61,10 +96,12 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 ; ── Macros ───────────────────────────────────────────────────────────────
 ; Kill running psmux servers — used by both install and uninstall
 !macro KillPsmuxServers
-  ; Try graceful kill-server via existing installed binary
+  ; Try graceful kill-server via existing installed binary. `-a` because the
+  ; installer must free EVERY namespace's binary, not just the default one
+  ; (a bare kill-server is socket scoped since #649).
   IfFileExists "$INSTDIR\psmux.exe" 0 +3
-    DetailPrint "Running psmux kill-server..."
-    nsExec::ExecToLog '"$INSTDIR\psmux.exe" kill-server'
+    DetailPrint "Running psmux kill-server -a..."
+    nsExec::ExecToLog '"$INSTDIR\psmux.exe" kill-server -a'
 
   ; Force-kill any remaining processes
   DetailPrint "Force-killing remaining psmux/pmux/tmux processes..."
@@ -100,7 +137,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
     "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
-    "Publisher" "Josh"
+    "Publisher" "Godwin Sam Josh"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
     "URLInfoAbout" "https://github.com/psmux/psmux"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \

@@ -1,54 +1,67 @@
-// Issue #272: TTL cache for `#(cmd)` shell expansions in status-format.
+// Issue #272 + async #() format jobs.
 //
-// These tests prove the cache layer added in src/format.rs:
-//   1. First call spawns the subprocess (cache miss).
-//   2. Subsequent calls within TTL return the cached value WITHOUT spawning.
-//   3. Calls after TTL expiry re-spawn.
-//   4. Different commands have separate cache entries (no key collisions).
-//   5. status_interval=0 still caches with a 1s floor (so typing never
-//      pays the spawn cost on every state_dirty push).
+// run_shell_command is non-blocking: it spawns the subprocess on a background
+// thread, returns the last cached value (empty on the first call), and the
+// server loop drains completed results to refresh the cache. These tests prove
+// the async contract: the call never blocks, one worker runs per command per
+// TTL / in-flight window (dup guard + cache), TTL expiry re-spawns, distinct
+// commands are independent, the value reaches the caller after a drain, and the
+// cached value is the stdout (not the command text).
 //
-// Spawn detection strategy: the helper command appends a line to a unique
-// counter file each time it runs. We count file lines to prove how many
-// real subprocess spawns happened, regardless of what `expand_format`
-// returns. This is the irrefutable measurement.
+// Spawn detection: the helper appends a line to a unique counter file each time
+// it actually runs, so line count == real subprocess spawns, independent of
+// what expand_format returns. `mock_app` preinitializes the format-job channel
+// (as the server loop does) and `drain`/`wait_for_drain` replicate the loop's
+// non-blocking result drain.
 
 use super::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Expand in ASYNC mode — the mode the periodic status bar uses (PR #477).
+/// These tests assert the non-blocking spawn-once-per-TTL caching contract,
+/// which is now opt-in; one-shot callers (display-message -p) expand `#()`
+/// synchronously by default.
+fn expand_async(fmt: &str, app: &AppState) -> String {
+    let _g = AsyncFormatGuard::new();
+    super::expand_format(fmt, app)
+}
 
 fn mock_app(interval_secs: u64) -> AppState {
     let mut app = AppState::new("issue272".to_string());
     app.window_base_index = 0;
     app.status_interval = interval_secs;
+    // Preinitialize the format-job channel exactly as the server loop does, so
+    // the async path can spawn workers and deliver results.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.format_job_tx = Some(tx);
+    app.format_job_rx = Some(rx);
     app
 }
 
-/// Build a counter file path unique to this test (avoids cross-test races).
 fn counter_path(test_name: &str) -> std::path::PathBuf {
-    // Include a per-process random suffix so parallel runs don't collide.
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "psmux_issue272_{}_{}_{}.count",
-        test_name, pid, nanos
-    ))
+    std::env::temp_dir().join(format!("psmux_issue272_{}_{}_{}.count", test_name, pid, nanos))
 }
 
-/// Build a `#(...)` command that appends to `counter_path` each time the
-/// subprocess runs. The command's stdout is empty; we measure spawn count
-/// purely by counting lines in the counter file.
+/// A `#(...)` inner command that appends one line to `counter` when it runs.
+/// Its stdout is empty, so `#()` expands to "".
 fn tracer_cmd(counter: &std::path::Path) -> String {
-    // On Windows the format engine uses `cmd /C`; on Unix it uses `sh -c`.
-    // Either way, redirecting an `echo` to a file is portable enough for
-    // our needs here. Use forward slashes so cmd /C accepts the path.
+    let p = counter.display().to_string().replace('\\', "/");
+    format!("echo x>>{}", p)
+}
+
+/// Like `tracer_cmd` but waits ~1s first, so a synchronous spawn would visibly
+/// block. `ping -n 2` is the classic cmd sleep and reads no stdin.
+fn slow_tracer_cmd(counter: &std::path::Path) -> String {
     let p = counter.display().to_string().replace('\\', "/");
     if cfg!(windows) {
-        format!("echo x>>{}", p)
+        format!("ping -n 2 127.0.0.1 >nul & echo x>>{}", p)
     } else {
-        format!("echo x>>{}", p)
+        format!("sleep 1; echo x>>{}", p)
     }
 }
 
@@ -59,132 +72,94 @@ fn line_count(p: &std::path::Path) -> usize {
     }
 }
 
+/// Ceiling for "the worker has run" waits. Every wait below polls and returns
+/// as soon as its condition holds, so this costs nothing when spawning is
+/// quick; it only bounds how long a starved spawn may take.
+///
+/// It was 5 s, and that is not a property of the code under test but of the
+/// harness: unit tests run in ONE process, and on Windows process creation
+/// inside a process is serialized (std holds a lock across CreateProcessW).
+/// In `cargo test -- shell` some twenty tests spawn PowerShell at the same
+/// time, and Store PowerShell's app alias activation makes each creation
+/// slow, so the worker's `cmd` spawn() itself was measured blocking 5.8 s
+/// (instrumented 2026-10-09: spawn 5.83 s, the command 20 ms) while the
+/// assertions here are about COUNTS and VALUES, never latency. Latency of
+/// expand_format itself is still asserted, in expand_does_not_block_on_the_subprocess.
+const SPAWN_WAIT: Duration = Duration::from_secs(30);
 fn cleanup(p: &std::path::Path) {
     let _ = std::fs::remove_file(p);
+}
+
+/// Replicate the server loop's drain: pull completed `#()` results and refresh
+/// the cache so the next `expand_format` returns the fresh value.
+fn drain(app: &AppState) -> usize {
+    let mut n = 0;
+    if let Some(rx) = app.format_job_rx.as_ref() {
+        while let Ok((cmd, output)) = rx.try_recv() {
+            if let Ok(mut g) = app.format_shell_cache.lock() {
+                let now = Instant::now();
+                g.insert(cmd, crate::types::ShellEntry { at: now, value: output, running: false });
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+fn wait_for_drain(app: &AppState, timeout: Duration) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let n = drain(app);
+        if n > 0 || Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_spawns(counter: &std::path::Path, expected: usize, timeout: Duration) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let c = line_count(counter);
+        if c >= expected || Instant::now() >= deadline {
+            return c;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // ───────────────────────── tests ─────────────────────────
 
 #[test]
-fn cache_miss_spawns_once_then_cache_hits_skip_spawn() {
-    let counter = counter_path("hit_skip");
+fn expand_does_not_block_on_the_subprocess() {
+    let counter = counter_path("nonblock");
     cleanup(&counter);
     let app = mock_app(15);
-    let fmt = format!("X#({})Y", tracer_cmd(&counter));
+    let fmt = format!("#({})", slow_tracer_cmd(&counter));
 
-    // Call expand_format 50 times in tight succession (simulates the
-    // server-push path firing during active typing).
-    for _ in 0..50 {
-        let _ = expand_format(&fmt, &app);
-    }
+    let t0 = Instant::now();
+    let out = expand_async(&fmt, &app);
+    let elapsed = t0.elapsed();
 
-    let spawns = line_count(&counter);
-    cleanup(&counter);
-
-    assert_eq!(
-        spawns, 1,
-        "Cache MISS-then-HIT: 50 expand_format calls within TTL should \
-         spawn the subprocess exactly once. Observed: {} spawns. \
-         (If this fails, the TTL cache regressed and issue #272 is back.)",
-        spawns
+    // The helper waits ~1s; a synchronous spawn would block here. The async
+    // path must return immediately with empty output.
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "expand_format blocked {:?} on a ~1s helper (issue #272 residual is back)",
+        elapsed
     );
+    assert_eq!(out, "", "first render shows empty #() before the worker completes; got {:?}", out);
+
+    // Let the worker finish so it doesn't outlive the test.
+    wait_for_spawns(&counter, 1, SPAWN_WAIT);
+    cleanup(&counter);
 }
 
 #[test]
-fn cache_expires_and_respawns_after_ttl() {
-    let counter = counter_path("expiry");
+fn one_spawn_per_window_and_value_after_drain() {
+    let counter = counter_path("value");
     cleanup(&counter);
-    // status_interval=1 -> TTL = 1s.
-    let app = mock_app(1);
-    let fmt = format!("#({})", tracer_cmd(&counter));
-
-    let _ = expand_format(&fmt, &app);
-    assert_eq!(line_count(&counter), 1, "First call should spawn");
-
-    // Burst of calls within TTL — should not respawn.
-    for _ in 0..10 { let _ = expand_format(&fmt, &app); }
-    assert_eq!(
-        line_count(&counter),
-        1,
-        "Calls within 1s TTL window should hit cache (no respawn)"
-    );
-
-    // Wait past TTL.
-    std::thread::sleep(Duration::from_millis(1100));
-
-    // Next call should respawn.
-    let _ = expand_format(&fmt, &app);
-    let spawns = line_count(&counter);
-    cleanup(&counter);
-
-    assert_eq!(
-        spawns, 2,
-        "After TTL expiry the next call must respawn. Observed total spawns: {}",
-        spawns
-    );
-}
-
-#[test]
-fn different_commands_have_independent_cache_entries() {
-    let counter_a = counter_path("indep_a");
-    let counter_b = counter_path("indep_b");
-    cleanup(&counter_a);
-    cleanup(&counter_b);
-
-    let app = mock_app(15);
-    let fmt_a = format!("#({})", tracer_cmd(&counter_a));
-    let fmt_b = format!("#({})", tracer_cmd(&counter_b));
-
-    for _ in 0..20 {
-        let _ = expand_format(&fmt_a, &app);
-        let _ = expand_format(&fmt_b, &app);
-    }
-
-    let a = line_count(&counter_a);
-    let b = line_count(&counter_b);
-    cleanup(&counter_a);
-    cleanup(&counter_b);
-
-    assert_eq!(a, 1, "Command A should spawn exactly once across 20 calls; got {}", a);
-    assert_eq!(b, 1, "Command B should spawn exactly once across 20 calls; got {}", b);
-}
-
-#[test]
-fn status_interval_zero_still_caches_with_one_second_floor() {
-    let counter = counter_path("zero_interval");
-    cleanup(&counter);
-    // The fix uses .max(1) so status-interval=0 doesn't disable caching.
-    // Without that floor a user with `set -g status-interval 0` would
-    // still hit the per-frame spawn pathology described in issue #272.
-    let app = mock_app(0);
-    let fmt = format!("#({})", tracer_cmd(&counter));
-
-    for _ in 0..50 {
-        let _ = expand_format(&fmt, &app);
-    }
-
-    let spawns = line_count(&counter);
-    cleanup(&counter);
-
-    assert_eq!(
-        spawns, 1,
-        "status_interval=0 must still cache (1s floor) to keep typing snappy. \
-         Got {} spawns from 50 rapid calls.",
-        spawns
-    );
-}
-
-#[test]
-fn cached_value_is_returned_to_callers_not_just_silently_dropped() {
-    // This test guards against a subtle bug: if the cache stores values
-    // but expand_format ignores them and re-runs anyway, spawn count is
-    // still right but output could be stale/empty/wrong. Verify the
-    // caller sees the cached output.
-    let counter = counter_path("retval");
-    cleanup(&counter);
-
     let app = mock_app(60);
-    // Helper that prints a stable token AND increments the counter.
     let p = counter.display().to_string().replace('\\', "/");
     let cmd = if cfg!(windows) {
         format!("echo TOKEN-272 & echo x>>{}", p)
@@ -193,41 +168,123 @@ fn cached_value_is_returned_to_callers_not_just_silently_dropped() {
     };
     let fmt = format!("[#({})]", cmd);
 
-    let first = expand_format(&fmt, &app);
-    let second = expand_format(&fmt, &app);
-    let third = expand_format(&fmt, &app);
+    // First render: worker spawned, value not ready yet -> empty.
+    assert_eq!(expand_async(&fmt, &app), "[]", "empty before the worker completes");
+    // 50 rapid calls in the same window must not double-spawn (cache is fresh).
+    for _ in 0..50 {
+        let _ = expand_async(&fmt, &app);
+    }
 
+    let drained = wait_for_drain(&app, SPAWN_WAIT);
+    assert_eq!(drained, 1, "exactly one result should drain");
+
+    let second = expand_async(&fmt, &app);
+    let third = expand_async(&fmt, &app);
     let spawns = line_count(&counter);
     cleanup(&counter);
 
-    assert!(
-        first.contains("TOKEN-272"),
-        "First call output must contain helper stdout, got: {:?}",
-        first
-    );
-    assert_eq!(
-        first, second,
-        "Cached call must return same value as first call"
-    );
-    assert_eq!(
-        second, third,
-        "Cached call must keep returning same value"
-    );
-    assert_eq!(
-        spawns, 1,
-        "Only one spawn should have occurred across 3 calls within TTL; got {}",
-        spawns
-    );
+    assert!(second.contains("TOKEN-272"), "value must reach the caller after drain; got {:?}", second);
+    assert_eq!(second, third, "cached value stays stable within TTL");
+    assert_eq!(spawns, 1, "one spawn total within the TTL window; got {}", spawns);
 }
 
 #[test]
-fn cache_does_not_leak_command_text_into_output() {
-    // Sanity check: the cache key is the command, but the cached *value*
-    // is the stdout. A bug where we cache the command text instead would
-    // make the status line display the helper command verbatim.
-    let counter = counter_path("no_leak");
+fn respawns_after_ttl_expiry() {
+    let counter = counter_path("ttl");
     cleanup(&counter);
+    let app = mock_app(1); // TTL = 1s
+    let fmt = format!("#({})", tracer_cmd(&counter));
 
+    let _ = expand_async(&fmt, &app);
+    wait_for_drain(&app, SPAWN_WAIT);
+    assert_eq!(line_count(&counter), 1, "first call spawns");
+
+    for _ in 0..10 {
+        let _ = expand_async(&fmt, &app);
+    }
+    assert_eq!(line_count(&counter), 1, "within TTL: no respawn");
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let _ = expand_async(&fmt, &app);
+    let spawns = wait_for_spawns(&counter, 2, SPAWN_WAIT);
+    cleanup(&counter);
+    assert_eq!(spawns, 2, "respawn after TTL expiry; got {}", spawns);
+}
+
+#[test]
+fn in_flight_worker_blocks_a_second_spawn_after_ttl() {
+    // Dup guard: if the entry is TTL-expired but a worker is still running, do
+    // NOT spawn a second one. A ~1s helper with a 1s TTL exercises the window
+    // where `at` is expired but `running` is still true.
+    let counter = counter_path("dupguard");
+    cleanup(&counter);
+    let app = mock_app(1); // TTL = 1s
+    let fmt = format!("#({})", slow_tracer_cmd(&counter));
+
+    let _ = expand_async(&fmt, &app); // spawn worker (waits ~1s)
+    // Hammer just past the 1s TTL while the worker is still in flight (and we
+    // never drain, so `running` stays true).
+    std::thread::sleep(Duration::from_millis(1050));
+    for _ in 0..10 {
+        let _ = expand_async(&fmt, &app);
+    }
+
+    let spawns = wait_for_spawns(&counter, 1, SPAWN_WAIT);
+    std::thread::sleep(Duration::from_millis(200));
+    let after = line_count(&counter);
+    cleanup(&counter);
+    assert_eq!(spawns, 1, "in-flight worker present; got {} spawns", spawns);
+    assert_eq!(after, 1, "no second worker while one was in flight; got {}", after);
+}
+
+#[test]
+fn distinct_commands_are_independent() {
+    let ca = counter_path("indep_a");
+    let cb = counter_path("indep_b");
+    cleanup(&ca);
+    cleanup(&cb);
+    let app = mock_app(15);
+    let fa = format!("#({})", tracer_cmd(&ca));
+    let fb = format!("#({})", tracer_cmd(&cb));
+
+    for _ in 0..20 {
+        let _ = expand_async(&fa, &app);
+        let _ = expand_async(&fb, &app);
+    }
+
+    wait_for_spawns(&ca, 1, SPAWN_WAIT);
+    wait_for_spawns(&cb, 1, SPAWN_WAIT);
+    std::thread::sleep(Duration::from_millis(150));
+    let a = line_count(&ca);
+    let b = line_count(&cb);
+    cleanup(&ca);
+    cleanup(&cb);
+    assert_eq!(a, 1, "command A spawns exactly once; got {}", a);
+    assert_eq!(b, 1, "command B spawns exactly once; got {}", b);
+}
+
+#[test]
+fn status_interval_zero_uses_one_second_floor() {
+    let counter = counter_path("zero");
+    cleanup(&counter);
+    // The .max(1) floor keeps status-interval=0 from re-spawning on every push.
+    let app = mock_app(0);
+    let fmt = format!("#({})", tracer_cmd(&counter));
+
+    for _ in 0..50 {
+        let _ = expand_async(&fmt, &app);
+    }
+    wait_for_spawns(&counter, 1, SPAWN_WAIT);
+    std::thread::sleep(Duration::from_millis(150));
+    let spawns = line_count(&counter);
+    cleanup(&counter);
+    assert_eq!(spawns, 1, "interval=0 floor keeps 50 rapid calls to one spawn; got {}", spawns);
+}
+
+#[test]
+fn value_is_stdout_not_command_text() {
+    let counter = counter_path("noleak");
+    cleanup(&counter);
     let app = mock_app(15);
     let p = counter.display().to_string().replace('\\', "/");
     let cmd = if cfg!(windows) {
@@ -237,13 +294,15 @@ fn cache_does_not_leak_command_text_into_output() {
     };
     let fmt = format!("#({})", cmd);
 
-    let out = expand_format(&fmt, &app);
+    let _ = expand_async(&fmt, &app); // spawn
+    wait_for_drain(&app, SPAWN_WAIT);
+    let out = expand_async(&fmt, &app); // cached value
     cleanup(&counter);
 
-    assert!(out.contains("SAFE_OUT"), "Output should contain helper stdout");
+    assert!(out.contains("SAFE_OUT"), "value should be the helper stdout; got {:?}", out);
     assert!(
         !out.contains("echo SAFE_OUT"),
-        "Output must NOT contain the raw command text (cache key vs value mixup): {:?}",
+        "value must be stdout, not the raw command text; got {:?}",
         out
     );
 }

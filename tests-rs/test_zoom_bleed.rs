@@ -16,11 +16,13 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         cursor_row: 0,
         cursor_col: 0,
         alternate_screen: false,
+        wants_mouse: false,
         hide_cursor: false,
         cursor_shape: 0,
         active,
         copy_mode: false,
         scroll_offset: 0,
+        view_offset: 0,
         sel_start_row: None,
         sel_start_col: None,
         sel_end_row: None,
@@ -30,7 +32,7 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         copy_cursor_col: None,
         content: Vec::new(),
         rows_v2: Vec::new(),
-        title: None,
+        title: None, copy_hl: Vec::new(),
         images: vec![],
     }
 }
@@ -68,11 +70,16 @@ fn zoomed_left_active_hidden_pane_label_never_rendered() {
         crate::client::render_layout_json(
             f, &layout, area,
             false,
-            Color::DarkGray, Color::Green,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset,
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
+            crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
 
@@ -122,11 +129,16 @@ fn zoomed_right_active_hidden_pane_label_never_rendered() {
         crate::client::render_layout_json(
             f, &layout, area,
             false,
-            Color::DarkGray, Color::Green,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset,
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
+            crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
 
@@ -176,11 +188,16 @@ fn zoomed_top_active_hidden_pane_label_never_rendered() {
         crate::client::render_layout_json(
             f, &layout, area,
             false,
-            Color::DarkGray, Color::Green,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset,
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
+            crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
 
@@ -230,11 +247,16 @@ fn zoomed_bottom_active_hidden_pane_label_never_rendered() {
         crate::client::render_layout_json(
             f, &layout, area,
             false,
-            Color::DarkGray, Color::Green,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset,
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
+            crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
 

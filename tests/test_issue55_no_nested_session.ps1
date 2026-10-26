@@ -4,10 +4,11 @@
 #      and exits without spawning anything.
 #
 # Guard locations in main.rs:
-#   PATH A (bare psmux / TUI): only reached when stdin IS a terminal. When stdin is
-#     NOT a terminal psmux hits the is_terminal() gate first and exits via
-#     print_version() — a subprocess test cannot exercise PATH A.
-#   PATH B (new-session command): applied after flag parsing, no is_terminal() gate;
+#   PATH A (bare psmux / TUI): the nesting guard fires before any TUI or session is
+#     spawned, even for a non-tty subprocess. Bare psmux with PSMUX_ACTIVE=1 or
+#     PSMUX_SESSION set prints the "nested with care" warning and refuses,
+#     mirroring tmux's nested-session refusal.
+#   PATH B (new-session command): applied after flag parsing;
 #     always reachable. Per issue #424 the guard only fires for an ATTACHING
 #     new-session (no -d). A detached `new-session -d` is allowed nested because it
 #     never grabs the current terminal (see tests/test_issue424_proof.ps1).
@@ -15,9 +16,9 @@
 # Tests (T1/T2 use the ATTACHING form, no -d, which is the case the guard blocks):
 #   T1. PSMUX_ACTIVE=1   + new-session -s gap55_a  => warning on stderr, session NOT created
 #   T2. PSMUX_SESSION=x  + new-session -s gap55_b  => warning on stderr, session NOT created
-#   T3. PSMUX_ACTIVE=1   + bare psmux (non-tty subprocess) => hits is_terminal() gate,
-#       exits cleanly printing version — PATH A guard unreachable without a real tty;
-#       assert: exits <5s AND no nested session file created (no port file for a new session)
+#   T3. PSMUX_ACTIVE=1   + bare psmux (non-tty subprocess) => nesting guard fires
+#       (tmux parity: refuses to nest);
+#       assert: exits <5s AND no nested session file created AND guard warning printed
 #   T4. PSMUX_ALLOW_NESTING=1 + PSMUX_ACTIVE=1 + new-session => guard bypassed, session created
 #   T5. Clean env + new-session -d -s gap55_ok         => no warning, session created
 
@@ -129,18 +130,19 @@ Remove-Item Env:PSMUX_SESSION -EA SilentlyContinue
 # -----------------------------------------------------------------------
 # T3: Bare `psmux` subprocess (non-tty) with PSMUX_ACTIVE=1
 #
-# Root-cause note: psmux's bare-TUI PATH A nesting guard (main.rs:3627) sits
-# AFTER the is_terminal() gate (main.rs:3617). A subprocess without a real tty
-# exits via print_version() before ever reaching the guard. This is correct
-# headless behavior, not a bug in the nesting fix.
+# The bare-TUI PATH A nesting guard fires even for a non-tty subprocess:
+# psmux refuses to nest and prints
+#   "psmux: sessions should be nested with care, unset PSMUX_SESSION to force"
+# mirroring tmux's nested-session refusal (tmux exits nonzero with the same
+# style of warning when $TMUX is set).
 #
 # What we assert here:
 #   (a) Process exits quickly (does not hang as TUI)       => no nested TUI spawned
 #   (b) No gap55_tui session file appears                  => no nested server created
-#   (c) Output contains the version string (headless gate) => correct early-exit path
+#   (c) Output contains the nesting-guard warning          => guard fired (tmux parity)
 # -----------------------------------------------------------------------
-Write-Host "`n[Test 3] Bare 'psmux' + PSMUX_ACTIVE=1 (non-tty): exits quickly, no session spawned" -ForegroundColor Yellow
-Write-Host "  (PATH A guard unreachable without real tty; is_terminal() gate exits first)" -ForegroundColor DarkGray
+Write-Host "`n[Test 3] Bare 'psmux' + PSMUX_ACTIVE=1 (non-tty): guard fires, no session spawned" -ForegroundColor Yellow
+Write-Host "  (PATH A guard fires before TUI/session spawn, tmux nested-session parity)" -ForegroundColor DarkGray
 
 $env:PSMUX_ACTIVE  = "1"
 $env:PSMUX_NO_WARM = "1"
@@ -151,23 +153,25 @@ $gap55Before = (Get-ChildItem "$psmuxDir\gap55_*.port" -EA SilentlyContinue).Cou
 
 $sw3  = [System.Diagnostics.Stopwatch]::StartNew()
 $out3 = & $PSMUX 2>&1 | Out-String
+$exit3 = $LASTEXITCODE
 $sw3.Stop()
 $elapsed3ms = $sw3.ElapsedMilliseconds
 
 $gap55After = (Get-ChildItem "$psmuxDir\gap55_*.port" -EA SilentlyContinue).Count
 
 Write-Host "  output:          '$($out3.Trim())'"
+Write-Host "  exit code:       $exit3"
 Write-Host "  elapsed ms:      $elapsed3ms"
 Write-Host "  gap55_* port files before/after: $gap55Before / $gap55After"
 
-if ($elapsed3ms -lt 5000) { Write-Pass "T3: bare psmux (non-tty) exited in ${elapsed3ms}ms — no TUI blocked on tty" }
+if ($elapsed3ms -lt 5000) { Write-Pass "T3: bare psmux (non-tty) exited in ${elapsed3ms}ms (no TUI blocked on tty)" }
 else                       { Write-Fail "T3: bare psmux took ${elapsed3ms}ms (expected <5000)" }
 
 if ($gap55After -le $gap55Before) { Write-Pass "T3: no new gap55_* session port file created (no nested session)" }
-else                               { Write-Fail "T3: $($gap55After - $gap55Before) new gap55_* port file(s) — nested session was created" }
+else                               { Write-Fail "T3: $($gap55After - $gap55Before) new gap55_* port file(s), nested session was created" }
 
-if ($out3 -match "\d+\.\d+") { Write-Pass "T3: output contains version string (correct headless-exit path)" }
-else                           { Write-Fail "T3: unexpected output from bare psmux: '$($out3.Trim())'" }
+if ($out3 -match "nested with care") { Write-Pass "T3: nesting-guard warning printed for bare psmux (tmux parity, exit=$exit3)" }
+else                                  { Write-Fail "T3: expected nesting-guard warning, got: '$($out3.Trim())' (exit=$exit3)" }
 
 Remove-Item Env:PSMUX_ACTIVE  -EA SilentlyContinue
 Remove-Item Env:PSMUX_NO_WARM -EA SilentlyContinue

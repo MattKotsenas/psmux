@@ -26,6 +26,23 @@ function Write-Fail { param($msg) Write-Host "[FAIL] $msg" -ForegroundColor Red;
 function Write-Info { param($msg) Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-Test { param($msg) Write-Host "[TEST] $msg" -ForegroundColor White }
 
+# Seed the system clipboard with retries. The Windows clipboard is a shared
+# resource: another process holding it makes Set-Clipboard/Get-Clipboard fail
+# transiently, which flaked this suite's PRECONDITION in the 2026-08-21 and
+# 2026-08-22 sweeps (product paths were green both times). Retry a few times
+# before declaring the precondition dead.
+function Seed-Clipboard {
+    param([string]$Value, [int]$Attempts = 5)
+    for ($a = 0; $a -lt $Attempts; $a++) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds (100 + 150 * $a)
+        $got = $null
+        try { $got = Get-Clipboard -Raw -EA Stop } catch {}
+        if ($got -eq $Value) { return $true }
+    }
+    return $false
+}
+
 # Resolve the under-test binary the same way test_pr27.ps1 does.
 $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
 if (-not (Test-Path $PSMUX)) {
@@ -136,10 +153,8 @@ Write-Host ("=" * 70) -ForegroundColor Cyan
 # ── Test 1: load-buffer -w copies stdin to the Win32 clipboard ──────────
 Write-Test "load-buffer -w copies stdin content to the system clipboard"
 $marker1 = "LB-W-MARKER-$([Guid]::NewGuid().ToString().Substring(0,8))"
-Set-Clipboard -Value "SENTINEL-BEFORE-TEST1"
-$preCb1 = Get-Clipboard -Raw
-if ($preCb1 -ne "SENTINEL-BEFORE-TEST1") {
-    Write-Fail "Precondition: could not seed clipboard for test 1 (got: $preCb1)"
+if (-not (Seed-Clipboard "SENTINEL-BEFORE-TEST1")) {
+    Write-Fail "Precondition: could not seed clipboard for test 1 after retries"
 } else {
     $marker1 | & $PSMUX -L $NS load-buffer -w - 2>&1 | Out-Null
     $loadExit = $LASTEXITCODE
@@ -159,10 +174,8 @@ if ($preCb1 -ne "SENTINEL-BEFORE-TEST1") {
 Write-Test "load-buffer (no -w) does NOT touch the system clipboard"
 $sentinel2 = "SENTINEL-BEFORE-TEST2-$([Guid]::NewGuid().ToString().Substring(0,8))"
 $marker2   = "LB-NOW-MARKER-$([Guid]::NewGuid().ToString().Substring(0,8))"
-Set-Clipboard -Value $sentinel2
-$preCb2 = Get-Clipboard -Raw
-if ($preCb2 -ne $sentinel2) {
-    Write-Fail "Precondition: could not seed clipboard for test 2 (got: $preCb2)"
+if (-not (Seed-Clipboard $sentinel2)) {
+    Write-Fail "Precondition: could not seed clipboard for test 2 after retries"
 } else {
     $marker2 | & $PSMUX -L $NS load-buffer - 2>&1 | Out-Null
     $loadExit = $LASTEXITCODE
@@ -191,7 +204,7 @@ if ($preCb2 -ne $sentinel2) {
 Write-Test "load-buffer -w -b NAME writes to both the system clipboard AND the named buffer"
 $marker3 = "LB-WB-MARKER-$([Guid]::NewGuid().ToString().Substring(0,8))"
 $bufName = "tw_test_buf"
-Set-Clipboard -Value "SENTINEL-BEFORE-TEST3"
+$null = Seed-Clipboard "SENTINEL-BEFORE-TEST3"
 $markerFile = New-TemporaryFile
 try {
     [System.IO.File]::WriteAllBytes($markerFile.FullName, [System.Text.Encoding]::UTF8.GetBytes($marker3))

@@ -68,6 +68,9 @@ fn app_with_sixel_pane() -> AppState {
         active_path: vec![], // single leaf root -> empty path is the active pane
         name: "w0".to_string(),
         id: 0,
+        area: Rect { x: 0, y: 0, width: 80, height: 24 },
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -78,6 +81,8 @@ fn app_with_sixel_pane() -> AppState {
         pane_mru: vec![1],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     };
 
     let mut app = AppState::new("m4-blobs".to_string());

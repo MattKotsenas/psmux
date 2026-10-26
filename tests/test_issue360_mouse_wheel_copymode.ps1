@@ -2,10 +2,8 @@
 # mouse=on and scroll-enter-copy-mode=on, even when the shell has filled the
 # screen with output (cursor at the bottom).
 #
-# Root cause was is_fullscreen_tui() in pane_wants_mouse() misclassifying a
-# filled shell as a TUI app and forwarding the wheel instead of entering copy
-# mode. Fix: scroll uses the stricter pane_wants_scroll_forward() (mouse
-# protocol or alternate screen only).
+# pane_wheel_forward must not infer mouse ownership from screen contents. It
+# forwards only for application-owned mouse metadata or the alternate screen.
 #
 # This drives a REAL attached psmux client in classic conhost and injects REAL
 # console mouse-wheel events via WriteConsoleInput, then verifies copy_mode via

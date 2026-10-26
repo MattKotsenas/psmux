@@ -18,7 +18,7 @@ if ($LASTEXITCODE -ne 0 -or $distroCheck.Trim().Length -eq 0) {
     exit 0
 }
 
-$exe = ".\target\release\psmux.exe"
+$exe = "$PSScriptRoot\..\target\release\psmux.exe"
 $home_ = $env:USERPROFILE
 $session = "0"
 

@@ -8,6 +8,15 @@ $PSMUX = "tmux"
 $SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
 $SshHost = "$SshUser@localhost"
 
+# Fail-fast SSH availability probe: without it, the first bare `ssh` call
+# blocks forever on auth when no sshd/key-auth is set up, and the suite burns
+# its entire harness timeout producing zero output (BatchMode forbids prompts).
+$sshProbe = ssh -o ConnectTimeout=5 -o BatchMode=yes $SshHost "echo psmux_ssh_ok" 2>$null
+if ("$sshProbe" -notmatch 'psmux_ssh_ok') {
+    Write-Host "[SKIP] SSH to localhost unavailable (sshd not running or key auth not configured)" -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host "=== VT Parser Paste: Missing Close Sequence Test ===" -ForegroundColor Cyan
 
 # Step 1: Clean up
@@ -15,10 +24,10 @@ ssh $SshHost "$PSMUX kill-server" 2>$null
 Start-Sleep -Seconds 2
 
 # Step 2: Clear debug log
-ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
+ssh $SshHost 'cmd /c "echo. > %USERPROFILE%\.psmux\ssh_input.log"' 2>$null
 
 # Step 3: Create session with verbose debug logging
-ssh $SshHost "set PSMUX_SSH_DEBUG=1&& tmux new-session -d -s missing_close"
+ssh $SshHost 'cmd /c "set PSMUX_SSH_DEBUG=1&& tmux new-session -d -s missing_close"'
 Start-Sleep -Seconds 3
 Write-Host "[OK] Session created" -ForegroundColor Green
 
@@ -92,7 +101,7 @@ $capture | ForEach-Object { Write-Host "  $_" }
 Write-Host "--- END ---" -ForegroundColor Cyan
 
 # Debug log
-$debugLog = ssh $SshHost "type %USERPROFILE%\.psmux\ssh_input.log"
+$debugLog = ssh $SshHost 'cmd /c "type %USERPROFILE%\.psmux\ssh_input.log"'
 Write-Host "--- DEBUG LOG (relevant lines) ---" -ForegroundColor DarkGray
 $debugLog | Where-Object { $_ -match "paste|Paste|drain|Drain|flush|tilde|KEY|emit|u_char" } | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 Write-Host "--- END ---" -ForegroundColor DarkGray

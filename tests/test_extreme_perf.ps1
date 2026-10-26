@@ -59,7 +59,23 @@ function Wait-Prompt {
         try {
             $cap = & $PSMUX capture-pane -t $Target -p 2>&1 | Out-String
             # Detect PS prompt: standard "PS C:\", oh-my-posh "❯", or starship "$"
-            if ($cap -match "PS [A-Z]:\\" -or $cap -match "\xE2\x9D\xAF" -or $cap -match "❯" -or ($cap -match "@" -and $cap.Trim().Length -gt 5)) {
+            #
+            # TEST 4 (split-pane scaling) drives panes down to 3 rows tall
+            # by width ~14-15 cols. At that size the prompt line
+            # "PS C:\Users\...\...>" line-wraps to more rows than the pane
+            # is tall, so the TOP wrapped segment (containing the literal
+            # "PS C:\" prefix every other check here looks for) scrolls out
+            # of the visible capture -- confirmed live: `capture-pane -p` on
+            # a 14x3 pane showed only the tail, e.g. "dwin\Documents /
+            # \workspace\psm / ux>", with "PS C:\" nowhere in the visible
+            # text even though the shell is fully alive and correctly
+            # rendering its prompt. That is real terminal line-wrap
+            # behavior (any shell/terminal would do the same at that size),
+            # not a psmux defect, so also accept a trailing '>' on the last
+            # non-blank line -- the one fragment of a wrapped PS/cmd prompt
+            # that survives regardless of how many rows scrolled away.
+            $lastLine = ($cap -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 1)
+            if ($cap -match "PS [A-Z]:\\" -or $cap -match "\xE2\x9D\xAF" -or $cap -match "❯" -or ($cap -match "@" -and $cap.Trim().Length -gt 5) -or ($lastLine -and $lastLine.TrimEnd().EndsWith(">"))) {
                 return @{ Found = $true; ElapsedMs = $sw.ElapsedMilliseconds }
             }
         } catch {}

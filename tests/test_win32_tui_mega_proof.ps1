@@ -76,6 +76,15 @@ public class Win32Mega {
     public const byte VK_BACK    = 0x08;
     public const uint KEYEVENTF_KEYUP = 0x0002;
 
+    // C-u clears the prompt line. Like tmux (command-prompt -I'#S' / -I'#W'),
+    // the rename prompts open holding the current name, so typing alone appends.
+    public static void SendCtrlU() {
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
     public static void SendCtrlB() {
         keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
         keybd_event(0x42, 0, 0, UIntPtr.Zero);       // B
@@ -341,10 +350,9 @@ function Send-TcpCommand {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()
@@ -360,6 +368,10 @@ Write-Host "`n============================================================" -For
 Write-Host "  PSMUX Win32 TUI Mega Proof Test Suite" -ForegroundColor Magenta
 Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Magenta
 Write-Host "============================================================`n" -ForegroundColor Magenta
+
+# The copy mode section copies a pane line to the system clipboard, which is
+# the user's: put back what was there before.
+$savedClip = try { Get-Clipboard -Raw -EA Stop } catch { $null }
 
 Cleanup-Session $SESSION
 Cleanup-Session "${SESSION}_target"
@@ -409,6 +421,8 @@ $origWinName = (& $PSMUX display-message -t $SESSION -p '#{window_name}' 2>&1 | 
 Start-Sleep -Milliseconds 400
 [Win32Mega]::SendDollar()
 Start-Sleep -Milliseconds 600
+[Win32Mega]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
 $renamed = "proven201"
 [Win32Mega]::SendString($renamed)
@@ -435,6 +449,8 @@ Write-Test "Issue #201: prefix+comma renames WINDOW"
 Start-Sleep -Milliseconds 400
 [Win32Mega]::SendComma()
 Start-Sleep -Milliseconds 600
+[Win32Mega]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
 $newWin = "proven201win"
 [Win32Mega]::SendString($newWin)
@@ -925,6 +941,14 @@ else { Write-Pass "TUI process state after detach: running=$(-not $proc.HasExite
 # =============================================================================
 
 Write-Host "`n=== Cleanup ===" -ForegroundColor Cyan
+
+if ($null -ne $savedClip) {
+    for ($i = 0; $i -lt 10; $i++) {
+        try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
+        if ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip) { break }
+        Start-Sleep -Milliseconds 200
+    }
+}
 
 if (-not $SkipCleanup) {
     Cleanup-Session $SESSION

@@ -166,7 +166,7 @@ if ($LASTEXITCODE -ne 0) {
 
     # Compile injector
     $injExe = "$env:TEMP\psmux_injector.exe"
-    $injSrc = "C:\Users\uniqu\Documents\workspace\psmux\tests\injector.cs"
+    $injSrc = "$PSScriptRoot\injector.cs"
     $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
     if (-not (Test-Path $injExe) -or (Get-Item $injSrc).LastWriteTime -gt (Get-Item $injExe -EA SilentlyContinue).LastWriteTime) {
         & $csc /nologo /optimize /out:$injExe $injSrc 2>&1 | Out-Null

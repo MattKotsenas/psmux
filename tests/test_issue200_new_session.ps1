@@ -200,12 +200,12 @@ Write-TestResult "B9: Main session still alive (no side effects)" $mainStillAliv
 Write-Host ""
 Write-Host "─── PART C: Duplicate session prevention ───" -ForegroundColor Magenta
 
-# Try creating same session again, should show "already exists"
+# Try creating same session again, should say "duplicate session: NAME", the tmux wording (cmd-new-session.c:138)
 Write-Host "Step C1: Attempting to create duplicate session..." -ForegroundColor Yellow
 $dupResp = Send-PsmuxCommand $testSession "new-session -d -s $promptCreated"
 if ($Verbose) { Write-Host "    Duplicate response: $dupResp" -ForegroundColor Gray }
-$isDuplicate = ($null -ne $dupResp -and $dupResp.Contains("already exists"))
-Write-TestResult "C1: Duplicate session correctly rejected" $isDuplicate "Expected 'already exists', got: $dupResp"
+$isDuplicate = ($null -ne $dupResp -and ($dupResp -match "duplicate session"))
+Write-TestResult "C1: Duplicate session correctly rejected" $isDuplicate "Expected 'duplicate session', got: $dupResp"
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
 Write-Host ""

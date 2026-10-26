@@ -143,6 +143,40 @@ fn get_option_allow_rename() {
 }
 
 #[test]
+fn warm_server_does_not_run_status_interval_timer() {
+    // Guards the double-fire fix; see AppState::should_run_status_interval_timer.
+    let mut app = AppState::new("__warm__".to_string());
+    app.status_interval = 5;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "warm server must not run the status-interval timer"
+    );
+
+    app.session_name = "main".to_string();
+    assert!(
+        app.should_run_status_interval_timer(),
+        "a real session must run the status-interval timer"
+    );
+
+    app.status_interval = 0;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "status-interval=0 disables the timer"
+    );
+}
+
+#[test]
+fn is_warm_server_tracks_the_reserved_name() {
+    // Guards the double-fire fix; see AppState::is_warm_server.
+    let mut app = AppState::new("__warm__".to_string());
+    assert!(app.is_warm_server(), "the __warm__ pre-spawn server is warm");
+
+    // Claiming a warm server renames it to the real session; it is no longer warm.
+    app.session_name = "main".to_string();
+    assert!(!app.is_warm_server(), "a claimed/real session is not warm");
+}
+
+#[test]
 fn get_option_bell_action() {
     let app = AppState::new("test".to_string());
     let val = super::options::get_option_value(&app, "bell-action");
@@ -382,7 +416,7 @@ fn bell_action_none_suppresses_bell_forward() {
     assert_eq!(app.bell_action, "none");
     // With bell-action none, check_window_activity should never set bell_forward
     // (no panes to trigger, but verify the option is accepted)
-    let hooks = super::helpers::check_window_activity(&mut app);
+    let hooks = super::helpers::check_window_activity(&mut app).hooks;
     assert!(!app.bell_forward, "bell_forward must stay false with bell-action none");
     assert!(hooks.is_empty());
 }
@@ -420,6 +454,9 @@ fn mock_window_for_server(name: &str) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -430,6 +467,8 @@ fn mock_window_for_server(name: &str) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 

@@ -71,7 +71,7 @@ if ($bufCount -eq 3) {
 # Test 2: choose-buffer CLI returns buffer list (non-interactive, just text)
 Write-Host "[Test 2] choose-buffer CLI returns buffer list" -ForegroundColor Yellow
 $output = & $PSMUX choose-buffer -t $SESSION 2>&1 | Out-String
-if ($output -match "buffer0:" -and $output -match "bytes:") {
+if ($output -match "buffer\d+:" -and $output -match "bytes:") {
     Write-Pass "choose-buffer CLI returns formatted buffer list"
 } else {
     Write-Fail "choose-buffer CLI output unexpected: $output"
@@ -92,7 +92,7 @@ Write-Host "`n--- Part B: TCP Server Path ---" -ForegroundColor Yellow
 # Test 4: choose-buffer via TCP returns buffer list
 Write-Host "[Test 4] choose-buffer via TCP returns buffer data" -ForegroundColor Yellow
 $resp = Send-TcpCommand -Session $SESSION -Command "choose-buffer"
-if ($resp -match "buffer0:" -and $resp -match "bytes:") {
+if ($resp -match "buffer\d+:" -and $resp -match "bytes:") {
     Write-Pass "TCP choose-buffer returns buffer data"
 } else {
     Write-Fail "TCP choose-buffer unexpected: $resp"
@@ -110,21 +110,24 @@ if ($afterBufs -eq ($beforeBufs - 1)) {
     Write-Fail "Expected $($beforeBufs - 1) buffers, got $afterBufs"
 }
 
-# Test 6: delete-buffer with -b flag removes specific buffer by index
-Write-Host "[Test 6] delete-buffer -b <idx> removes specific buffer" -ForegroundColor Yellow
+# Test 6: delete-buffer -b removes the buffer of a name list-buffers shows.
+# -b is a name, as in tmux (issue #818): there is no index form.
+Write-Host "[Test 6] delete-buffer -b <name> removes that buffer" -ForegroundColor Yellow
 # Add more buffers first
 & $PSMUX set-buffer -t $SESSION "Buffer A"
 & $PSMUX set-buffer -t $SESSION "Buffer B"
 & $PSMUX set-buffer -t $SESSION "Buffer C"
 Start-Sleep -Milliseconds 500
-$before = (& $PSMUX list-buffers -t $SESSION 2>&1 | Where-Object { $_ -match '^buffer\d+:' }).Count
-$null = Send-TcpCommand -Session $SESSION -Command "delete-buffer -b 1"
+$lines = @(& $PSMUX list-buffers -t $SESSION 2>&1 | Where-Object { $_ -match '^buffer\d+:' })
+$before = $lines.Count
+$victim = ($lines | Where-Object { $_ -match '"Buffer B"' } | Select-Object -First 1) -replace ':.*$', ''
+$null = Send-TcpCommand -Session $SESSION -Command "delete-buffer -b $victim"
 Start-Sleep -Milliseconds 1000
-$after = (& $PSMUX list-buffers -t $SESSION 2>&1 | Where-Object { $_ -match '^buffer\d+:' }).Count
-if ($after -eq ($before - 1)) {
-    Write-Pass "delete-buffer -b 1 removed buffer at index 1"
+$afterLines = @(& $PSMUX list-buffers -t $SESSION 2>&1 | Where-Object { $_ -match '^buffer\d+:' })
+if ($afterLines.Count -eq ($before - 1) -and -not ($afterLines -match '"Buffer B"')) {
+    Write-Pass "delete-buffer -b $victim removed Buffer B"
 } else {
-    Write-Fail "Expected $($before - 1) buffers after delete -b 1, got $after"
+    Write-Fail "Expected Buffer B ($victim) gone, got: $($afterLines -join ' / ')"
 }
 
 # === Part C: Edge Cases ===

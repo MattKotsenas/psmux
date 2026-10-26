@@ -72,8 +72,11 @@ Write-Test "Renderer: iterates entries with .skip(session_scroll).take(visible_h
 $skipTake = $src -match '\.skip\(session_scroll\)\.take\(visible_h\)'
 Add-Result "renderer uses skip+take for viewport" $skipTake ""
 
-Write-Test "Scroll indicator: drawn when session_entries.len() > visible_h"
-$indicator = $src -match 'session_entries\.len\(\)\s*>\s*visible_h'
+Write-Test "Scroll indicator: drawn when filtered_indices.len() > visible_h"
+# Post-ea71e75 the session chooser renders through session_filtered_indices();
+# the indicator condition now checks the filtered list, and the pct math is
+# anchored on session_scroll to bind this match to the session chooser block.
+$indicator = $src -match '(?s)if\s+filtered_indices\.len\(\)\s*>\s*visible_h\s*\{\s*let\s+max_scroll\s*=\s*filtered_indices\.len\(\)\.saturating_sub\(visible_h\);\s*let\s+pct\s*=\s*if\s+max_scroll\s*>\s*0\s*\{\s*session_scroll\s*\*\s*100'
 Add-Result "scroll indicator condition present" $indicator ""
 
 Write-Test "Scroll indicator: Top/Bot/% text drawn"

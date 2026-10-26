@@ -164,6 +164,11 @@ unbind-key v
 "@ | Set-Content -Path $confFile -Encoding UTF8
 
 # [Test 8] Config file unbinds applied on session start
+# The config only unbinds from the prefix and root tables (unbind-key without
+# -T targets prefix, -n targets root; tmux cmd-unbind-key.c). copy-mode-vi
+# keeps `v`/`C-v` rectangle-toggle and copy-mode keeps `C-v` page-down, as in
+# tmux 3.4, and list-keys without -T prints those tables too, so the C-v check
+# looks at prefix/root lines only.
 Write-Host "`n[Test 8] Config file unbinds C-v and v on startup" -ForegroundColor Yellow
 $env:PSMUX_CONFIG_FILE = $confFile
 Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s",$configSession,"-d" -WindowStyle Hidden
@@ -174,9 +179,9 @@ Start-Sleep -Seconds 4
 if ($LASTEXITCODE -eq 0) {
     $cfgKeys = & $PSMUX list-keys -t $configSession 2>&1 | Out-String
     $hasV = $cfgKeys -match "prefix\s+v\s+rectangle-toggle"
-    $hasCv = $cfgKeys -match "C-v"
+    $hasCv = [bool]($cfgKeys -split "`n" | Where-Object { $_ -match '-T\s+(prefix|root)\s+C-v\s' })
     if (-not $hasV -and -not $hasCv) {
-        Write-Pass "Config file removed both 'v' and 'C-v' from all tables"
+        Write-Pass "Config file removed both 'v' and 'C-v' from the prefix and root tables"
     } elseif ($hasV) {
         Write-Fail "Config file did NOT remove prefix 'v' binding"
     } else {

@@ -11,7 +11,7 @@
 #   - detach is GRACEFUL: client-detached hook fires; ClientDetached notification sent
 
 $ErrorActionPreference = "Continue"
-$PSMUX = (Resolve-Path '.\target\release\psmux.exe').Path
+$PSMUX = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe").Path
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $SESSION = "issue275"
 $script:Passed = 0
@@ -103,15 +103,27 @@ $out = & $PSMUX detach-client -s $SESSION -P 2>&1
 if ($LASTEXITCODE -eq 0) { Write-Pass "-P flag accepted" }
 else { Write-Fail "-P flag rejected: $out" }
 
-Write-Host "`n[A5] detach-client -t /dev/pts/0 (tty path)" -ForegroundColor Yellow
-$out = & $PSMUX detach-client -s $SESSION -t "/dev/pts/0" 2>&1
-if ($LASTEXITCODE -eq 0) { Write-Pass "-t with tty path accepted" }
-else { Write-Fail "-t tty path rejected: $out" }
+# A5/A6 target a client that does not exist: this session is detached, so there
+# is no /dev/pts/0 and no %1. These used to assert only `$LASTEXITCODE -eq 0`,
+# i.e. "the flag was accepted" -- which the old behaviour satisfied for the wrong
+# reason, because `-t` was stripped before it reached the handler and the command
+# was silently promoted to `-a`. Exit 0 therefore proved nothing about `-t`.
+#
+# Real tmux 3.4, measured:
+#     tmux detach-client -t <not-a-client>  ->  rc 1, "can't find client: X"
+#
+# So the correct assertion is that the flag REACHES the handler and an unknown
+# client is refused. That distinguishes "parsed and acted on" from both "silently
+# ignored" and "unknown flag", which exit 0 alone cannot.
+Write-Host "`n[A5] detach-client -t /dev/pts/0 (tty path, no such client)" -ForegroundColor Yellow
+$out = (& $PSMUX detach-client -s $SESSION -t "/dev/pts/0" 2>&1) -join ' '
+if ($LASTEXITCODE -ne 0 -and $out -match "can't find client") { Write-Pass "-t tty path reaches handler; unknown client refused (tmux parity)" }
+else { Write-Fail "-t tty path: expected nonzero rc plus a can-not-find-client message, got rc=$LASTEXITCODE out=$out" }
 
-Write-Host "`n[A6] detach-client -t %1 (numeric client id)" -ForegroundColor Yellow
-$out = & $PSMUX detach-client -s $SESSION -t "%1" 2>&1
-if ($LASTEXITCODE -eq 0) { Write-Pass "-t %id accepted" }
-else { Write-Fail "-t %id rejected: $out" }
+Write-Host "`n[A6] detach-client -t %1 (numeric client id, no such client)" -ForegroundColor Yellow
+$out = (& $PSMUX detach-client -s $SESSION -t "%1" 2>&1) -join ' '
+if ($LASTEXITCODE -ne 0 -and $out -match "can't find client") { Write-Pass "-t %id reaches handler; unknown client refused (tmux parity)" }
+else { Write-Fail "-t %id: expected nonzero rc plus a can-not-find-client message, got rc=$LASTEXITCODE out=$out" }
 
 Write-Host "`n[A7] detach-client against non-existent session reports cleanly" -ForegroundColor Yellow
 $out = & $PSMUX detach-client -s "no_such_session_xyz" 2>&1
@@ -244,7 +256,7 @@ else {
     if ($LASTEXITCODE -eq 0) {
         Write-Pass "TUI: server preserved after client detach (panes still alive)"
     } else {
-        Write-Fail "TUI: server died — detach should not kill server"
+        Write-Fail "TUI: server died, detach should not kill server"
     }
 }
 

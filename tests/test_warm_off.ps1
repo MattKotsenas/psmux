@@ -8,7 +8,11 @@
 # - Runtime toggle: on -> off -> on
 
 $ErrorActionPreference = "Stop"
-$PSMUX_DIR = "$env:USERPROFILE\.psmux"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and a developer's shell may have it set, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
+$PSMUX_DIR = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 
 $pass = 0
 $fail = 0
@@ -25,9 +29,30 @@ function Assert-True($condition, $msg) {
     }
 }
 
+# Tear down every server registered in THIS data directory, by its pid anchor,
+# never by image name. The old body was
+#
+#     Get-Process -Name psmux,tmux,pmux | Stop-Process -Force
+#
+# which on 2026-09-23 killed the servers of two unrelated agents working beside
+# this suite on the same machine and left their pane shells orphaned. A server
+# that belongs to this run has a `<name>.pid` file under $PSMUX_DIR; anything
+# without one is somebody else's and is left alone. The pane shells die with
+# their server because kill-session / kill-server tear the tree down, so ask
+# the server first and only fall back to the pid when it does not answer.
 function Kill-AllPsmux {
-    Get-Process -Name psmux,tmux,pmux -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    $psmuxExe = (Get-Command psmux -ErrorAction SilentlyContinue).Source
+    foreach ($pidFile in @(Get-ChildItem "$PSMUX_DIR\*.pid" -ErrorAction SilentlyContinue)) {
+        $name = $pidFile.BaseName
+        $raw = (Get-Content $pidFile.FullName -Raw -ErrorAction SilentlyContinue)
+        $serverPid = if ($raw -and ($raw.Trim() -split ':')[0] -match '^\d+$') { [int](($raw.Trim() -split ':')[0]) } else { 0 }
+        if ($psmuxExe) { try { & $psmuxExe kill-session -t $name 2>&1 | Out-Null } catch { } }
+        Start-Sleep -Milliseconds 150
+        if ($serverPid -gt 0) {
+            $p = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            if ($p -and $p.ProcessName -match '^(psmux|tmux|pmux)$') { Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue }
+        }
+    }
     Start-Sleep -Milliseconds 500
     # Clean stale port files
     Get-ChildItem "$PSMUX_DIR\*.port" -ErrorAction SilentlyContinue |

@@ -3,14 +3,39 @@
 # for arrow/rounded/slant, with the expected powerline codepoints.
 
 $ErrorActionPreference = "Continue"
+# Same encoding fix as test_issue58_all_themes.ps1 / test_issue263_nested.ps1:
+# without forcing this process's own console/pipeline encoding to UTF-8,
+# PowerShell mis-decodes psmux's UTF-8 output for the Private Use Area
+# powerline glyphs (U+E0Bx) checked below, producing "got NONE" for every
+# separator even though psmux stores/returns them correctly.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "test_issue58_fix"
 $psmuxDir = "$env:USERPROFILE\.psmux"
-$PLUGIN = "$env:LOCALAPPDATA\Temp\psmux-plugins-check\psmux-theme-everforest\psmux-theme-everforest.ps1"
+$PLUGIN_BASE = "$env:USERPROFILE\.psmux\plugins\psmux-plugins"
+$PLUGIN = "$PLUGIN_BASE\psmux-theme-everforest\psmux-theme-everforest.ps1"
 $script:Pass = 0; $script:Fail = 0
 function Write-Pass($m){ Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function Write-Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
 function Cleanup { & $PSMUX kill-session -t $SESSION 2>&1 | Out-Null; Start-Sleep -Milliseconds 400; Remove-Item "$psmuxDir\$SESSION.*" -Force -EA SilentlyContinue }
+
+# The theme .ps1 fixture is an external psmux-plugins checkout (same fixture
+# test_issue58_all_themes.ps1 depends on), now kept in the durable
+# ~\.psmux\plugins location that survives Windows Temp cleanup, and
+# auto-cloned if missing (same bootstrap as test_real_plugins.ps1). When the
+# .ps1 is still absent after the bootstrap there is nothing real to test --
+# every "got NONE" below would just be this file not being found, not a
+# separator-wiring regression -- so skip instead of reporting phantom
+# failures.
+if (-not (Test-Path $PLUGIN_BASE)) {
+    Write-Host "[INFO] Cloning psmux-plugins repo into $PLUGIN_BASE ..." -ForegroundColor Cyan
+    git clone https://github.com/psmux/psmux-plugins $PLUGIN_BASE 2>&1 | Out-Null
+}
+if (-not (Test-Path $PLUGIN)) {
+    Write-Host "[SKIP] psmux-plugins theme checkout not present at $PLUGIN (clone psmux-plugins there to run this suite)" -ForegroundColor Yellow
+    exit 0
+}
 
 Cleanup
 & $PSMUX new-session -d -s $SESSION

@@ -1,8 +1,7 @@
 # Issue #178: pane-border-format label clipped or overflows on narrow panes
 #
-# Fix: rendering.rs line 325 guards `if label_width > 0 && area.width >= label_width`
-# and line 327 uses `label_width.min(area.width)` so the label area never exceeds
-# the pane width. No overflow into adjacent panes, no panic on very narrow panes.
+# client::render_layout_json checks the label width before drawing, so the
+# label area never exceeds the pane width.
 #
 # Verification strategy:
 #   1. Create a session, split into two panes, make one pane very narrow (10 cols).

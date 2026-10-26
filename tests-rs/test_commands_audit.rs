@@ -5,6 +5,12 @@
 
 use super::*;
 
+use std::io::{Read, Write as IoWrite};
+use std::net::TcpListener;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 fn mock_app() -> AppState {
     let mut app = AppState::new("test_session".to_string());
     app.window_base_index = 0;
@@ -18,6 +24,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -28,6 +37,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -43,6 +54,34 @@ fn mock_app_with_windows(names: &[&str]) -> AppState {
         app.windows.push(make_window(name, i));
     }
     app
+}
+
+fn capture_control_request() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut request = Vec::new();
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut seen_lf = 0;
+            let mut buf = [0u8; 1];
+            while seen_lf < 2 {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        request.push(buf[0]);
+                        if buf[0] == b'\n' {
+                            seen_lf += 1;
+                        }
+                    }
+                }
+            }
+            let _ = stream.write_all(b"OK\n");
+            let _ = stream.flush();
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+    });
+    (port, rx)
 }
 
 /// Extract popup output text, panicking with context if not PopupMode.
@@ -88,6 +127,20 @@ fn display_alias_works() {
     execute_command_string(&mut app, "display test_alias").unwrap();
     let msg = extract_status_message(&app);
     assert_eq!(msg, "test_alias");
+}
+
+#[test]
+fn new_window_forwards_full_command_to_control_port() {
+    let command = r#"new-window -n 'Foo Bar' -c 'D:\x y' 'clod --resume=abc 123'"#;
+    let (port, request_rx) = capture_control_request();
+    let mut app = mock_app_with_window();
+    app.control_port = Some(port);
+    app.session_key = "test-key".to_string();
+
+    execute_command_string(&mut app, command).unwrap();
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request, format!("AUTH test-key\n{}\n", command));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -259,21 +312,35 @@ fn findw_alias_works() {
 
 #[test]
 fn move_window_changes_position() {
+    // `-t` names a display INDEX, and tmux refuses one another window already
+    // holds. Verified on tmux 3.4 with 0:first* 1:second 2:third:
+    //   move-window -t 2  ->  rc 1, "index in use: 2", list unchanged
+    //   move-window -t 5  ->  rc 0, 1:second 2:third 5:first*
+    // This used to splice the Vec instead, which produced an order tmux never
+    // produces for any layout with a gap (issue #602).
     let mut app = mock_app_with_windows(&["first", "second", "third"]);
     app.active_idx = 0; // "first" is active
     execute_command_string(&mut app, "move-window -t 2").unwrap();
-    // After move, "first" should now be at position 1 (moved toward index 2)
     let names: Vec<&str> = app.windows.iter().map(|w| w.name.as_str()).collect();
-    assert_eq!(names[0], "second", "second should be at 0 after move");
-    assert!(names.contains(&"first"), "first should still exist");
+    assert_eq!(names, vec!["first", "second", "third"],
+        "an occupied destination is refused, so nothing moves");
+
+    execute_command_string(&mut app, "move-window -t 5").unwrap();
+    let names: Vec<&str> = app.windows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, vec!["second", "third", "first"], "first moved to index 5");
+    assert_eq!(app.window_indices, vec![1, 2, 5]);
+    assert_eq!(app.windows[app.active_idx].name, "first",
+        "without -d the moved window stays current");
 }
 
 #[test]
 fn movew_alias_works() {
     let mut app = mock_app_with_windows(&["a", "b", "c"]);
     app.active_idx = 2;
-    execute_command_string(&mut app, "movew -t 0").unwrap();
-    assert_eq!(app.windows[0].name, "c", "moving window 2 to position 0");
+    execute_command_string(&mut app, "movew -t 7").unwrap();
+    assert_eq!(app.window_indices, vec![0, 1, 7], "c took index 7");
+    assert_eq!(app.windows[2].name, "c");
+    assert_eq!(app.windows[app.active_idx].name, "c");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -324,6 +391,8 @@ fn linkw_alias_accepted() {
     let mut app = mock_app_with_window();
     // linkw alias is also accepted without error
     execute_command_string(&mut app, "linkw").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -403,12 +472,17 @@ fn suspendc_alias_shows_not_available() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn choose_client_shows_single_client_message() {
+fn choose_client_lists_the_attached_clients() {
+    // psmux takes several clients, so the old "single-client model" status
+    // line was wrong (discussion #776); the client list is shown instead, as
+    // the wire path does.
     let mut app = mock_app_with_window();
+    app.register_client(1, false);
     execute_command_string(&mut app, "choose-client").unwrap();
-    let msg = extract_status_message(&app);
-    assert!(msg.contains("single-client") || msg.contains("only client"),
-        "choose-client should show single-client feedback, got: {}", msg);
+    let (cmd, out) = extract_popup(&app);
+    assert_eq!(cmd, "choose-client");
+    assert!(out.contains("/dev/pts/1:"), "choose-client should list the client, got: {}", out);
+    assert!(app.status_message.as_ref().map_or(true, |m| !m.0.contains("single-client")));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -454,13 +528,21 @@ fn refresh_alias_works() {
 #[test]
 fn server_info_shows_popup_with_version_and_session() {
     let mut app = mock_app_with_window();
+    // tmux's default alias makes `server-info` run `show-messages -JT`
+    // (command_alias_defaults_expand_info below).
     app.session_name = "my_sess".to_string();
     execute_command_string(&mut app, "server-info").unwrap();
     let (cmd, out) = extract_popup(&app);
-    assert_eq!(cmd, "server-info");
-    assert!(out.contains("psmux"), "should contain 'psmux'");
-    assert!(out.contains("my_sess"), "should contain session name");
-    assert!(out.contains("Windows:"), "should contain window count");
+    assert_eq!(cmd, "show-messages");
+    // The same six lines the server sends the CLI and control mode.
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 6, "{:?}", lines);
+    assert_eq!(lines[0], format!("psmux {} (Windows)", crate::types::VERSION));
+    assert_eq!(lines[1], format!("pid: {}", std::process::id()));
+    assert_eq!(lines[2], "session: my_sess");
+    assert_eq!(lines[3], format!("windows: {}", app.windows.len()));
+    assert!(lines[4].starts_with("uptime: ") && lines[4].ends_with('s'), "{}", lines[4]);
+    assert!(lines[5].starts_with("socket: "), "{}", lines[5]);
 }
 
 #[test]
@@ -468,20 +550,48 @@ fn info_alias_works() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "info").unwrap();
     let (cmd, _) = extract_popup(&app);
-    assert_eq!(cmd, "server-info");
+    assert_eq!(cmd, "show-messages");
+    // info is an alias, no command of its own: with the array emptied, as a
+    // tmux config can, it runs nothing.
+    let mut app = mock_app_with_window();
+    crate::command_alias::write(&app.command_aliases).set("command-alias", "", false).unwrap();
+    execute_command_string(&mut app, "info").unwrap();
+    assert!(!matches!(app.mode, Mode::PopupMode { .. }));
+}
+
+#[test]
+fn command_alias_defaults_expand_info() {
+    // tmux's default command-alias (options-table.c:301-306): info and
+    // server-info are `show-messages -JT`.
+    let app = mock_app_with_window();
+    let aliases = crate::command_alias::read(&app.command_aliases);
+    for name in ["info", "server-info"] {
+        assert_eq!(
+            aliases.expand(&[name.to_string()]),
+            Some(vec![vec!["show-messages".to_string(), "-JT".to_string()]]),
+            "{}",
+            name
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  show-messages: shows popup
+//  show-messages: the server-info text, whatever -J, -T and -t say
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn show_messages_shows_popup() {
-    let mut app = mock_app_with_window();
-    execute_command_string(&mut app, "show-messages").unwrap();
-    let (cmd, out) = extract_popup(&app);
-    assert_eq!(cmd, "show-messages");
-    assert!(out.contains("no messages"), "empty messages log should show feedback");
+fn show_messages_shows_the_server_info_text() {
+    // tmux's default aliases make info and server-info `show-messages -JT`.
+    // psmux has no message log, so every form prints what info prints.
+    for line in ["show-messages", "show-messages -J", "show-messages -T", "show-messages -JT", "show-messages -t /dev/pts/0"] {
+        let mut app = mock_app_with_window();
+        app.session_name = "my_sess".to_string();
+        execute_command_string(&mut app, line).unwrap();
+        let (cmd, out) = extract_popup(&app);
+        assert_eq!(cmd, "show-messages", "{}", line);
+        assert_eq!(out.lines().next(), Some(format!("psmux {} (Windows)", crate::types::VERSION).as_str()), "{}", line);
+        assert!(out.contains("\nsession: my_sess\n"), "{}: {}", line, out);
+    }
 }
 
 #[test]
@@ -914,8 +1024,10 @@ fn every_command_does_not_panic_embedded_mode() {
     ];
     for cmd in &safe_commands {
         let mut app = mock_app_with_windows(&["test1", "test2"]);
-        app.paste_buffers.push("buffer_data".to_string());
+        app.paste_add("buffer_data".to_string());
         let result = execute_command_string(&mut app, cmd);
         assert!(result.is_ok(), "command '{}' panicked or returned error: {:?}", cmd, result);
+        // Some of these start a real shell; end it before the state drops.
+        crate::util::kill_app_shells(&mut app);
     }
 }

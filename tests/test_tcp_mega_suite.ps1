@@ -78,10 +78,9 @@ function Send-TcpCommand {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()
@@ -113,10 +112,9 @@ function Send-TcpRaw {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()

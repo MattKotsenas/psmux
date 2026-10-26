@@ -287,8 +287,20 @@ if (-not (Test-Path $injectorExe)) {
         Start-Sleep -Milliseconds 500
 
         $marker = "NOSYNC$(Get-Random -Maximum 9999)"
-        # Inject prefix+q (to activate overlay), wait for auto-dismiss, then type marker
-        & $injectorExe $proc.Id "^b{SLEEP:200}q{SLEEP:700}echo $marker{ENTER}"
+        # Inject prefix+q (to activate overlay), wait for auto-dismiss, then type marker.
+        #
+        # Root-cause note (2026-07-18 debugging pass): this used to wait only
+        # 700ms after 'q' before typing, but display-panes-time defaults to
+        # 1000ms, so the overlay can STILL be showing (and swallowing/
+        # dismissing-on-first-key) at the 700ms mark - a race against the
+        # overlay's own timer, not a real post-dismissal desync. Reproduced
+        # directly: at 700ms margin the leading 'e' of "echo" gets consumed
+        # by the still-active overlay's dismiss-on-keypress handling, and the
+        # shell receives "cho ...". At 1200ms margin (comfortably past the
+        # 1000ms auto-dismiss) the full "echo <marker>" reaches the pane
+        # every time with zero desync. Widened the margin so the test
+        # actually waits for the real auto-dismiss instead of racing it.
+        & $injectorExe $proc.Id "^b{SLEEP:200}q{SLEEP:1200}echo $marker{ENTER}"
         Start-Sleep -Seconds 2
 
         $cap = & $PSMUX capture-pane -t $SESSION_TUI -p 2>&1 | Out-String

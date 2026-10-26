@@ -26,6 +26,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -36,6 +39,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -576,9 +581,10 @@ fn auto_respawn_hook_full_chain_verify() {
 fn ctrl_req_respawn_pane_carries_kill_flag() {
     // Verify CtrlReq::RespawnPane enum variant stores workdir, kill, and command.
     // (issue #399: added the optional `-- <command>` field.)
-    let req_with_kill = CtrlReq::RespawnPane(Some("/tmp".to_string()), true, None);
+    let (resp_s, _resp_r) = std::sync::mpsc::channel();
+    let req_with_kill = CtrlReq::RespawnPane(Some("/tmp".to_string()), true, None, false, resp_s, Vec::new());
     match req_with_kill {
-        CtrlReq::RespawnPane(wd, kill, cmd) => {
+        CtrlReq::RespawnPane(wd, kill, cmd, _, _, _) => {
             assert_eq!(wd.as_deref(), Some("/tmp"));
             assert!(kill, "kill flag must be true");
             assert!(cmd.is_none(), "no -- command in this case");
@@ -587,9 +593,10 @@ fn ctrl_req_respawn_pane_carries_kill_flag() {
     }
 
     // issue #399: a teammate launch delivers the command via `respawn-pane -- <cmd>`.
-    let req_with_cmd = CtrlReq::RespawnPane(None, true, Some("claude --agent-id Bob".to_string()));
+    let (resp_s, _resp_r) = std::sync::mpsc::channel();
+    let req_with_cmd = CtrlReq::RespawnPane(None, true, Some("claude --agent-id Bob".to_string()), false, resp_s, Vec::new());
     match req_with_cmd {
-        CtrlReq::RespawnPane(wd, kill, cmd) => {
+        CtrlReq::RespawnPane(wd, kill, cmd, _, _, _) => {
             assert!(wd.is_none());
             assert!(kill);
             assert_eq!(cmd.as_deref(), Some("claude --agent-id Bob"), "-- command must be carried");
@@ -597,9 +604,10 @@ fn ctrl_req_respawn_pane_carries_kill_flag() {
         _ => panic!("wrong variant"),
     }
 
-    let req_without_kill = CtrlReq::RespawnPane(None, false, None);
+    let (resp_s, _resp_r) = std::sync::mpsc::channel();
+    let req_without_kill = CtrlReq::RespawnPane(None, false, None, false, resp_s, Vec::new());
     match req_without_kill {
-        CtrlReq::RespawnPane(wd, kill, cmd) => {
+        CtrlReq::RespawnPane(wd, kill, cmd, _, _, _) => {
             assert!(wd.is_none());
             assert!(!kill, "kill flag must be false");
             assert!(cmd.is_none());

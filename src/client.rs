@@ -11,17 +11,322 @@ use crate::layout::LayoutJson;
 use crate::help;
 use crate::util::{WinTree, base64_encode, quote_arg};
 use crate::session::read_session_key;
-use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
-use crate::style::parse_tmux_style_components;
+use crate::rendering::{
+    BorderGeometry, centered_rect, dim_color, dim_predictions_enabled,
+    fix_border_intersections,
+};
+use crate::style::{map_color, parse_tmux_style_components};
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
-use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
+use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled,
+    reconnect_log, reconnect_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
+use crate::pane_border::PaneBorderIndicators;
+
+/// A floating pane (tmux new-pane) as shipped from the server: position, size,
+/// border style, focus, title, and the pane's rendered rows.
+#[derive(serde::Deserialize, Clone, Default)]
+pub(crate) struct FloatJson {
+    #[serde(default)] pub x: u16,
+    #[serde(default)] pub y: u16,
+    #[serde(default)] pub w: u16,
+    #[serde(default)] pub h: u16,
+    #[serde(default)] pub border: String,
+    #[serde(default)] pub focused: bool,
+    #[serde(default)] pub title: String,
+    #[serde(default)] pub rows: Vec<crate::layout::RowRunsJson>,
+    /// The float's own cursor, content relative (#767).
+    #[serde(default)] pub cursor_row: u16,
+    #[serde(default)] pub cursor_col: u16,
+    #[serde(default)] pub hide_cursor: bool,
+    /// new-pane -s: the float's window-style (and window-active-style).
+    #[serde(default)] pub style: String,
+    /// new-pane -S: its pane-active-border-style.
+    #[serde(default)] pub astyle: String,
+    /// new-pane -R: its pane-border-style.
+    #[serde(default)] pub bstyle: String,
+}
+
+/// Content rect of a float on screen: the same placement and border inset
+/// `render_float_overlays` draws it with. `None` for a float too small to draw.
+pub(crate) fn float_inner_rect(content_chunk: Rect, fl: &FloatJson) -> Option<Rect> {
+    if fl.w < 2 || fl.h < 2 { return None; }
+    let w = fl.w.min(content_chunk.width);
+    let h = fl.h.min(content_chunk.height);
+    let x = content_chunk.x + fl.x.min(content_chunk.width.saturating_sub(w));
+    let y = content_chunk.y + fl.y.min(content_chunk.height.saturating_sub(h));
+    if fl.border == "none" {
+        Some(Rect { x, y, width: w, height: h })
+    } else {
+        Some(Rect { x: x + 1, y: y + 1, width: w.saturating_sub(2), height: h.saturating_sub(2) })
+    }
+}
+
+/// Where the terminal cursor goes when a floating pane holds the focus (#767).
+///
+/// tmux puts the cursor in the active pane, and a focused floating pane IS
+/// the active pane, so the cursor sits at that pane's cursor inside the float
+/// (`server_client_reset_state`, server-client.c, using `wp->xoff`/`wp->yoff`
+/// of the floating pane). The outer `None` means no float is focused, so the
+/// tiled active pane decides. `Some(None)` means a float is focused but its
+/// cursor is hidden (or the float cannot be drawn): the cursor must not fall
+/// back to the tiled pane behind it.
+pub(crate) fn focused_float_cursor(content_chunk: Rect, floats: &[FloatJson]) -> Option<Option<(u16, u16)>> {
+    let fl = floats.iter().rev().find(|fl| fl.focused)?;
+    let inner = match float_inner_rect(content_chunk, fl) {
+        Some(r) if r.width > 0 && r.height > 0 => r,
+        _ => return Some(None),
+    };
+    if fl.hide_cursor { return Some(None); }
+    let cx = inner.x + fl.cursor_col.min(inner.width - 1);
+    let cy = inner.y + fl.cursor_row.min(inner.height - 1);
+    Some(Some((cx, cy)))
+}
+
+/// Extract the `-T <table>` argument of a `switch-client` command line.
+///
+/// Issue #640: `switch-client -T <table>` is not session navigation. tmux's
+/// `cmd_switch_client_exec` returns as soon as `-T` is present, after setting
+/// `tc->keytable`, so the flag has to be recognised before the `-n`/`-p`/`-l`
+/// arms are considered. Returns `None` for every other `switch-client` form.
+///
+/// The tokenizer is the same one the server's command dispatcher uses, so a
+/// quoted table name (`switch-client -T "my table"`) parses identically here.
+pub fn switch_client_table_arg(cmd: &str) -> Option<String> {
+    let parts = crate::commands::parse_command_line(cmd);
+    if !matches!(parts.first().map(|s| s.as_str()), Some("switch-client") | Some("switchc")) {
+        return None;
+    }
+    let mut i = 1;
+    while i < parts.len() {
+        if parts[i] == "-T" {
+            return parts.get(i + 1).filter(|t| !t.is_empty()).cloned();
+        }
+        // `-Tname` (tmux's getopt accepts the value glued to the flag).
+        if let Some(rest) = parts[i].strip_prefix("-T") {
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return Some(rest.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// What an attached client should do with one dispatched binding, as far as
+/// the key table and session navigation are concerned.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BindingDispatch {
+    /// A bare `switch-client -n` / `-p` / `-l`: session navigation, which the
+    /// client performs itself. `next` is true for `-n`.
+    SessionNav { next: bool },
+    /// Commands to hand to the server, in order, plus the key table this
+    /// binding leaves latched on the client (`None` when it latches nothing).
+    Commands { cmds: Vec<String>, latch: Option<String> },
+}
+
+/// The lines a binding's command list goes out as (PR #740).
+///
+/// Each command is normally its own line. The server runs a foreground
+/// `run-shell` (no `-b`) on a thread so the client's reader keeps reading, and
+/// separate lines would then run before the shell had finished. tmux runs the
+/// rest of the list only after it: the run-shell item waits in the client's
+/// queue (cmd-run-shell.c returns CMD_RETURN_WAIT, cmd-queue.c CMDQ_WAITING).
+/// So a list in which a foreground run-shell is followed by more commands goes
+/// out as one `\;` joined line, which the server splits again and holds the
+/// tail of until the shell exits. Every other list is unchanged on the wire.
+pub(crate) fn binding_wire_lines(cmds: &[String]) -> Vec<String> {
+    let waits = |sub: &str| {
+        let argv = crate::commands::parse_command_line(sub);
+        matches!(argv.first().map(|s| s.as_str()), Some("run-shell") | Some("run"))
+            && !argv.iter().skip(1).any(|a| a == "-b")
+    };
+    let n = cmds.len();
+    if n > 1 && cmds[..n - 1].iter().any(|c| waits(c)) {
+        vec![format!("{}\n", cmds.join(" \\; "))]
+    } else {
+        cmds.iter().map(|c| format!("{}\n", c)).collect()
+    }
+}
+
+/// Split a binding into the command list tmux would dispatch and report the key
+/// table it leaves latched (issue #640).
+///
+/// tmux clears the client's key table BEFORE running the binding:
+/// `server_client_set_key_table(c, NULL)` at server-client.c:1572 immediately
+/// precedes `key_bindings_dispatch(bd, item, c, event, &fs)` at :1577. So a
+/// `switch-client -T` anywhere in the binding's command list re-arms the table
+/// instead of being undone once the binding finishes, and that ordering is the
+/// whole of the sticky/repeat table idiom:
+///
+/// ```text
+/// bind-key z switch-client -T MOVE
+/// bind-key -T MOVE h select-pane -L \; switch-client -T MOVE
+/// ```
+///
+/// The last `-T` in the list wins, because `cmd_switch_client_exec` just
+/// assigns `tc->keytable` every time it runs. Matching on the whole binding
+/// string instead of on its elements used to keep only the head of a chain,
+/// so `switch-client -T MOVE \; select-pane -L` silently dropped the movement.
+pub fn dispatch_binding_commands(binding: &str) -> BindingDispatch {
+    let subs = crate::config::split_chained_commands_pub(binding);
+    if subs.len() == 1 {
+        let only = subs[0].trim();
+        let argv = crate::commands::parse_command_line(only);
+        let is_switch = matches!(
+            argv.first().map(|s| s.as_str()),
+            Some("switch-client") | Some("switchc")
+        );
+        if is_switch && switch_client_table_arg(only).is_none() {
+            // Only `-n` / `-p` are session navigation the client performs
+            // itself. `switch-client -t <target>` names an explicit destination
+            // and must reach the server, which resolves the session, validates
+            // any window/pane component and signals the re-attach (#483, #555).
+            // So must `-l`: the last session is this client's own history,
+            // which the server keeps (issue #566). Taken here it ran as `-p`,
+            // the previous session by name, which is a different session as
+            // soon as there are three. Deciding this by `contains("-n")` over
+            // the whole string also misread any target that merely contained
+            // those two characters, so the flags are matched as parsed tokens.
+            let has_target = argv.iter().any(|a| a == "-t");
+            let has_last = argv.iter().any(|a| a == "-l");
+            let nav = argv
+                .iter()
+                .find(|a| matches!(a.as_str(), "-n" | "-p"))
+                .map(|a| a == "-n")
+                .filter(|_| !has_last);
+            if !has_target {
+                if let Some(next) = nav {
+                    return BindingDispatch::SessionNav { next };
+                }
+            }
+        }
+    }
+    let mut cmds = Vec::with_capacity(subs.len());
+    let mut latch: Option<String> = None;
+    for sub in &subs {
+        let sub = sub.trim();
+        if sub.is_empty() {
+            continue;
+        }
+        if let Some(tbl) = switch_client_table_arg(sub) {
+            // Re-emit canonically so the server sees the same table name the
+            // client latched, quoting included.
+            cmds.push(format!("switch-client -T {}", crate::util::quote_arg_if_needed(&tbl)));
+            latch = Some(tbl);
+        } else {
+            cmds.push(sub.to_string());
+        }
+    }
+    BindingDispatch::Commands { cmds, latch }
+}
+
+/// Keeps the attached client's `switch-client -T` latch in step with the key
+/// table the server holds.
+///
+/// tmux has a single `c->keytable`: a `switch-client -T` run from a binding,
+/// the command prompt, the CLI, run-shell or a hook all write it, and the next
+/// key is looked up in it. psmux dispatches keys in the client, so a table the
+/// server set behind the client's back (everything except a binding the client
+/// dispatched itself) used to change `#{client_key_table}` and nothing else:
+/// the next key still went to root.
+///
+/// The server reports its table in every state frame. A change there that the
+/// client did not cause itself is adopted as the client's latch. The client's
+/// own writes (the reset to root before a latched key's binding, a binding's
+/// `switch-client -T`, the drop on the prefix key) are queued, so their echoes,
+/// including a frame that was already in flight when a fast second key landed,
+/// never re-arm a latch the client has just consumed.
+///
+/// It also holds the session's `key-table` option (tmux
+/// `server_client_get_key_table`): the table a client returns to after every
+/// key, root unless set. A latch naming it is no latch at all.
+#[derive(Debug, Default)]
+pub(crate) struct KeyTableSync {
+    last_server: Option<String>,
+    own_writes: std::collections::VecDeque<Option<String>>,
+    /// The session's `key-table`; empty means root.
+    default: String,
+}
+
+impl KeyTableSync {
+    /// The table keys are looked up in when nothing is latched.
+    pub(crate) fn default_table(&self) -> &str {
+        if self.default.is_empty() { "root" } else { &self.default }
+    }
+
+    /// The server reported the session's `key-table` (absent = root).
+    pub(crate) fn set_default(&mut self, table: Option<&str>) {
+        self.default = match table {
+            Some(t) if t != "root" => t.to_string(),
+            _ => String::new(),
+        };
+    }
+
+    /// The server stores the default table as no table at all.
+    fn normalize(&self, table: Option<&str>) -> Option<String> {
+        match table {
+            None => None,
+            Some(t) if t == self.default_table() => None,
+            Some(t) => Some(t.to_string()),
+        }
+    }
+
+    /// The latch a binding's `switch-client -T` leaves: naming the default
+    /// table puts the client on it, which is the unlatched state.
+    pub(crate) fn latch_for(&self, table: Option<String>) -> Option<String> {
+        self.normalize(table.as_deref())
+    }
+
+    /// The client sent the server a table change of its own.
+    pub(crate) fn note_own_write(&mut self, table: Option<&str>) {
+        if self.own_writes.len() >= 32 {
+            self.own_writes.pop_front();
+        }
+        let v = self.normalize(table);
+        self.own_writes.push_back(v);
+    }
+
+    /// A state frame reported `server` as the server's table. Returns
+    /// `Some(latch)` when the client must adopt it (`Some(None)` = back to the
+    /// default table).
+    pub(crate) fn on_server_table(&mut self, server: Option<&str>) -> Option<Option<String>> {
+        let v = self.normalize(server);
+        if let Some(pos) = self.own_writes.iter().position(|w| *w == v) {
+            // An echo of the client's own write: the latch already says so.
+            self.own_writes.drain(..=pos);
+            self.last_server = v;
+            return None;
+        }
+        if v != self.last_server {
+            self.last_server = v.clone();
+            self.own_writes.clear();
+            return Some(v);
+        }
+        None
+    }
+}
 
 /// Extract the actual command from a confirm-before argument string.
 /// Handles: `confirm-before -p 'prompt text' kill-pane`
 /// Returns the command to execute after confirmation (e.g. "kill-pane").
+/// The chooser a binding opens on this client without asking the server: a
+/// `choose-tree` with no flag but `-Z`, `-s` and `-w`, as the default
+/// prefix+w and prefix+s are (`choose-tree -Zw`, `choose-tree -Zs`). Anything
+/// else goes to the server, which sends the chooser back as a directive.
+pub(crate) fn local_chooser(cmd: &str) -> Option<crate::choose_tree::ChooserKind> {
+    let words = crate::commands::parse_command_line(cmd);
+    let (name, args) = words.split_first()?;
+    if name != "choose-tree" {
+        return None;
+    }
+    let plain = args
+        .iter()
+        .all(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| matches!(c, 'Z' | 's' | 'w')));
+    plain.then(|| crate::choose_tree::chooser_kind(args))
+}
+
 fn extract_confirm_command(args: &str) -> String {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let mut i = 0;
@@ -52,8 +357,330 @@ fn extract_confirm_command(args: &str) -> String {
     args.to_string()
 }
 
+/// What a `command-prompt` binding's flags asked the client to do: the text the
+/// prompt opens with (`-I`), the overlay heading (`-p`), and the command to run
+/// with `%%` replaced by whatever the user typed. A bare `command-prompt`
+/// leaves all three empty and the typed line is itself the command.
+///
+/// The same parse serves a prefix binding and `psmux command-prompt` run from
+/// the command line, which the server hands to the attached client (#789
+/// follow up), so the two cannot drift apart.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandPromptSpec {
+    pub(crate) initial: String,
+    pub(crate) label: Option<String>,
+    pub(crate) template: Option<String>,
+    /// `-k`: the next key answers the prompt with its NAME
+    /// (PROMPT_KEY, status.c:1438).
+    pub(crate) key: bool,
+    /// `-1`: the next character answers the prompt (PROMPT_SINGLE).
+    pub(crate) single: bool,
+    /// `-N`: only digits are typed; any other key answers the prompt and is
+    /// then handled as the key it is (PROMPT_NUMERIC, status.c:1449).
+    pub(crate) numeric: bool,
+    /// `-T search`: Up and Down walk the search history, not the command
+    /// history (tmux keeps one history per prompt type).
+    pub(crate) search: bool,
+    /// `-T` as given, for the server's check of the type name.
+    pub(crate) prompt_type: Option<String>,
+    /// `-F`: the template is expanded as a format before it is used.
+    pub(crate) format: bool,
+    /// `-b`: the command line that asked for the prompt does not wait for it.
+    pub(crate) background: bool,
+    /// `-l`: the labels are one literal string, not split on commas.
+    pub(crate) literal: bool,
+    /// `-t`: the client the prompt opens on.
+    pub(crate) target: Option<String>,
+}
+
+impl CommandPromptSpec {
+    /// One `(label, initial text)` per prompt: `-p a,b` asks twice, and `-I`
+    /// splits the same way (cmd-command-prompt.c:131 to :154).
+    pub(crate) fn prompts(&self) -> Vec<(Option<String>, String)> {
+        let labels: Vec<Option<String>> = match &self.label {
+            Some(l) if !self.literal => l.split(',').map(|s| Some(s.to_string())).collect(),
+            other => vec![other.clone()],
+        };
+        let inputs: Vec<String> = if self.literal {
+            vec![self.initial.clone()]
+        } else {
+            self.initial.split(',').map(str::to_string).collect()
+        };
+        labels
+            .into_iter()
+            .enumerate()
+            .map(|(n, l)| (l, inputs.get(n).cloned().unwrap_or_default()))
+            .collect()
+    }
+}
+
+/// Parse the arguments of a `command-prompt` binding — everything after the
+/// command name.
+///
+/// A value-taking flag consumes the token after it, classified through the one
+/// flag table in cli.rs (`cli::flag_takes_value`) rather than a list kept here.
+/// tmux's own `bind . command-prompt -T target "move-window -t '%%'"` is the
+/// case that needs it: skipping the flag but not its value left `target` as the
+/// first word of the template, so Enter ran `target move-window -t '3'`.
+///
+/// Four more shapes follow tmux's `args_parse_flags` (arguments.c:207): the
+/// flags end at the first token that is not one (so a `-t` inside an unquoted
+/// template stays in the template), `--` ends them explicitly, a value glued to
+/// its flag (`-pindex`) satisfies it on its own, and one token can carry
+/// several flags.
+/// The text inside the `{ ... }` block that ends `args`: from the first `{`
+/// standing as a word of its own to the last `}`, trimmed.
+fn brace_block_body(args: &str) -> Option<String> {
+    let close = args.rfind('}')?;
+    let bytes = args.as_bytes();
+    let open = args.char_indices().find(|&(at, c)| {
+        c == '{'
+            && (at == 0 || bytes[at - 1].is_ascii_whitespace())
+            && bytes.get(at + 1).is_none_or(|b| b.is_ascii_whitespace())
+    })?.0;
+    (open < close).then(|| args[open + 1..close].trim().to_string())
+}
+
+pub(crate) fn parse_command_prompt_args(args: &str) -> CommandPromptSpec {
+    let tokens = crate::config::shell_words(args);
+    let mut spec = CommandPromptSpec::default();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].clone();
+        if token == "--" {
+            i += 1;
+            break;
+        }
+        // A bare `-`, and anything not starting with `-`, ends the flags: what
+        // is left is the template.
+        let Some(rest) = token.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
+            break;
+        };
+        // tmux walks the CHARACTERS of one token (arguments.c:227): a flag that
+        // takes no value falls through to the next letter in the same token, and
+        // the first one that does takes whatever is left of the token, or the
+        // token after it. tmux's own `/` binding is written that way, as
+        // `command-prompt -kpkey { list-keys -1N '%%' }`, which is `-k` plus
+        // `-p key`; reading only the first letter would have dropped `pkey` and
+        // left the prompt headed after the template instead.
+        for (at, flag) in rest.char_indices() {
+            if !crate::cli::flag_takes_value("command-prompt", flag) {
+                match flag {
+                    'k' => spec.key = true,
+                    '1' => spec.single = true,
+                    'N' => spec.numeric = true,
+                    'F' => spec.format = true,
+                    'b' => spec.background = true,
+                    'l' => spec.literal = true,
+                    _ => {}
+                }
+                continue;
+            }
+            let glued = &rest[at + flag.len_utf8()..];
+            let value = if !glued.is_empty() {
+                Some(glued.to_string())
+            } else {
+                i += 1;
+                tokens.get(i).cloned()
+            };
+            match flag {
+                'I' => spec.initial = value.unwrap_or_default(),
+                'p' => spec.label = value,
+                // -T: the prompt type. Only `search` changes anything here,
+                // which history Up and Down walk; psmux has no prompt type
+                // completion.
+                'T' => {
+                    spec.search = value.as_deref() == Some("search");
+                    spec.prompt_type = value;
+                }
+                't' => spec.target = value,
+                _ => {}
+            }
+            break;
+        }
+        i += 1;
+    }
+    if i < tokens.len() {
+        // A `{ ... }` block is the template as written, quotes included: tmux's
+        // own bindings are written that way (`command-prompt -p '(goto line)'
+        // { send -X goto-line -- '%%' }`), and the tokens above have had
+        // their quotes taken off, so joining them ran `{ rename-window a b }`
+        // for `{ rename-window "%%" }`. The block is cut from the raw text,
+        // as the copy mode prompt's parser does (#789 follow up).
+        let block = (tokens[i] == "{" && tokens.last().map(String::as_str) == Some("}"))
+            .then(|| brace_block_body(args))
+            .flatten();
+        let template = block.unwrap_or_else(|| tokens[i..].join(" "));
+        if spec.label.is_none() {
+            // With no -p, tmux's prompt names the command it is about to run.
+            // cmd-command-prompt.c:113 asks for that name and wraps it:
+            //     tmp = args_make_commands_get_command(cdata->state);
+            //     xasprintf(&prompts, "(%s)", tmp);
+            // and for a template that is still a string, which is the only
+            // shape psmux has, that name is the first word (arguments.c:885):
+            //     n = strcspn(state->cmd, " ,");
+            let head = template.split(|c| c == ' ' || c == ',').next().unwrap_or("");
+            if !head.is_empty() {
+                spec.label = Some(format!("({})", head));
+            }
+        }
+        spec.template = Some(template);
+    }
+    spec
+}
+
+/// One row of the choose-tree model: `(is_win, win_id, pane_id, label, session)`.
+/// A session header is `is_win == true` with `win_id == usize::MAX`.
+pub(crate) type TreeRow = (bool, usize, usize, String, String);
+
+/// A kill one of the choosers has asked about: the question on screen, and
+/// which row it names. The answer acts only when the cursor is still on that
+/// row, because the mouse wheel can move it while the question is up, where
+/// tmux's prompt holds the terminal and nothing can move under it.
+pub(crate) struct ChooserKill {
+    /// The confirm box's text, without the `? (y/n)` the box adds.
+    pub prompt: String,
+    /// The tree chooser's window id, or `None` in the session chooser, whose
+    /// rows are sessions.
+    pub window: Option<usize>,
+    /// The session the row belongs to, which in the session chooser is the row
+    /// itself.
+    pub session: String,
+}
+
+/// Whether a key answers a chooser's kill question with yes. tmux asks with
+/// `status_prompt_set(... PROMPT_SINGLE ...)`, which takes a single key, and
+/// its callback kills only when that key was `y` (`window-tree.c:1306` and
+/// `:1137`), so every other key cancels.
+pub(crate) fn chooser_kill_confirmed(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
+}
+
+/// Make a window or pane current in ANOTHER session's server before the
+/// client switches to it, so choosing a row of that session in the tree lands
+/// on that row (discussion #776). `focus` is one `focus-window <id>` or
+/// `focus-pane <id>` line. Written on an authenticated connection of its own
+/// and closed, so the server runs it before the switching client attaches.
+fn chooser_focus_in_session(session: &str, focus: &str) {
+    let Ok(port_str) = std::fs::read_to_string(crate::paths::port_file(session)) else { return };
+    let Ok(port) = port_str.trim().parse::<u16>() else { return };
+    let key = read_session_key(session).unwrap_or_default();
+    let _ = crate::session::send_auth_cmd(&format!("127.0.0.1:{}", port), key.trim(), focus.as_bytes());
+}
+
+/// What the tree chooser's kill question names. Its rows are built as
+/// `"  2: bash* (1 panes)"`, and tmux's own question carries the window index
+/// alone, `"Kill window 2? "` (`window-tree.c:1295`), so the part in front of
+/// the colon is what the question takes.
+pub(crate) fn chooser_kill_target(label: &str) -> String {
+    let label = label.trim();
+    label.split(':').next().unwrap_or(label).trim().to_string()
+}
+
+/// The session chooser's kill question. Its rows are registry bases, which
+/// under `-L ns` carry the `ns__` prefix, so the question names the session
+/// the way the user typed it, as tmux's "Kill session %s? " names `s->name`
+/// (`window-tree.c:1498`), and not the prefixed file stem.
+pub(crate) fn chooser_kill_session_prompt(current_session: &str, row: &str) -> String {
+    let ns = crate::session::session_namespace(current_session);
+    format!("kill-session {}", crate::session::display_session_name(ns, row))
+}
+
+/// The choose-tree header of one session: `name: N windows`, plus
+/// ` (attached)` on the client's own. `base` is the registry base, which reads
+/// `ns__name` under `-L ns`; the header shows the name, as choose-session and
+/// tmux's `#{session_name}` (window-tree.c) do.
+pub(crate) fn tree_session_header(ns: Option<&str>, base: &str, windows: usize, attached: bool) -> String {
+    format!(
+        "{}: {} windows{}",
+        crate::session::display_session_name(ns, base),
+        windows,
+        if attached { " (attached)" } else { "" }
+    )
+}
+
+/// The registry base (port file stem) of this client's own session, once a
+/// frame has said what the session is called now.
+///
+/// tmux's client holds its session by pointer (`server_client_set_session`,
+/// server-client.c), and cmd-rename-session.c only replaces `s->name`, so a
+/// rename never changes which session a client is in. psmux's client names its
+/// session by the base it attached with, and a rename moves the .port and .key
+/// files to the new base, so the base has to follow the name or every lookup
+/// by it (choose-buffer, prefix ( and ), the choosers' own row) misses.
+///
+/// The frame carries the short name; the base is `<ns>__<name>` under `-L ns`,
+/// prefixed whatever the name looks like, as `AppState::port_file_base` and
+/// RenameSession build it. `ns` is the client's namespace, read once from the
+/// base it attached with (`client_namespace`): a rename never changes the
+/// socket a server listens on, so it is never read back off a renamed base,
+/// where a name such as `my__x` in the default namespace would pass for
+/// namespace `my` and send the next rename to `my__<name>`. An empty name, or
+/// a standby that has not been claimed yet, leaves the base as it is.
+pub(crate) fn session_base_after_rename(ns: Option<&str>, current_base: &str, live_name: &str) -> String {
+    if live_name.is_empty() || crate::session::is_warm_session(live_name) {
+        return current_base.to_string();
+    }
+    match ns {
+        Some(n) => format!("{}__{}", n, live_name),
+        None => live_name.to_string(),
+    }
+}
+
+/// The `-L` namespace of the base a client attached with. A warm standby's
+/// base `<ns>____warm__` has no namespace for `session_namespace`, so it is
+/// read off the warm suffix.
+pub(crate) fn client_namespace(attach_base: &str) -> Option<String> {
+    if crate::session::is_warm_session(attach_base) {
+        attach_base.strip_suffix("____warm__").map(str::to_string)
+    } else {
+        crate::session::session_namespace(attach_base).map(str::to_string)
+    }
+}
+
+/// Classify every row of a choose-tree model so the tmux line rules in
+/// `crate::choose_tree` can be applied to it.
+pub(crate) fn tree_row_kinds(rows: &[TreeRow]) -> Vec<crate::choose_tree::RowKind> {
+    rows.iter()
+        .map(|(is_win, wid, _, _, _)| crate::choose_tree::row_kind(*is_win, *wid))
+        .collect()
+}
+
+/// Recompute the visible rows from the model, mirroring tmux's
+/// `mode_tree_build_lines`. Returns `(visible rows, visible index -> model
+/// index)`.
+pub(crate) fn tree_rebuild_visible(
+    all: &[TreeRow],
+    collapsed: &std::collections::HashSet<usize>,
+) -> (Vec<TreeRow>, Vec<usize>) {
+    let kinds = tree_row_kinds(all);
+    let map = crate::choose_tree::visible_lines(&kinds, collapsed);
+    let rows = map.iter().map(|&i| all[i].clone()).collect();
+    (rows, map)
+}
+
+/// The name a `command-prompt -k` prompt answers with, as tmux's
+/// `key_string_lookup_key` writes it (key-string.c:327): modifiers as `C-`,
+/// `M-`, `S-`, then the table name (`Left`, `PPage`, `NPage`, `IC`, `DC`,
+/// `F1`, `BTab`, `Space`, `BSpace`, `Escape`, `Enter`, `Tab`). Shift is part of
+/// a character (`A`, not `S-a`) and of BTab, and an AltGr character is the
+/// character, as the console reports AltGr as Ctrl+Alt.
+pub(crate) fn prompt_key_answer_name(code: KeyCode, mods: KeyModifiers) -> String {
+    let mut mods = mods;
+    if let KeyCode::Char(c) = code {
+        if is_altgr_char(c, mods) {
+            mods = KeyModifiers::NONE;
+        }
+    }
+    if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
+        mods.remove(KeyModifiers::SHIFT);
+    }
+    let mods = mods & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    crate::config::format_key_binding(&(code, mods))
+}
+
 /// Build a send-key name with modifier prefix (e.g. "C-Left", "S-Right", "C-S-Up").
-fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
+pub(crate) fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
     let mut prefix = String::new();
     if mods.contains(KeyModifiers::CONTROL) { prefix.push_str("C-"); }
     if mods.contains(KeyModifiers::ALT) { prefix.push_str("M-"); }
@@ -63,6 +690,30 @@ fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
     } else {
         format!("{}{}", prefix, base)
     }
+}
+
+/// The wire line that forwards one key by name: `send-key <name>\n`.
+///
+/// The server tokenizes the line with the quote aware command parser, so a
+/// name holding a quote is quoted here (issue #888): raw, `send-key M-'`
+/// opened a single quote and the server read the key as `M-`, and wrote
+/// nothing to the pane.  Names that need no quoting go out unchanged.
+pub(crate) fn send_key_line(name: &str) -> String {
+    format!("send-key {}\n", crate::util::quote_arg_if_needed(name))
+}
+
+/// The `send-key` name for an Escape key event (issue #766).
+///
+/// A front end that writes `ESC ESC` in one write reaches the client, on the
+/// console input route, as ONE Alt+Escape key record: conhost's input parser
+/// reads an ESC in front of another key as the Alt prefix, exactly as it turns
+/// `ESC a` into Alt+a.  Naming that "esc" threw the Alt away and the pane read
+/// a single ESC.  tmux reads the same bytes as M-Escape (tty-keys.c) and
+/// writes M-Escape to the pane as `\033\033` (input-keys.c, the meta prefix),
+/// so Alt is kept here and the server writes both bytes.  Ctrl and Shift have
+/// no encoding of their own on Escape, in tmux as here, so they stay "esc".
+pub(crate) fn escape_key_name(mods: KeyModifiers) -> &'static str {
+    if mods.contains(KeyModifiers::ALT) { "M-Escape" } else { "esc" }
 }
 
 /// Extract selected text from the layout tree given absolute terminal coordinates.
@@ -92,6 +743,8 @@ thread_local! {
     /// on a single thread and this avoids threading a collector through the
     /// recursive `render_layout_json`.
     static FRAME_HYPERLINKS: std::cell::RefCell<Vec<HyperlinkRun>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static PREVIOUS_HYPERLINK_ROWS: std::cell::RefCell<Vec<u16>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -140,6 +793,14 @@ pub(crate) fn frame_sixels_push(emit: SixelEmit) {
 
 pub(crate) fn frame_sixels_take() -> Vec<SixelEmit> {
     FRAME_SIXELS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
+pub(crate) fn previous_hyperlink_rows_get() -> Vec<u16> {
+    PREVIOUS_HYPERLINK_ROWS.with(|rows| rows.borrow().clone())
+}
+
+pub(crate) fn previous_hyperlink_rows_set(new_rows: Vec<u16>) {
+    PREVIOUS_HYPERLINK_ROWS.with(|rows| *rows.borrow_mut() = new_rows);
 }
 
 /// SGR parameters for a ratatui color as a foreground (`base` 38/foreground)
@@ -231,6 +892,101 @@ pub(crate) fn build_sixel_overlay(
         out.extend_from_slice(b"\x1b8"); // DECRC: restore cursor
     }
     out
+}
+
+pub(crate) fn hyperlink_rows(runs: &[HyperlinkRun]) -> Vec<u16> {
+    let mut rows: Vec<u16> = runs
+        .iter()
+        .filter(|run| !run.text.is_empty())
+        .map(|run| run.y)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+pub(crate) fn redraw_hyperlink_rows(buffer: &mut ratatui::buffer::Buffer, rows: &[u16]) {
+    let area = buffer.area;
+    for &row in rows {
+        if row < area.top() || row >= area.bottom() {
+            continue;
+        }
+        for column in area.left()..area.right() {
+            buffer[(column, row)].set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
+/// tmux ships a non-empty `pane-border-format`, so `set pane-border-status top`
+/// on its own still draws a label and still costs the pane a row.  Both the
+/// client's renderer and the server's mouse handlers substitute this when the
+/// option is unset, or the label gate skips and the reserved row goes
+/// unaccounted for (#414, #669).
+pub(crate) const DEFAULT_PANE_BORDER_FORMAT: &str = "#{pane_index} \"#{pane_title}\"";
+
+/// Content area of a pane after reserving the `pane-border-status` label row.
+/// Must match `render_layout_json`'s `inner`; the caret and every screen→cell
+/// mouse mapping route through this so they stay aligned with the content (#288).
+pub(crate) fn pane_content_inner(area: Rect, border_status: &str, border_format: &str) -> Rect {
+    let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
+    if !has_border_label {
+        return area;
+    }
+    if border_status == "top" {
+        Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+    } else {
+        // "bottom": content keeps its top origin, only the last row is reserved.
+        Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+    }
+}
+
+/// Screen rect of the centred display-popup overlay.
+///
+/// The draw pass and the post-draw cursor write both need this rect and must
+/// agree on it to the cell, or the cursor lands off the popup it belongs to
+/// (#507), so both call this instead of recomputing the geometry.
+pub(crate) fn popup_overlay_rect(content_chunk: Rect, want_w: u16, want_h: u16) -> Rect {
+    crate::popup::popup_rect(content_chunk, want_w, want_h)
+}
+
+/// Screen position of a PTY popup's cursor, given the popup-inner cursor cell
+/// reported by the server.
+///
+/// Returns `None` when the cell is not currently on screen (scrolled away, or
+/// outside a popup too small to have an interior), in which case the caller
+/// leaves the cursor hidden rather than parking it somewhere arbitrary.
+pub(crate) fn popup_cursor_screen_pos(
+    content_chunk: Rect,
+    want_w: u16,
+    want_h: u16,
+    scroll: u16,
+    cursor: (u16, u16),
+) -> Option<(u16, u16)> {
+    popup_cursor_screen_pos_framed(content_chunk, want_w, want_h, scroll, cursor, true)
+}
+
+/// [`popup_cursor_screen_pos`] for a popup drawn with or without a border
+/// (`display-popup -B` puts the content at the popup's own origin, #792).
+pub(crate) fn popup_cursor_screen_pos_framed(
+    content_chunk: Rect,
+    want_w: u16,
+    want_h: u16,
+    scroll: u16,
+    cursor: (u16, u16),
+    has_border: bool,
+) -> Option<(u16, u16)> {
+    let (cc, cr) = cursor;
+    let popup_area = popup_overlay_rect(content_chunk, want_w, want_h);
+    let inner = crate::popup::popup_inner_rect(popup_area, has_border);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    // Same scroll offset the popup paragraph is drawn with.
+    let row = cr.checked_sub(scroll)?;
+    if row >= inner.height || cc >= inner.width {
+        return None;
+    }
+    Some((inner.x + cc, inner.y + row))
 }
 
 fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
@@ -403,6 +1159,8 @@ fn extract_selection_text(
     end: (u16, u16),
     block: bool,
     pane_clip: Option<Rect>,
+    border_status: &str,
+    border_format: &str,
 ) -> String {
     let (r0, c0, r1, c1) = normalize_selection(start, end, block);
 
@@ -428,7 +1186,7 @@ fn extract_selection_text(
         for col in col_start..=col_end {
             let mut ch = ' ';
             for leaf in &leaves {
-                let inner = &leaf.inner;
+                let inner = pane_content_inner(leaf.inner, border_status, border_format);
                 if col >= inner.x
                     && col < inner.x + inner.width
                     && row >= inner.y
@@ -464,6 +1222,84 @@ fn active_pane_in_alt_screen(layout: &LayoutJson) -> bool {
     }
 }
 
+/// Check if the pane with `pane_id` has explicitly enabled a mouse protocol
+/// (DECSET 1000/1002/1003 — the server ships this per leaf as `wants_mouse`).
+/// Used on left-down to decide whether psmux may start its client-side drag
+/// selection: an app that asked for mouse tracking (gaviero, opencode, nvim
+/// with `set mouse=a`, …) implements its own selection and must receive the
+/// drags, not have psmux swallow them and paint an overlay on top.  This is
+/// the per-pane automatic version of the global `mouse-selection off` escape
+/// hatch (issue #245).  Alt-screen alone does NOT qualify, so alt-screen
+/// apps without mouse support (`less`, …) keep psmux selection.
+fn pane_wants_mouse_json(layout: &LayoutJson, pane_id: usize) -> bool {
+    match layout {
+        LayoutJson::Leaf { id, wants_mouse, .. } => *id == pane_id && *wants_mouse,
+        LayoutJson::Split { children, .. } => {
+            children.iter().any(|c| pane_wants_mouse_json(c, pane_id))
+        }
+    }
+}
+
+/// Is this batched client command nothing but a bare pointer move?
+///
+/// The client emits `pane-mouse <id> 35 <col> <row> M` when the pointer moves
+/// inside a pane and `mouse-move <col> <row>` when it moves anywhere else.
+/// SGR button 35 is the motion bit (32) plus the "no button held" low bits (3),
+/// so it is the one mouse verb that carries no user intent: it must not be
+/// mistaken for a keystroke and drive the typing fast-poll and an immediate
+/// state round trip (#604).
+pub(crate) fn is_bare_motion_cmd(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.starts_with("mouse-move ") {
+        return true;
+    }
+    let Some(rest) = cmd.strip_prefix("pane-mouse ") else { return false };
+    let mut fields = rest.split_whitespace();
+    let _pane_id = fields.next();
+    fields.next() == Some("35")
+}
+
+/// Commands a persistent client sends on a timer rather than because the user
+/// did something. `window-size latest` follows "the client the user is
+/// actually using", so a poll must not move the window to that client: with
+/// two clients of different sizes attached, each one's idle `dump-state` (once
+/// a second, ten times a second while typing) flipped the latest client back
+/// and forth, `refresh_dynamic_window_sizes` resized every pane on each flip,
+/// and that resize made the full-screen program in the pane repaint its whole
+/// screen. The user saw it as the pane flickering whenever the program was
+/// idle and a second client (the SSH/Termius one) was attached. See the
+/// activity ping in `server::connection`.
+pub(crate) fn is_client_poll_cmd(cmd: &str) -> bool {
+    cmd.trim() == "dump-state"
+}
+
+/// The one key tmux refuses to count as activity.
+///
+/// tmux updates the latest client at the `out:` label of its key callback,
+/// guarded by `key != KEYC_FOCUS_OUT` (server-client.c:1653). Focus IN is
+/// therefore activity and focus OUT deliberately is not, which is the only
+/// sensible reading: the terminal the user just moved away from is the last
+/// one that should be handed the window.
+///
+/// psmux reports both as ordinary command lines, so they pinged
+/// `ClientActivity` like anything else. Measured with a 120x40 client and a
+/// 60x20 client attached under `window-size latest`: typing in the 120x40 one
+/// sized the window 120x40, then the 60x20 client merely losing focus pulled
+/// it to 60x20. Every pane was resized and the program inside repainted, the
+/// same visible cost as the idle poll above, triggered by alt-tabbing away
+/// from the second terminal.
+pub(crate) fn is_focus_loss_cmd(cmd: &str) -> bool {
+    cmd.trim() == "focus-out"
+}
+
+fn client_selection_owns_drag(
+    mouse_selection: bool,
+    mouse_selection_force: bool,
+    pane_handles_mouse: bool,
+) -> bool {
+    mouse_selection && (mouse_selection_force || !pane_handles_mouse)
+}
+
 /// Check if the active pane is in server-side copy mode.
 /// When true, the client should NOT start its own text selection —
 /// the server handles cursor positioning and selection in copy mode.
@@ -471,6 +1307,208 @@ fn active_pane_in_copy_mode(layout: &LayoutJson) -> bool {
     match layout {
         LayoutJson::Leaf { active, copy_mode, .. } => *active && *copy_mode,
         LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_copy_mode(c)),
+    }
+}
+
+/// The selection endpoint of the active pane while it is in copy mode, in
+/// pane-content cells: the endpoint of the last frame this client painted.
+///
+/// The server's endpoint and the screen can disagree, because a motion can
+/// reach the server, be written into a frame, and still never be drawn — the
+/// release is handled before that frame gets its turn.  Only the client knows
+/// which cell the user was actually shown, so a copy-mode release re-reports
+/// this value (see [`copy_release_repin`]).
+///
+/// It is the COPY CURSOR, not `sel_end_*`.  `sel_start_*`/`sel_end_*` are the
+/// painted rectangle's top and bottom, ordered by row, so on a drag that moved
+/// UP the bottom end is the anchor and re-reporting it would collapse the
+/// selection onto the press cell and yank nothing at all.  `copy_cursor_*` is
+/// `copy_pos` itself, which is the end the drag is moving.
+fn active_copy_sel_end(layout: &LayoutJson) -> Option<(u16, u16)> {
+    match layout {
+        LayoutJson::Leaf { active, copy_mode, sel_end_row, copy_cursor_row, copy_cursor_col, .. } => {
+            // `sel_end_row` only tells us a selection is on screen at all; a
+            // copy cursor without one is keyboard copy mode, which never repins.
+            if *active && *copy_mode && sel_end_row.is_some() {
+                (*copy_cursor_row).zip(*copy_cursor_col)
+            } else {
+                None
+            }
+        }
+        LayoutJson::Split { children, .. } => children.iter().find_map(active_copy_sel_end),
+    }
+}
+
+/// The extra drag a copy-mode release sends before it reports the button up:
+/// the endpoint this client last painted.
+///
+/// The server treats the newest drag as the copy endpoint and the release as a
+/// no-op, so re-reporting the painted cell makes the yank match the highlight
+/// even when the final motion only ever reached the server — the reported bug
+/// was a highlight ending on `.` and a buffer ending on the `9` after it.
+///
+/// `None` for a gesture whose endpoint never made it to the screen (a flick the
+/// frames did not catch up with): the newest drag cell stands, as it does in
+/// tmux, and the flick is copied.
+///
+/// The painted cell is a CONTENT column, the way the server reports it, and
+/// a mouse report carries a view column, so the line number gutter has to be
+/// put back on before this goes out: the server takes it off again
+/// (`window_ops::handle_pane_mouse`). `gutter` is 0 whenever no gutter is
+/// drawn, which leaves the column alone.
+fn copy_release_repin(
+    pane_id: usize,
+    painted: Option<(u16, u16)>,
+    gutter: u16,
+    pane_width: u16,
+) -> Option<String> {
+    painted.map(|(row, col)| {
+        let col = crate::copy_line_numbers::cursor_offset(
+            gutter as usize, col as usize, pane_width as usize);
+        format!("pane-mouse {} 32 {} {} M\n", pane_id, col, row)
+    })
+}
+
+/// The commands a copy-mode drag release sends, in order: the re-pin of the
+/// painted endpoint (only when the gesture ever painted one), then the release
+/// itself.
+///
+/// Split out of the event loop so the ORDER can be pinned by a test: the re-pin
+/// has to be the last drag the server sees before the release, or the endpoint
+/// it yanks is the motion that never reached the screen.
+fn copy_release_commands(
+    pane_id: usize,
+    dragged: bool,
+    painted: Option<(u16, u16)>,
+    release: (i16, i16),
+    gutter: u16,
+    pane_width: u16,
+) -> Vec<String> {
+    let mut cmds = Vec::new();
+    if dragged {
+        if let Some(repin) = copy_release_repin(pane_id, painted, gutter, pane_width) {
+            cmds.push(repin);
+        }
+    }
+    cmds.push(format!("pane-mouse {} 0 {} {} m\n", pane_id, release.0, release.1));
+    cmds
+}
+
+#[cfg(test)]
+mod copy_release_repin_tests {
+    use super::{copy_release_commands, copy_release_repin};
+
+    #[test]
+    fn the_repin_reports_the_painted_cell_as_a_drag() {
+        assert_eq!(
+            copy_release_repin(7, Some((3, 14)), 0, 80).expect("a painted cell must be re-reported"),
+            "pane-mouse 7 32 14 3 M\n",
+            "col 14, row 3: the same order the drag itself uses"
+        );
+    }
+
+    /// With a gutter on screen the painted cell is reported where it is
+    /// PAINTED: the server reads a mouse column as a view column and takes
+    /// the gutter back off, so a re-pin that sent the content column moved
+    /// the endpoint left by the width of the gutter.
+    #[test]
+    fn the_repin_reports_the_column_the_gutter_painted_it_at() {
+        assert_eq!(
+            copy_release_repin(7, Some((3, 14)), 4, 80).expect("a painted cell must be re-reported"),
+            "pane-mouse 7 32 18 3 M\n",
+            "content column 14 is drawn at view column 18 behind a 4-wide gutter"
+        );
+    }
+
+    #[test]
+    fn a_gesture_with_nothing_painted_sends_no_repin() {
+        assert!(copy_release_repin(7, None, 0, 80).is_none());
+    }
+
+    /// The reported bug, at the client end: the drag reached cell 15 and only
+    /// cell 14 was ever painted, so the release on 15 must be preceded by a
+    /// drag back to 14 — and the release itself is untouched.
+    #[test]
+    fn a_drag_release_repins_the_painted_cell_before_reporting_up() {
+        assert_eq!(
+            copy_release_commands(7, true, Some((3, 14)), (15, 3), 0, 80),
+            vec![
+                "pane-mouse 7 32 14 3 M\n".to_string(),
+                "pane-mouse 7 0 15 3 m\n".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_release_with_nothing_painted_sends_only_the_release() {
+        assert_eq!(
+            copy_release_commands(7, true, None, (15, 3), 0, 80),
+            vec!["pane-mouse 7 0 15 3 m\n".to_string()]
+        );
+    }
+
+    /// The re-pin must report the COPY CURSOR, not `sel_end_*`.
+    ///
+    /// `sel_start_*`/`sel_end_*` are the painted rectangle's top and bottom,
+    /// ordered by row, so on a drag that moved UP the bottom end is the
+    /// ANCHOR.  Re-reporting it collapses the selection onto the press cell
+    /// and the release yanks nothing at all: a real client dragging up over
+    /// three rows came back with an empty paste buffer.
+    #[test]
+    fn the_repin_follows_the_copy_cursor_not_the_bottom_of_the_selection() {
+        // anchor (row 4, col 9), dragged UP to (row 2, col 3): the frame
+        // publishes top=(2,3) and bottom=(4,9), and the copy cursor is the
+        // end that moved.
+        let leaf: super::LayoutJson = serde_json::from_str(
+            r#"{"type":"leaf","id":1,"rows":29,"cols":120,"cursor_row":0,"cursor_col":0,
+                "active":true,"copy_mode":true,"scroll_offset":0,
+                "sel_start_row":2,"sel_start_col":3,"sel_end_row":4,"sel_end_col":9,
+                "copy_cursor_row":2,"copy_cursor_col":3}"#,
+        )
+        .expect("a leaf");
+        assert_eq!(
+            super::active_copy_sel_end(&leaf),
+            Some((2, 3)),
+            "an upward drag must re-pin its endpoint, not the anchor below it"
+        );
+    }
+
+    /// Keyboard copy mode has a cursor but no selection, and must not repin.
+    #[test]
+    fn a_pane_with_no_selection_has_no_painted_endpoint() {
+        let leaf: super::LayoutJson = serde_json::from_str(
+            r#"{"type":"leaf","id":1,"rows":29,"cols":120,"cursor_row":0,"cursor_col":0,
+                "active":true,"copy_mode":true,"scroll_offset":0,
+                "sel_start_row":null,"sel_start_col":null,
+                "sel_end_row":null,"sel_end_col":null,
+                "copy_cursor_row":7,"copy_cursor_col":11}"#,
+        )
+        .expect("a leaf");
+        assert_eq!(super::active_copy_sel_end(&leaf), None);
+    }
+
+    /// A plain click never repins: the release has to position the copy cursor
+    /// by itself (#669), and a click has no painted endpoint to report.
+    #[test]
+    fn a_click_never_repins() {
+        assert_eq!(
+            copy_release_commands(7, false, Some((3, 14)), (14, 3), 0, 80),
+            vec!["pane-mouse 7 0 14 3 m\n".to_string()]
+        );
+    }
+}
+
+/// Collect each leaf's live scrollback offset (`view_offset`) by pane id.
+/// Nonzero outside copy mode means the pane is direct-scrolled
+/// (scroll-enter-copy-mode off, #193) — i.e. there is content below the view.
+fn collect_view_offsets(layout: &LayoutJson, out: &mut Vec<(usize, usize)>) {
+    match layout {
+        LayoutJson::Leaf { id, view_offset, .. } => out.push((*id, *view_offset)),
+        LayoutJson::Split { children, .. } => {
+            for c in children {
+                collect_view_offsets(c, out);
+            }
+        }
     }
 }
 
@@ -491,19 +1529,23 @@ fn word_bounds_at(
     pane_rect: Rect,
     col: u16,
     row: u16,
+    border_status: &str,
+    border_format: &str,
 ) -> Option<(u16, u16)> {
     let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
     let mut leaves: Vec<PaneLeaf> = Vec::new();
     collect_leaves(layout, content_area, &mut leaves);
 
+    // `pane_rect` is the outer rect; match on it, then map into the content inner.
     let leaf = leaves.iter().find(|l| l.inner == pane_rect)?;
+    let content = pane_content_inner(leaf.inner, border_status, border_format);
 
-    let local_row = row.checked_sub(leaf.inner.y)? as usize;
+    let local_row = row.checked_sub(content.y)? as usize;
     if local_row >= leaf.rows_v2.len() { return None; }
-    let width = leaf.inner.width as usize;
+    let width = content.width as usize;
     let chars = row_chars(&leaf.rows_v2[local_row].runs, width);
 
-    let local_col = col.checked_sub(leaf.inner.x)? as usize;
+    let local_col = col.checked_sub(content.x)? as usize;
     if local_col >= width { return None; }
     if !is_word_char(chars[local_col]) { return None; }
 
@@ -516,7 +1558,7 @@ fn word_bounds_at(
         right += 1;
     }
 
-    Some((leaf.inner.x + left as u16, leaf.inner.x + right as u16))
+    Some((content.x + left as u16, content.x + right as u16))
 }
 
 /// Check if screen coordinates (x, y) fall on a separator line in the layout.
@@ -621,6 +1663,94 @@ fn collect_layout_borders(
     }
 }
 
+/// Collect final separator orientations in render order. Child geometry is
+/// recorded before parent separators so collapsed parent cells overwrite it.
+pub fn border_geometry_from_layout(
+    node: &LayoutJson,
+    area: Rect,
+    buf_area: Rect,
+    zoomed: bool,
+) -> BorderGeometry {
+    let mut borders = BorderGeometry::default();
+    mark_layout_borders(node, area, buf_area, zoomed, &mut borders);
+    borders
+}
+
+fn mark_layout_borders(
+    node: &LayoutJson,
+    area: Rect,
+    buf_area: Rect,
+    zoomed: bool,
+    borders: &mut BorderGeometry,
+) {
+    let LayoutJson::Split {
+        kind,
+        sizes,
+        children,
+    } = node
+    else {
+        return;
+    };
+    let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+        sizes.clone()
+    } else {
+        vec![(100 / children.len().max(1)) as u16; children.len()]
+    };
+    let is_horizontal = kind == "Horizontal";
+
+    if zoomed {
+        // Match render_layout_json's zoom early-return exactly: no separator
+        // drawn for this split, recurse into the chosen child at the SAME area.
+        if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
+            if let Some(child) = children.get(i) {
+                mark_layout_borders(child, area, buf_area, zoomed, borders);
+            }
+        }
+        return;
+    }
+
+    let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+    for (i, child) in children.iter().enumerate() {
+        if i < rects.len() {
+            mark_layout_borders(child, rects[i], buf_area, zoomed, borders);
+        }
+    }
+
+    let w = buf_area.width as usize;
+    for i in 0..children.len().saturating_sub(1) {
+        if i >= rects.len() {
+            break;
+        }
+        if is_horizontal {
+            // Vertical separator line at column `pos`, spanning this split's own area height.
+            let pos = rects[i].x + rects[i].width;
+            if pos >= buf_area.x && pos < buf_area.x + buf_area.width {
+                for y in area.y..area.y + area.height {
+                    if y >= buf_area.y && y < buf_area.y + buf_area.height {
+                        borders.set_vertical(
+                            (y - buf_area.y) as usize * w
+                                + (pos - buf_area.x) as usize,
+                        );
+                    }
+                }
+            }
+        } else {
+            // Horizontal separator line at row `pos`, spanning this split's own area width.
+            let pos = rects[i].y + rects[i].height;
+            if pos >= buf_area.y && pos < buf_area.y + buf_area.height {
+                for x in area.x..area.x + area.width {
+                    if x >= buf_area.x && x < buf_area.x + buf_area.width {
+                        borders.set_horizontal(
+                            (pos - buf_area.y) as usize * w
+                                + (x - buf_area.x) as usize,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Check if any leaf in a LayoutJson subtree is the active pane.
 /// Compute the rectangle of the active pane by searching the LayoutJson tree.
 pub fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
@@ -692,7 +1822,12 @@ pub(crate) fn compute_active_rect_json_zoom_aware(
 /// Render a large ASCII clock overlay (tmux clock-mode).
 /// Top-level so both the main viewport and the choose-tree/choose-session
 /// preview can share one implementation.
-pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
+pub fn render_clock_overlay(
+    f: &mut Frame,
+    area: Rect,
+    colour: Color,
+    window_style: Option<Style>,
+) {
     const DIGITS: [&[&str; 5]; 10] = [
         &["###", "# #", "# #", "# #", "###"],
         &["  #", "  #", "  #", "  #", "  #"],
@@ -715,18 +1850,21 @@ pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
     let start_y = area.y + (area.height.saturating_sub(total_h)) / 2;
     let clock_area = Rect::new(start_x.saturating_sub(1), start_y, total_w + 2, total_h);
     f.render_widget(Clear, clock_area);
+    let fill_style = window_content_fill_style(window_style);
+    f.render_widget(Block::default().style(fill_style), clock_area);
+    let glyph_style = fill_style.fg(colour);
     for row in 0..5u16 {
         let mut x = start_x;
         for ch in time_str.chars() {
             if ch == ':' {
                 let cell_area = Rect::new(x, start_y + row, 1, 1);
-                let s = Span::styled(COLON[row as usize], Style::default().fg(colour));
+                let s = Span::styled(COLON[row as usize], glyph_style);
                 f.render_widget(Paragraph::new(Line::from(s)), cell_area);
                 x += 2;
             } else if let Some(d) = ch.to_digit(10) {
                 let pattern = DIGITS[d as usize][row as usize];
                 let cell_area = Rect::new(x, start_y + row, 3, 1);
-                let s = Span::styled(pattern, Style::default().fg(colour));
+                let s = Span::styled(pattern, glyph_style);
                 f.render_widget(Paragraph::new(Line::from(s)), cell_area);
                 x += 4;
             }
@@ -734,17 +1872,540 @@ pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
     }
 }
 
-/// Render a LayoutJson tree into the given area.  This is the canonical
-/// pane renderer used by both the main viewport and the choose-tree/
-/// choose-session preview, so a preview is a true miniature of the real
-/// window (same separators, same colors, same content rendering).
+/// Draw the active window's floating panes (tmux new-pane) as positioned
+/// overlays over the tiled layout. Called after `render_layout_json` and before
+/// the modal popup overlay, so popups still stack on top. Reuses the popup
+/// run-rendering; borders come from `-B` (mapped to ratatui border types),
+/// `none` draws no border. The focused float gets a highlighted border.
+pub(crate) fn render_float_overlays(
+    f: &mut Frame,
+    content_chunk: Rect,
+    floats: &[FloatJson],
+    window_styles: WindowContentStyles,
+    border_style: Style,
+    active_border_style: Style,
+    indicators: PaneBorderIndicators,
+) {
+    let border_style = complete_pane_border_colors(border_style);
+    let active_border_style = complete_pane_border_colors(active_border_style);
+    for fl in floats {
+        if fl.w < 2 || fl.h < 2 { continue; }
+        let w = fl.w.min(content_chunk.width);
+        let h = fl.h.min(content_chunk.height);
+        let x = content_chunk.x + fl.x.min(content_chunk.width.saturating_sub(w));
+        let y = content_chunk.y + fl.y.min(content_chunk.height.saturating_sub(h));
+        let area = Rect { x, y, width: w, height: h };
+        let border_type = match fl.border.as_str() {
+            "double" => Some(BorderType::Double),
+            "heavy" => Some(BorderType::Thick),
+            "none" => None,
+            // single/simple/number/spaces/unknown -> plain line box
+            _ => Some(BorderType::Plain),
+        };
+        // A float's own -S/-R border style and -s content style, set by
+        // new-pane, go over the session's (tmux sets them as the pane's own
+        // options, cmd-split-window.c).
+        let own_border = if fl.focused { &fl.astyle } else { &fl.bstyle };
+        let pane_border_style = if fl.focused { active_border_style } else { border_style };
+        let pane_border_style = if own_border.is_empty() {
+            pane_border_style
+        } else {
+            complete_pane_border_colors(pane_border_style.patch(crate::style::parse_tmux_style(own_border)))
+        };
+        let window_style = window_styles.for_pane(fl.focused);
+        let window_style = if fl.style.is_empty() {
+            window_style
+        } else {
+            Some(window_style.unwrap_or_default().patch(crate::style::parse_tmux_style(&fl.style)))
+        };
+        let window_dim = window_styles.dim_for_pane(fl.focused);
+        // Paths that paint straight from the window style take it pre dimmed;
+        // `apply_window_content_style` dims the cell colours itself.
+        let window_fill = crate::style::dim_window_style(window_style, window_dim);
+        let inner_w = if border_type.is_some() { w.saturating_sub(2) } else { w };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for row_data in &fl.rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut col: u16 = 0;
+            for run in &row_data.runs {
+                if col >= inner_w { break; }
+                let mut fg = crate::style::map_color(&run.fg);
+                let mut bg = crate::style::map_color(&run.bg);
+                apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
+                let mut style = Style::default().fg(fg).bg(bg);
+                if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
+                if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
+                if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
+                if run.flags & 8  != 0 {
+                    style = crate::rendering::with_underline(
+                        style,
+                        if run.ul == 0 { 1 } else { run.ul },
+                        run.ulc.as_deref().map(map_color),
+                    );
+                }
+                if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
+                if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
+                if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+                let run_w = run.width.max(1);
+                let text = if run.flags & 64 != 0 {
+                    " ".repeat(run_w as usize)
+                } else if run.text.is_empty() {
+                    " ".to_string()
+                } else {
+                    run.text.clone()
+                };
+                if col + run_w > inner_w {
+                    let avail = (inner_w - col) as usize;
+                    let truncated: String = text.chars().take(avail).collect();
+                    if !truncated.is_empty() { spans.push(Span::styled(truncated, style)); }
+                    col = inner_w;
+                } else {
+                    spans.push(Span::styled(text, style));
+                    col += run_w;
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Clear, area);
+        match border_type {
+            Some(bt) => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(bt)
+                    .border_style(pane_border_style)
+                    .title(fl.title.clone());
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                if fl.focused && indicators.uses_arrows() && area.width >= 3 && area.height >= 3 {
+                    let buffer = f.buffer_mut();
+                    let title_width =
+                        vt100::str_width(fl.title.as_str());
+                    let midpoint_x = area.x + area.width / 2;
+                    let midpoint_y = area.y + area.height / 2;
+                    let mut arrows = vec![
+                        (midpoint_x, area.y + area.height - 1, "↑"),
+                        (area.x, midpoint_y, "→"),
+                        (area.x + area.width - 1, midpoint_y, "←"),
+                    ];
+                    let top_x = if title_width == 0 {
+                        Some(midpoint_x)
+                    } else {
+                        let offset = title_width.saturating_add(2);
+                        (offset < area.width.saturating_sub(1) as usize)
+                            .then(|| area.x + offset as u16)
+                    };
+                    if let Some(top_x) = top_x {
+                        arrows.push((top_x, area.y, "↓"));
+                    }
+                    for (x, y, symbol) in arrows {
+                        if x >= buffer.area.x
+                            && x < buffer.area.x + buffer.area.width
+                            && y >= buffer.area.y
+                            && y < buffer.area.y + buffer.area.height
+                        {
+                            buffer[(x, y)].set_symbol(symbol);
+                        }
+                    }
+                }
+                f.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .style(window_content_fill_style(window_fill)),
+                    inner,
+                );
+            }
+            None => {
+                f.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .style(window_content_fill_style(window_fill)),
+                    area,
+                );
+            }
+        }
+    }
+}
+
+/// Copy-mode line-number rendering config, resolved once per frame from the
+/// `copy-mode-line-numbers` option and the active pane's scrollback size.
+#[derive(Clone, Copy)]
+pub struct CopyLnRender {
+    pub mode: crate::copy_line_numbers::CopyLnMode,
+    pub hsize: usize,
+    /// `toggle-position` / `copy-mode -H`: the position indicator is not drawn
+    /// while this is set (#704).
+    pub hide_position: bool,
+    pub num_style: Style,
+    pub cur_style: Style,
+    /// Search match, current match and mark styles for `copy_hl` (#694).
+    pub hl: CopyHighlightStyles,
+}
+
+/// The three copy-mode highlight styles, tmux's `copy-mode-match-style`,
+/// `copy-mode-current-match-style` and `copy-mode-mark-style`.
+#[derive(Clone, Copy)]
+pub struct CopyHighlightStyles {
+    pub match_style: Style,
+    pub current_match_style: Style,
+    pub mark_style: Style,
+}
+
+impl Default for CopyHighlightStyles {
+    /// tmux's defaults (options-table.c, 3.4 to 3.7b).
+    fn default() -> Self {
+        CopyHighlightStyles {
+            match_style: crate::style::parse_tmux_style("bg=cyan,fg=black"),
+            current_match_style: crate::style::parse_tmux_style("bg=magenta,fg=black"),
+            mark_style: crate::style::parse_tmux_style("bg=red,fg=black"),
+        }
+    }
+}
+
+/// The style a copy-mode highlight gives the cell at row `r`, column `c`,
+/// or None. tmux's `window_copy_update_style` applies the mark first and the
+/// search marks over it, and the marked cell itself has its colours swapped.
+pub(crate) fn copy_highlight_style(hl: &[[u16; 4]], r: u16, c: u16, styles: &CopyHighlightStyles) -> Option<Style> {
+    let mut best: Option<u16> = None;
+    // Higher wins: current match 4, match 3, marked cell 2, marked line 1.
+    let rank = |k: u16| match k { 1 => 4, 0 => 3, 3 => 2, _ => 1 };
+    for h in hl {
+        if h[0] == r && c >= h[1] && c <= h[2] {
+            if best.map_or(true, |b| rank(h[3]) > rank(b)) { best = Some(h[3]); }
+        }
+    }
+    match best? {
+        0 => Some(styles.match_style),
+        1 => Some(styles.current_match_style),
+        3 => {
+            let m = styles.mark_style;
+            let mut s = m;
+            s.fg = m.bg;
+            s.bg = m.fg;
+            Some(s)
+        }
+        _ => Some(styles.mark_style),
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct WindowContentStyles {
+    pub inactive: Option<Style>,
+    pub active: Option<Style>,
+    /// `dim=N` percentage from `window-style` (tmux `wp->cached_dim`).
+    pub inactive_dim: u8,
+    /// `dim=N` percentage from `window-active-style` (tmux `wp->cached_active_dim`).
+    pub active_dim: u8,
+}
+
+impl WindowContentStyles {
+    /// The effective content style for a pane.
+    ///
+    /// The active pane merges `window-active-style` over `window-style` per
+    /// attribute, matching tmux `tty.c` `tty_default_colours`. See
+    /// `crate::style::active_window_style_with_fallback`.
+    pub(crate) fn for_pane(self, active: bool) -> Option<Style> {
+        if active {
+            crate::style::active_window_style_with_fallback(self.active, self.inactive)
+        } else {
+            self.inactive
+        }
+    }
+
+    /// The `dim` percentage for a pane.
+    ///
+    /// tmux `tty_default_colours` picks `cached_active_dim` or `cached_dim`
+    /// outright: unlike fg and bg, `dim` has no fallback between the two styles.
+    pub(crate) fn dim_for_pane(self, active: bool) -> u8 {
+        if active { self.active_dim } else { self.inactive_dim }
+    }
+
+    pub(crate) fn for_tiled_panes(self, floating_pane_focused: bool) -> Self {
+        if floating_pane_focused {
+            Self {
+                inactive: self.inactive,
+                active: self.inactive,
+                inactive_dim: self.inactive_dim,
+                active_dim: self.inactive_dim,
+            }
+        } else {
+            self
+        }
+    }
+}
+
+/// Render one popup or menu row's run list into a `Line`, clipping to `inner_w`.
+///
+/// Extracted from the popup draw path so the run accounting is unit testable.
+pub(crate) fn render_popup_runs_line(
+    runs: &[crate::layout::CellRunJson],
+    inner_w: u16,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col: u16 = 0;
+    for run in runs {
+        if col >= inner_w { break; }
+        let fg = crate::style::map_color(&run.fg);
+        let bg = crate::style::map_color(&run.bg);
+        let mut style = Style::default().fg(fg).bg(bg);
+        if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
+        if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
+        if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
+        if run.flags & 8  != 0 {
+            style = crate::rendering::with_underline(
+                style,
+                if run.ul == 0 { 1 } else { run.ul },
+                run.ulc.as_deref().map(map_color),
+            );
+        }
+        if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
+        if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
+        if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+        let run_w = run.width.max(1);
+        // ratatui-crossterm omits SGR 8 (HIDDEN), render as spaces. One space
+        // per column of the run: the column accounting below advances by
+        // `run_w`, so a single space would claim `run_w` columns while painting
+        // one and shift every later run on the row (#617, #619).
+        let hidden = " ".repeat(run_w as usize);
+        let text: &str = if run.flags & 64 != 0 {
+            &hidden
+        } else if run.text.is_empty() {
+            " "
+        } else {
+            &run.text
+        };
+        if col + run_w > inner_w {
+            let avail = (inner_w - col) as usize;
+            let truncated: String = text.chars().take(avail).collect();
+            if !truncated.is_empty() {
+                spans.push(Span::styled(truncated, style));
+            }
+            col = inner_w;
+        } else {
+            spans.push(Span::styled(text.to_string(), style));
+            col += run_w;
+        }
+    }
+    Line::from(spans)
+}
+
+fn apply_window_content_style(fg: &mut Color, bg: &mut Color, style: Option<Style>, dim: u8) {
+    if let Some(style) = style {
+        if *fg == Color::Reset {
+            if let Some(default_fg) = style.fg {
+                *fg = default_fg;
+            }
+        }
+        if *bg == Color::Reset {
+            if let Some(default_bg) = style.bg {
+                *bg = default_bg;
+            }
+        }
+    }
+    // tmux `tty.c` `tty_attributes` dims the resolved colours, application
+    // colours included, by the window style's `dim=N` percentage (#619 item 4).
+    if dim != 0 {
+        *fg = crate::style::dim_colour_percent(*fg, dim);
+        *bg = crate::style::dim_colour_percent(*bg, dim);
+    }
+}
+
+fn window_content_fill_style(style: Option<Style>) -> Style {
+    let Some(style) = style else { return Style::default(); };
+    Style::default()
+        .fg(style.fg.unwrap_or(Color::Reset))
+        .bg(style.bg.unwrap_or(Color::Reset))
+}
+
+/// Pin the border colours without touching the border attributes.
+///
+/// tmux paints a border cell with `style_add` (style.c:459): a colour replaces
+/// the cell colour only when the style actually names one, but the attributes
+/// are merged in unconditionally (`gc->attr |= sy->gc.attr;`) and the
+/// underscore colour rides along with them (`gc->us`). psmux needs the colour
+/// half of that to be absolute, because an omitted `fg=`/`bg=` in an explicit
+/// pane-border-style must reset rather than inherit whatever the pane under the
+/// separator painted (#624). The attribute half must survive: rebuilding the
+/// style from `Style::default()` dropped `bold`, the underline modifiers and
+/// `us=`, so `pane-border-style 'fg=red,bold'` drew red but never bold (#626).
+fn complete_pane_border_colors(style: Style) -> Style {
+    style
+        .fg(style.fg.unwrap_or(Color::Reset))
+        .bg(style.bg.unwrap_or(Color::Reset))
+}
+
+pub(crate) fn parse_pane_border_colors(raw: Option<&str>, default: Style) -> Style {
+    let Some(raw) = raw.filter(|style| !style.is_empty()) else {
+        return complete_pane_border_colors(default);
+    };
+    complete_pane_border_colors(crate::style::parse_tmux_style(raw))
+}
+
+/// The style a pane border falls back to when the option is unset.
+///
+/// tmux keeps these in options-table.c (pane-border-style
+/// `fg=themelightgrey`, pane-active-border-style `fg=themegreen`), so an unset
+/// option and a freshly started server always agree. psmux carries the same
+/// pair as concrete ratatui colours, and `pane_border_default_style` is the one
+/// place that names them so the option catalog, the client renderer and the
+/// server-side renderer cannot drift apart (#626).
+pub(crate) fn pane_border_default_style(active: bool) -> Style {
+    if active {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Hover is an overlay, so omitted colors keep the separator's own colors.
+fn parse_pane_border_hover_style(raw: Option<&str>) -> Style {
+    raw.filter(|style| !style.is_empty())
+        .map(crate::style::parse_tmux_style)
+        .unwrap_or_else(|| Style::default().fg(Color::Yellow))
+}
+
+/// A focused floating pane owns the active cue, so the tiled layout draws none.
+pub(crate) fn tiled_border_focus(
+    active_rect: Option<Rect>,
+    border_style: Style,
+    active_border_style: Style,
+    floating_pane_focused: bool,
+) -> (Option<Rect>, Style) {
+    if floating_pane_focused {
+        (None, border_style)
+    } else {
+        (active_rect, active_border_style)
+    }
+}
+
+/// Recolor only junctions so straight separators keep their per-cell styles.
+pub(crate) fn recolor_border_junctions(
+    buffer: &mut ratatui::buffer::Buffer,
+    junctions: &[usize],
+    active_rect: Option<Rect>,
+    border_style: Style,
+    active_border_style: Style,
+) {
+    let Some(active_rect) = active_rect else { return; };
+    let width = buffer.area.width as usize;
+    if width == 0 { return; }
+    let border_style = complete_pane_border_colors(border_style);
+    let active_border_style = complete_pane_border_colors(active_border_style);
+
+    for &idx in junctions {
+        if idx >= buffer.content.len() { continue; }
+        let col = idx % width;
+        let row = idx / width;
+        let x = buffer.area.x + col as u16;
+        let y = buffer.area.y + row as u16;
+        buffer.content[idx].set_style(
+            if border_cell_touches_rect(x, y, active_rect) {
+                active_border_style
+            } else {
+                border_style
+            },
+        );
+    }
+}
+
+fn border_cell_touches_rect(x: u16, y: u16, rect: Rect) -> bool {
+    let right = rect.x.saturating_add(rect.width);
+    let bottom = rect.y.saturating_add(rect.height);
+    let left_of_rect = x.checked_add(1) == Some(rect.x);
+    let above_rect = y.checked_add(1) == Some(rect.y);
+    let touches_vertical = (left_of_rect || x == right)
+        && y >= rect.y
+        && y < bottom;
+    let touches_horizontal = (above_rect || y == bottom)
+        && x >= rect.x
+        && x < right;
+    let touches_corner = (left_of_rect || x == right)
+        && (above_rect || y == bottom);
+    touches_vertical || touches_horizontal || touches_corner
+}
+
+pub(crate) fn draw_pane_border_arrows(
+    buffer: &mut ratatui::buffer::Buffer,
+    borders: &crate::rendering::BorderGeometry,
+    border_chars: Option<crate::border_lines::BorderChars>,
+    active_rect: Option<Rect>,
+    indicators: PaneBorderIndicators,
+) {
+    if border_chars.is_none() || !indicators.uses_arrows() { return; }
+    let Some(active_rect) = active_rect else { return; };
+    if active_rect.width == 0 || active_rect.height == 0 { return; }
+    let width = buffer.area.width as usize;
+    let mut draw = |x: i32, y: i32, symbol: &str, vertical: bool| {
+        let rel_x = x - buffer.area.x as i32;
+        let rel_y = y - buffer.area.y as i32;
+        if rel_x < 0 || rel_y < 0
+            || rel_x >= buffer.area.width as i32
+            || rel_y >= buffer.area.height as i32
+        {
+            return;
+        }
+        let idx = rel_y as usize * width + rel_x as usize;
+        let matches_orientation = if vertical {
+            borders.contains_vertical(idx)
+        } else {
+            borders.contains_horizontal(idx)
+        };
+        if !matches_orientation { return; }
+        buffer.content[idx].set_symbol(symbol);
+    };
+
+    let x = active_rect.x as i32;
+    let y = active_rect.y as i32;
+    let right = (active_rect.x + active_rect.width) as i32;
+    let bottom = (active_rect.y + active_rect.height) as i32;
+    let side_y = y + i32::from(active_rect.height.saturating_sub(1).min(1));
+    let side_x = x + i32::from(active_rect.width.saturating_sub(1).min(1));
+    draw(x - 1, side_y, "→", true);
+    draw(right, side_y, "←", true);
+    draw(side_x, y - 1, "↓", false);
+    draw(side_x, bottom, "↑", false);
+}
+
+/// Is the copy-mode cursor cell inside the selection that is on screen?
+///
+/// The renderer draws the copy cursor as a REVERSED cell and parks the host
+/// terminal's cursor on it.  When the cursor sits on a selection endpoint that
+/// turns the last selected cell into "text colour on the default background",
+/// which reads as if it were not selected at all -- the copy then looks one
+/// cell longer than the highlight even though the selection is correct.  The
+/// selection style already marks the cell, so the caller does not reverse it
+/// when this returns true, and only parks the host cursor there.
+pub(crate) fn copy_cursor_in_selection(
+    cr: u16,
+    cc: u16,
+    sel_start: Option<(u16, u16)>,
+    sel_end: Option<(u16, u16)>,
+    mode: &str,
+) -> bool {
+    let (Some((sr, sc)), Some((er, ec))) = (sel_start, sel_end) else {
+        return false;
+    };
+    match mode {
+        "rect" => cr >= sr && cr <= er && cc >= sc.min(ec) && cc <= sc.max(ec),
+        "line" => cr >= sr && cr <= er,
+        _ => {
+            if sr == er {
+                cr == sr && cc >= sc.min(ec) && cc <= sc.max(ec)
+            } else if cr == sr {
+                cc >= sc
+            } else if cr == er {
+                cc <= ec
+            } else {
+                cr > sr && cr < er
+            }
+        }
+    }
+}
+
 pub fn render_layout_json(
     f: &mut Frame,
     node: &LayoutJson,
     area: Rect,
     dim_preds: bool,
-    border_fg: Color,
-    active_border_fg: Color,
+    border_style: Style,
+    active_border_style: Style,
     clock_mode: bool,
     clock_colour: Color,
     active_rect: Option<Rect>,
@@ -753,7 +2414,13 @@ pub fn render_layout_json(
     border_status: &str,
     border_format: &str,
     total_panes: usize,
+    bchars: Option<crate::border_lines::BorderChars>,
+    copy_ln: Option<CopyLnRender>,
+    window_styles: WindowContentStyles,
+    border_indicators: PaneBorderIndicators,
 ) {
+    let border_style = complete_pane_border_colors(border_style);
+    let active_border_style = complete_pane_border_colors(active_border_style);
     match node {
         LayoutJson::Leaf {
             id,
@@ -762,11 +2429,13 @@ pub fn render_layout_json(
             cursor_row,
             cursor_col,
             alternate_screen,
+            wants_mouse: _,
             hide_cursor: _,
             cursor_shape: _,
             active,
             copy_mode,
             scroll_offset,
+            view_offset: _,
             sel_start_row,
             sel_start_col,
             sel_end_row,
@@ -780,19 +2449,17 @@ pub fn render_layout_json(
             // Sixel image descriptors (#431): positioned here and collected
             // into FRAME_SIXELS for the post-draw emit path (M6).
             images,
+            copy_hl,
         } => {
-            // When pane-border-status is enabled, reserve 1 row for the
-            // border label so it doesn't overlap pane content (#288).
+            let window_style = window_styles.for_pane(*active);
+            let hl_styles = copy_ln.map(|cfg| cfg.hl).unwrap_or_default();
+            let window_dim = window_styles.dim_for_pane(*active);
+            // Paths that paint straight from the window style take it pre
+            // dimmed; `apply_window_content_style` dims the cell colours itself.
+            let window_fill = crate::style::dim_window_style(window_style, window_dim);
+            // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
-            let inner = if has_border_label {
-                if border_status == "top" {
-                    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
-                } else {
-                    Rect::new(area.x, area.y, area.width, area.height - 1)
-                }
-            } else {
-                area
-            };
+            let inner = pane_content_inner(area, border_status, border_format);
             // ── Sixel: collect fully-inside images for post-draw emit (#431) ──
             // Mirror FRAME_HYPERLINKS: push geometry+id during render, defer the
             // blob-cache-presence check to emit time (the cache is not in scope
@@ -847,7 +2514,8 @@ pub fn render_layout_json(
                     while c < max_c {
                         let cell = &row[c as usize];
                         let mut fg = map_color(&cell.fg);
-                        let bg = map_color(&cell.bg);
+                        let mut bg = map_color(&cell.bg);
+                        apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
                         let in_selection = if *copy_mode && *active {
                             if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
                                 let mode = sel_mode.as_deref().unwrap_or("char");
@@ -875,8 +2543,14 @@ pub fn render_layout_json(
                         }
                         let mut style = Style::default().fg(fg).bg(bg);
                         if in_selection {
-                            let ms = crate::rendering::parse_tmux_style(mode_style_str);
+                            let ms = crate::style::parse_tmux_style(mode_style_str);
                             style = ms;
+                        } else if *copy_mode && *active && !copy_hl.is_empty() {
+                            // Search matches and the mark (#694); the selection,
+                            // drawn over them in tmux too, wins above.
+                            if let Some(hs) = copy_highlight_style(copy_hl, r, c, &hl_styles) {
+                                style = hs;
+                            }
                         }
                         if cell.inverse { style = style.add_modifier(Modifier::REVERSED); }
                         if cell.dim { style = style.add_modifier(Modifier::DIM); }
@@ -892,7 +2566,7 @@ pub fn render_layout_json(
                         } else {
                             &cell.text
                         };
-                        let char_width = unicode_width::UnicodeWidthStr::width(text) as u16;
+                        let char_width = vt100::str_width(text) as u16;
                         if char_width >= 2 && c + char_width > max_c {
                             spans.push(Span::styled(" ", style));
                             c += 1;
@@ -909,8 +2583,11 @@ pub fn render_layout_json(
                         let last_bg = if !spans.is_empty() {
                             spans.last().unwrap().style.bg.unwrap_or(Color::Reset)
                         } else { Color::Reset };
+                        let padding_bg = window_fill
+                            .and_then(|style| style.bg)
+                            .unwrap_or(last_bg);
                         let pad = " ".repeat((inner.width - c) as usize);
-                        spans.push(Span::styled(pad, Style::default().bg(last_bg)));
+                        spans.push(Span::styled(pad, Style::default().bg(padding_bg)));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -918,11 +2595,14 @@ pub fn render_layout_json(
                 for r in 0..inner.height.min(rows_v2_eff.len() as u16) {
                     let mut spans: Vec<Span> = Vec::new();
                     let mut c: u16 = 0;
-                    let mut last_bg = Color::Reset;
+                    let mut last_bg = window_fill
+                        .and_then(|style| style.bg)
+                        .unwrap_or(Color::Reset);
                     for run in &rows_v2_eff[r as usize].runs {
                         if c >= inner.width { break; }
                         let mut fg = map_color(&run.fg);
-                        let bg = map_color(&run.bg);
+                        let mut bg = map_color(&run.bg);
+                        apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
                         last_bg = bg;
                         if *active && dim_preds && !*alternate_screen
                             && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
@@ -934,23 +2614,29 @@ pub fn render_layout_json(
                         if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
                         if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                         if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                        if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                        if run.flags & 8 != 0 {
+                            style = crate::rendering::with_underline(
+                                style,
+                                if run.ul == 0 { 1 } else { run.ul },
+                                run.ulc.as_deref().map(map_color),
+                            );
+                        }
                         if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                         if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                        let text: &str = if run.flags & 64 != 0 {
-                            " "
-                        } else if run.text.is_empty() {
-                            " "
-                        } else {
-                            &run.text
-                        };
                         let run_w = run.width.max(1);
+                        let text = if run.flags & 64 != 0 {
+                            " ".repeat(run_w as usize)
+                        } else if run.text.is_empty() {
+                            " ".to_string()
+                        } else {
+                            run.text.clone()
+                        };
                         if c + run_w > inner.width {
                             let avail = (inner.width - c) as usize;
                             let mut truncated = String::new();
                             let mut used = 0usize;
                             for ch in text.chars() {
-                                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                                let cw = vt100::char_width(ch).unwrap_or(1);
                                 if used + cw > avail { break; }
                                 used += cw;
                                 truncated.push(ch);
@@ -969,7 +2655,7 @@ pub fn render_layout_json(
                             if let Some(uri) = &run.link {
                                 frame_hyperlinks_push(HyperlinkRun {
                                     x: inner.x + c, y: inner.y + r,
-                                    text: text.to_string(), uri: uri.clone(), style,
+                                    text: text.clone(), uri: uri.clone(), style,
                                 });
                             }
                             spans.push(Span::styled(text, style));
@@ -977,17 +2663,46 @@ pub fn render_layout_json(
                         }
                     }
                     if c < inner.width {
+                        let padding_bg = window_fill
+                            .and_then(|style| style.bg)
+                            .unwrap_or(last_bg);
                         let pad = " ".repeat((inner.width - c) as usize);
-                        spans.push(Span::styled(pad, Style::default().bg(last_bg)));
+                        spans.push(Span::styled(pad, Style::default().bg(padding_bg)));
                     }
                     lines.push(Line::from(spans));
                 }
             }
+            // Copy-mode line-number gutter (#copy-mode-line-numbers). Prepend a
+            // right-aligned number column to each visible row; content shifts
+            // right and the rightmost columns clip, matching tmux's reduced
+            // content width. Only the active copy-mode pane shows the gutter.
+            let gutter_w: u16 = if *copy_mode && *active {
+                copy_ln.map(|cfg| crate::copy_line_numbers::gutter_width(cfg.mode, cfg.hsize, inner.height as usize) as u16).unwrap_or(0)
+            } else { 0 };
+            if gutter_w > 0 {
+                if let Some(cfg) = copy_ln {
+                    let oy = *scroll_offset;
+                    let cy = copy_cursor_row.map(|r| r as usize).unwrap_or(usize::MAX);
+                    for (r, line) in lines.iter_mut().enumerate() {
+                        let txt = crate::copy_line_numbers::gutter_text(cfg.mode, gutter_w as usize, r, oy, cy, cfg.hsize);
+                        let sty = if crate::copy_line_numbers::is_current_row(r, cy) { cfg.cur_style } else { cfg.num_style };
+                        line.spans.insert(0, Span::styled(txt, sty));
+                    }
+                }
+            }
+
             f.render_widget(Clear, inner);
-            let para = Paragraph::new(Text::from(lines));
+            let para = Paragraph::new(Text::from(lines))
+                .style(window_content_fill_style(window_fill));
             f.render_widget(para, inner);
 
-            if *copy_mode && *active {
+            // tmux draws the copy-mode position indicator out of each pane's
+            // OWN mode screen (`window-copy.c` `window_copy_write_line`), so
+            // every pane that is in copy mode is marked, focused or not.
+            // psmux used to gate this on `active` because only one pane could
+            // ever be in copy mode; now that a mode belongs to its pane
+            // (#607), mark every pane that holds one.
+            if *copy_mode {
                 let label = "[copy mode]";
                 let lw = label.len() as u16;
                 if area.width >= lw {
@@ -998,8 +2713,20 @@ pub fn render_layout_json(
                 }
             }
 
-            if *copy_mode && *active && *scroll_offset > 0 {
-                let indicator = format!("[{}/{}]", scroll_offset, scroll_offset);
+            // tmux draws `[#{copy_position}/#{copy_position_limit}]` on every
+            // copy mode frame, the live bottom included (window-copy.c
+            // `window_copy_write_line`, pair from `window_copy_formats`).
+            // This used to print the scroll offset on both sides of the slash
+            // and skip offset 0 (#702).
+            // `toggle-position` (P) and `copy-mode -H` hide it, the way
+            // `window_copy_write_line` skips the draw on `data->hide_position`
+            // (#704).
+            if *copy_mode && *active && !copy_ln.map(|cfg| cfg.hide_position).unwrap_or(false) {
+                let (mode, hsize) = copy_ln
+                    .map(|cfg| (cfg.mode, cfg.hsize))
+                    .unwrap_or((crate::copy_line_numbers::CopyLnMode::Off, 0));
+                let indicator = crate::copy_line_numbers::position_indicator(
+                    mode, *scroll_offset, hsize, *src_rows as usize);
                 let indicator_width = indicator.len() as u16;
                 if area.width > indicator_width + 2 {
                     let indicator_x = area.x + area.width - indicator_width - 1;
@@ -1012,27 +2739,53 @@ pub fn render_layout_json(
 
             if *active && !*copy_mode {
                 if clock_mode {
-                    render_clock_overlay(f, inner, clock_colour);
+                    render_clock_overlay(f, inner, clock_colour, window_fill);
                 }
             }
 
             if *copy_mode && *active {
                 if let (Some(cr), Some(cc)) = (copy_cursor_row, copy_cursor_col) {
                     let cr = (*cr).min(inner.height.saturating_sub(1));
-                    let cc = (*cc).min(inner.width.saturating_sub(1));
+                    // The gutter shifts content right, so the cursor shifts
+                    // too. A mouse column is brought back through the same
+                    // shift on the way in, so the two directions are one pair
+                    // of functions (tmux `window_copy_cursor_offset` and
+                    // `window_copy_cursor_unoffset`).
+                    let cc = (*cc).min(inner.width.saturating_sub(1).saturating_sub(gutter_w));
                     let cy = inner.y + cr;
-                    let cx = inner.x + cc;
+                    let cx = inner.x + crate::copy_line_numbers::cursor_offset(
+                        gutter_w as usize, cc as usize, inner.width as usize) as u16;
+                    // While a selection is on screen the copy cursor sits on one
+                    // of its endpoints.  Reversing that cell turns a selected
+                    // cell into "text colour on the default background", which
+                    // reads as if the last selected cell were *not* selected:
+                    // users then reported the copy as one cell longer than the
+                    // highlight (4853ddd).  So the cell keeps the selection
+                    // style.  The host terminal's cursor still goes there, which
+                    // is how tmux shows the copy cursor inside a selection (it
+                    // is the terminal's own cursor, window-copy.c moves it to
+                    // cx/cy): hiding it as well left `o` (other-end) with no
+                    // visible effect (discussion #694).
+                    let cursor_in_selection = copy_cursor_in_selection(
+                        cr,
+                        cc,
+                        (*sel_start_row).zip(*sel_start_col),
+                        (*sel_end_row).zip(*sel_end_col),
+                        sel_mode.as_deref().unwrap_or("char"),
+                    );
                     f.set_cursor_position((cx, cy));
-                    let buf = f.buffer_mut();
-                    let buf_area = buf.area;
-                    if cy >= buf_area.y && cy < buf_area.y + buf_area.height
-                        && cx >= buf_area.x && cx < buf_area.x + buf_area.width
-                    {
-                        let idx = (cy - buf_area.y) as usize * buf_area.width as usize
-                            + (cx - buf_area.x) as usize;
-                        if idx < buf.content.len() {
-                            let cell = &mut buf.content[idx];
-                            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    if !cursor_in_selection {
+                        let buf = f.buffer_mut();
+                        let buf_area = buf.area;
+                        if cy >= buf_area.y && cy < buf_area.y + buf_area.height
+                            && cx >= buf_area.x && cx < buf_area.x + buf_area.width
+                        {
+                            let idx = (cy - buf_area.y) as usize * buf_area.width as usize
+                                + (cx - buf_area.x) as usize;
+                            if idx < buf.content.len() {
+                                let cell = &mut buf.content[idx];
+                                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                            }
                         }
                     }
                 }
@@ -1044,11 +2797,11 @@ pub fn render_layout_json(
                     .replace("#{pane_title}", pane_title_str)
                     .replace("#{pane_index}", &id.to_string())
                     .replace("#P", &id.to_string());
-                let label_width = unicode_width::UnicodeWidthStr::width(pane_label.as_str()) as u16;
+                let label_width = vt100::str_width(pane_label.as_str()) as u16;
                 if label_width > 0 && area.width >= label_width {
                     let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
                     let label_area = Rect::new(area.x, label_y, label_width.min(area.width), 1);
-                    let label_style = Style::default().fg(if *active { active_border_fg } else { border_fg });
+                    let label_style = if *active { active_border_style } else { border_style };
                     f.render_widget(Paragraph::new(Line::from(Span::styled(pane_label, label_style))), label_area);
                 }
             }
@@ -1064,7 +2817,7 @@ pub fn render_layout_json(
             if zoomed {
                 if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
                     if let Some(child) = children.get(i) {
-                        render_layout_json(f, child, area, dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes);
+                        render_layout_json(f, child, area, dim_preds, border_style, active_border_style, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
                     }
                 }
                 return;
@@ -1074,11 +2827,12 @@ pub fn render_layout_json(
 
             for (i, child) in children.iter().enumerate() {
                 if i < rects.len() {
-                    render_layout_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes);
+                    render_layout_json(f, child, rects[i], dim_preds, border_style, active_border_style, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles, border_indicators);
                 }
             }
-            let border_style = Style::default().fg(border_fg);
-            let active_border_style = Style::default().fg(active_border_fg);
+            // pane-border-lines none: children are drawn, but no separators.
+            let Some(bc) = bchars else { return; };
+            let (v_char, h_char) = (bc.vertical, bc.horizontal);
             let buf = f.buffer_mut();
             for i in 0..children.len().saturating_sub(1) {
                 if i >= rects.len() { break; }
@@ -1089,7 +2843,7 @@ pub fn render_layout_json(
                 if is_horizontal {
                     let sep_x = rects[i].x + rects[i].width;
                     if sep_x < buf.area.x + buf.area.width {
-                        if both_leaves && total_panes == 2 {
+                        if both_leaves && total_panes == 2 && border_indicators.uses_colour() {
                             let left_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
                             let right_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
                             let left_sty = if left_active { active_border_style } else { border_style };
@@ -1100,13 +2854,14 @@ pub fn render_layout_json(
                                 let idx = (y - buf.area.y) as usize * buf.area.width as usize
                                     + (sep_x - buf.area.x) as usize;
                                 if idx < buf.content.len() {
-                                    buf.content[idx].set_char('│');
+                                    buf.content[idx].set_char(v_char);
                                     buf.content[idx].set_style(sty);
                                 }
                             }
                         } else {
                             for y in area.y..area.y + area.height {
-                                let active = active_rect.map_or(false, |ar| {
+                                let active = border_indicators.highlights_active()
+                                    && active_rect.map_or(false, |ar| {
                                     y >= ar.y && y < ar.y + ar.height
                                     && (sep_x == ar.x + ar.width || sep_x + 1 == ar.x)
                                 });
@@ -1114,7 +2869,7 @@ pub fn render_layout_json(
                                 let idx = (y - buf.area.y) as usize * buf.area.width as usize
                                     + (sep_x - buf.area.x) as usize;
                                 if idx < buf.content.len() {
-                                    buf.content[idx].set_char('│');
+                                    buf.content[idx].set_char(v_char);
                                     buf.content[idx].set_style(sty);
                                 }
                             }
@@ -1123,7 +2878,7 @@ pub fn render_layout_json(
                 } else {
                     let sep_y = rects[i].y + rects[i].height;
                     if sep_y < buf.area.y + buf.area.height {
-                        if both_leaves && total_panes == 2 {
+                        if both_leaves && total_panes == 2 && border_indicators.uses_colour() {
                             let top_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
                             let bot_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
                             let top_sty = if top_active { active_border_style } else { border_style };
@@ -1134,13 +2889,14 @@ pub fn render_layout_json(
                                 let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
                                     + (x - buf.area.x) as usize;
                                 if idx < buf.content.len() {
-                                    buf.content[idx].set_char('─');
+                                    buf.content[idx].set_char(h_char);
                                     buf.content[idx].set_style(sty);
                                 }
                             }
                         } else {
                             for x in area.x..area.x + area.width {
-                                let active = active_rect.map_or(false, |ar| {
+                                let active = border_indicators.highlights_active()
+                                    && active_rect.map_or(false, |ar| {
                                     x >= ar.x && x < ar.x + ar.width
                                     && (sep_y == ar.y + ar.height || sep_y + 1 == ar.y)
                                 });
@@ -1148,7 +2904,7 @@ pub fn render_layout_json(
                                 let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
                                     + (x - buf.area.x) as usize;
                                 if idx < buf.content.len() {
-                                    buf.content[idx].set_char('─');
+                                    buf.content[idx].set_char(h_char);
                                     buf.content[idx].set_style(sty);
                                 }
                             }
@@ -1174,28 +2930,153 @@ struct ClientDragState {
 /// thread, and return a (writer, frame_rx) pair ready for the event loop.
 /// Sets a 5-second write timeout so blocked writes never freeze the client.
 fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
-    let stream = std::net::TcpStream::connect(addr)?;
+    establish_connection_with_timeout(addr, key, RECONNECT_CONNECT_TIMEOUT)
+}
+
+/// Connect budget for a RE-connect: generous, because the server is known to
+/// have existed a moment ago and may simply be busy.
+const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Connect budget for the FIRST attach. A live server on loopback completes the
+/// handshake in about a millisecond (the kernel accepts into the listen backlog
+/// before the app ever calls accept), so a short budget cannot starve a healthy
+/// server. It does cap how long a DEAD port can stall the attach: Windows drops
+/// the SYN for an unbound loopback port and retransmits, so a refusal can take
+/// upwards of two seconds to surface (issue #605). Waiting that out only to
+/// print an OS error wastes the user's time; the liveness verdict is the same
+/// either way.
+const ATTACH_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// The value of `last_sent_size` that means "the server has not been told this
+/// client's size". The size-send check is a plain `!=`, so this sentinel makes
+/// the next loop tick report the size again.
+///
+/// Two things set it back: the server's `status_lines` changing (the content
+/// height the server needs changes with it), and a reconnect. The reconnect one
+/// is not an optimisation: the server keys `client_sizes` on the connection and
+/// a reconnect is a new connection with a new server-side client id, so the
+/// size the window was being sized from died with the old id. Without the
+/// reset, an idle desktop client that got torn down and reconnected became
+/// invisible to `window-size latest` for the rest of its life, and the window
+/// stayed at the other (phone/SSH) client's size even after that client left
+/// (see `tests-rs/test_client_size_after_reconnect.rs`).
+const SIZE_NOT_REPORTED: (u16, u16) = (0, 0);
+
+/// Rows the status line takes from the terminal, which is what the client
+/// subtracts before it reports its size to the server (issue #883). With
+/// `status off` that is zero, as in tmux, where `status_line_size` returns
+/// `s->statuslines` (status.c:113) and that is 0 for off; the window then gets
+/// `tty.sy - 0` rows (resize.c:194, resize.c:299). The draw already gives the
+/// panes every row when the status is off, so reserving a row here left the
+/// panes one row short of what the client draws and the bottom row blank.
+pub(crate) fn status_rows_reserved(status_visible: bool, status_lines: usize) -> u16 {
+    if status_visible { status_lines.max(1).min(u16::MAX as usize) as u16 } else { 0 }
+}
+
+fn reported_terminal_features() -> crate::terminal_features::TerminalFeatures {
+    use crate::terminal_features::TerminalFeatures;
+    TerminalFeatures::from_bits(
+        TerminalFeatures::COLOR_256.bits() | TerminalFeatures::RGB.bits()
+            | TerminalFeatures::HYPERLINKS.bits() | TerminalFeatures::TITLE.bits(),
+    )
+}
+
+fn establish_connection_with_timeout(
+    addr: &str,
+    key: &str,
+    connect_timeout: Duration,
+) -> io::Result<Connection> {
+    // Bounded connect: a wedged/backlogged server otherwise makes `attach` hang
+    // until the ~21s Windows SYN-retransmit and surface as `os error 10060`.
+    // A bounded timeout turns that into a fast, clear failure the caller can
+    // report (and lets try_reconnect back off promptly instead of stalling).
+    let sockaddr: std::net::SocketAddr = addr.parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("bad server address: {addr}")))?;
+    let stream = std::net::TcpStream::connect_timeout(&sockaddr, connect_timeout)?;
     stream.set_nodelay(true)?;
     let mut writer = stream.try_clone()?;
     writer.set_nodelay(true)?;
     writer.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream);
 
+    // Bound the AUTH read too: a wedged server that accepts the socket but never
+    // answers would otherwise block the attach forever with no feedback. The
+    // persistent read timeout is (re)set to 2s just below, after auth.
+    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(3)));
     let _ = writer.write_all(format!("AUTH {}\n", key).as_bytes());
     let _ = writer.flush();
     let mut auth_line = String::new();
-    reader.read_line(&mut auth_line)?;
+    let read_res = reader.read_line(&mut auth_line);
+    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        eprintln!(
+            "[auth-debug pid={}] establish_connection addr={} key={} read_res={:?} got_line={:?}",
+            std::process::id(), addr, key, read_res.as_ref().map(|n| *n), auth_line
+        );
+    }
+    read_res?;
     if !auth_line.trim().starts_with("OK") {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed"));
     }
 
-    let _ = writer.write_all(b"PERSISTENT\n");
-    let _ = writer.write_all(b"client-attach\n");
+    // These two lines are what make the server COUNT this client, so a silent
+    // failure here produces a connection that looks established from the
+    // client's side and does not exist from the server's (issue #675). The
+    // results were discarded; now they are at least reported when the reconnect
+    // trace is on.
+    let persistent_res = writer.write_all(b"PERSISTENT\n");
+    // This client's environment, for the server's update-environment (tmux's
+    // client sends its environ in MSG_IDENTIFY_ENVIRON, #775). It must come
+    // BEFORE client-attach, which is what applies it.
+    {
+        use base64::Engine;
+        let block = crate::client_env::encode_env_block(std::env::vars_os());
+        let line = format!("client-environ {}\n", base64::engine::general_purpose::STANDARD.encode(&block));
+        let _ = writer.write_all(line.as_bytes());
+    }
+    let attach = format!("client-attach features={:#x}\n", reported_terminal_features().bits());
+    let attach_res = writer.write_all(attach.as_bytes());
+    if (persistent_res.is_err() || attach_res.is_err()) && crate::debug_log::reconnect_log_enabled() {
+        crate::debug_log::reconnect_log(&format!(
+            "handshake write FAILED: persistent={:?} client-attach={:?}",
+            persistent_res.err(), attach_res.err()
+        ));
+    }
+    // Report the session this client came FROM, so the server can answer
+    // `switch-client -l` from this client's own history rather than from a
+    // machine-wide file (issue #566). This MUST follow client-attach: that is
+    // what registers the client, and a value arriving before registration has
+    // no entry to be recorded on and is silently dropped. Sent only when there
+    // is something to say, so a first attach is byte-identical to before.
+    if let Ok(prev) = std::env::var("PSMUX_CLIENT_LAST_SESSION") {
+        if !prev.trim().is_empty() {
+            let _ = writer.write_all(
+                format!("client-last-session {}\n",
+                    crate::util::quote_arg_if_needed(prev.trim())).as_bytes(),
+            );
+        }
+    }
+    // `attach -r` (issue #724): ask to be a read only client. Like the last
+    // session above it must follow client-attach, and it is resent on every
+    // reconnect because the flag lives on the connection. Sent only when set,
+    // so a normal attach is byte-identical to before.
+    if std::env::var("PSMUX_CLIENT_READONLY").map(|v| v == "1").unwrap_or(false) {
+        let _ = writer.write_all(b"client-flags read-only\n");
+    }
+    // Issue #473: report the host terminal's colors (queried once at client
+    // startup) so the server can answer pane color queries (OSC 4/10/11,
+    // CSI ?996n) with the real palette instead of the Campbell fallback.
+    if let Some(Some(spec)) = crate::types::HOST_COLORS_SPEC.get() {
+        let _ = writer.write_all(format!("host-colors {}\n", spec).as_bytes());
+    }
     let _ = writer.flush();
 
     // 2-second read timeout keeps the thread from blocking forever on process exit.
     let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    // A frame queued behind another frame replaces it, so a terminal that
+    // stops reading cannot pile up frames here, and the reader never blocks:
+    // blocking it would stall the server's writer into its 5 s write timeout
+    // and get this client dropped. See client_frame_queue.rs.
+    let (frame_tx, frame_rx) = crate::client_frame_queue::frame_queue();
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = String::with_capacity(64 * 1024);
@@ -1217,8 +3098,35 @@ fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
                 }
             }
             let line = std::mem::take(&mut buf);
+            crate::pty_trace::mark_plain("c", line.len());
             buf = String::with_capacity(64 * 1024);
-            if frame_tx.send(line).is_err() { return; }
+            // Whether this line is worth interrupting the main loop's wait for,
+            // decided BEFORE the line is moved into the channel.
+            //
+            // "NC" means the server has nothing new. Waking for it is not just
+            // pointless, it is self-sustaining: the wake returns the input wait
+            // immediately, the loop goes round and sends another dump-state, the
+            // server answers "NC" again, and that NC wakes the loop again. The
+            // result is a request/reply spin at TCP round-trip rate between two
+            // processes that both have nothing to do.
+            //
+            // Measured over a 10s idle window with a silent pane, counting the
+            // client's socket reads: 0.1 lines/sec before this branch, 3935
+            // lines/sec with the wake firing on every line, and 0.1 again with
+            // this gate. It cost up to 92% of a core across the pair, and it is
+            // the same busy poll this branch removed from the "NC" handler,
+            // reintroduced from the other end.
+            //
+            // Everything else is worth a wake: a frame is the whole point, and
+            // directives like SWITCH want to be acted on now. Both are rare
+            // enough that they cannot spin.
+            let worth_waking = line.trim_end() != "NC";
+            if !frame_tx.send(line) { return; }
+            if worth_waking {
+                // Break the main loop out of its console wait NOW. Without this
+                // the frame sits in the channel until the poll interval expires.
+                crate::ssh_input::frame_wake::signal();
+            }
         }
     });
 
@@ -1226,37 +3134,289 @@ fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
 }
 
 /// A live connection: write half + incoming-frame channel.
-type Connection = (std::net::TcpStream, std::sync::mpsc::Receiver<String>);
+type Connection = (std::net::TcpStream, crate::client_frame_queue::FrameReceiver);
+
+/// The one answer to a connection that has gone away, whoever notices first.
+///
+/// Two things can notice: the reader thread, whose exit closes the frame
+/// channel, and the main loop itself, when a write to the old socket fails.
+/// They used to answer differently. The reader spawned the reconnect; the
+/// writer broke out of the main loop, which returned Ok and ended the process
+/// with exit code 0, reconnect thread and all. Whether that happened depended
+/// on whether the server's close arrived as a reset before the loop's next
+/// write (an unread request on the server side at close time turns its FIN
+/// into a RST), which is why the #434 suite lost its client in two rounds of
+/// thirty under load and never in a quiet run (issue #675).
+///
+/// The rules, in order: a detach already under way (`quit`) needs nothing; a
+/// missing port file means the server left on purpose and the client quits
+/// too; a reconnect already in flight is waited for; otherwise one is started.
+/// A failed write while the reconnect is pending is therefore not an exit, it
+/// is the stale socket being stale, and the loop carries on until the result
+/// is applied (a new writer) or the reconnect gives up (which sets `quit`).
+fn on_connection_lost(
+    reconnect_pending: &mut Option<std::sync::mpsc::Receiver<Option<Connection>>>,
+    quit: &mut bool,
+    port_file: &str,
+    addr: &str,
+    key: &str,
+    why: &str,
+) {
+    if *quit {
+        return;
+    }
+    if !std::path::Path::new(port_file).exists() {
+        if reconnect_log_enabled() {
+            reconnect_log(&format!("{} and the port file is gone: intentional, quitting", why));
+        }
+        *quit = true;
+        return;
+    }
+    if reconnect_pending.is_some() {
+        if reconnect_log_enabled() {
+            reconnect_log(&format!("{}, reconnect already pending, waiting for it", why));
+        }
+        return;
+    }
+    if reconnect_log_enabled() {
+        reconnect_log(&format!("{}, spawning reconnect thread", why));
+    }
+    let addr_c = addr.to_string();
+    let key_c = key.to_string();
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    *reconnect_pending = Some(rrx);
+    std::thread::spawn(move || {
+        let _ = rtx.send(try_reconnect(&addr_c, &key_c));
+    });
+}
 
 /// Retry connecting up to 5 times: one immediate attempt, then up to 4 more
 /// with increasing backoff (500ms, 1s, 1.5s, 2s). Returns None if all fail.
+///
+/// Every attempt is traced under `PSMUX_CLIENT_DEBUG=1` (attempt number,
+/// elapsed milliseconds since the teardown was noticed, and the outcome), so a
+/// reconnect that lands late can be told apart from one that lands and is torn
+/// down again. Issue #675 turned on exactly that question and the log is the
+/// only place the answer lives: the client is a TUI, so stdout is unusable.
+/// Gated, so it costs nothing when the env is off.
 fn try_reconnect(addr: &str, key: &str) -> Option<Connection> {
+    let started = Instant::now();
+    let logging = reconnect_log_enabled();
+    if logging {
+        reconnect_log(&format!("begin addr={}", addr));
+    }
     for attempt in 0..5u64 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(attempt * 500));
         }
-        if let Ok(result) = establish_connection(addr, key) {
-            return Some(result);
+        let attempt_started = Instant::now();
+        match establish_connection(addr, key) {
+            Ok(result) => {
+                if logging {
+                    reconnect_log(&format!(
+                        "attempt {}/5 CONNECTED in {}ms (total {}ms)",
+                        attempt + 1,
+                        attempt_started.elapsed().as_millis(),
+                        started.elapsed().as_millis()
+                    ));
+                }
+                return Some(result);
+            }
+            Err(e) => {
+                if logging {
+                    reconnect_log(&format!(
+                        "attempt {}/5 failed in {}ms (total {}ms): {}",
+                        attempt + 1,
+                        attempt_started.elapsed().as_millis(),
+                        started.elapsed().as_millis(),
+                        e
+                    ));
+                }
+            }
         }
+    }
+    if logging {
+        reconnect_log(&format!(
+            "GAVE UP after 5 attempts in {}ms, client will exit",
+            started.elapsed().as_millis()
+        ));
     }
     None
 }
 
-pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::PsmuxWriter>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
+/// Write a client panic to `~/.psmux/client_crash.<pid>.log` with a backtrace.
+///
+/// The server has had one of these since issue #204; the client never did, and
+/// a client's stderr is the last thing anyone can read: it owns a terminal that
+/// is being torn down as the process dies, and in a test it is a minimised
+/// window that closes with the panic still on it. The result is that a client
+/// which dies mid session leaves exactly the same evidence as one that was
+/// killed, namely none.
+///
+/// Issue #675 is that ambiguity in practice: a reconnect that connects in a
+/// millisecond and is then never applied looks identical whether the main loop
+/// stalled or the process died on the spot. The file is per pid, so the thirty
+/// churn clients of the #434 suite cannot overwrite each other, and it is
+/// written only when a panic actually happens.
+fn install_client_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let path = crate::paths::psmux_dir_file(&format!("client_crash.{}.log", std::process::id()));
+        let bt = std::backtrace::Backtrace::force_capture();
+        let _ = std::fs::write(
+            &path,
+            format!(
+                "psmux client pid {} panicked at {}\n\n{info}\n\nBacktrace:\n{bt}",
+                std::process::id(),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            ),
+        );
+        crate::debug_log::reconnect_log("CLIENT PANIC, see client_crash log");
+    }));
+}
+
+/// Log a console control event (Ctrl+C, Ctrl+Break, window close, logoff,
+/// shutdown) before the default handler ends the process. Issue #675: a
+/// client that dies with none of its own exit paths logged is either killed
+/// from outside or told to close by its console, and only a handler can tell
+/// which. Registered only under `PSMUX_CLIENT_DEBUG=1`; it returns FALSE so
+/// the default behaviour is unchanged.
+#[cfg(windows)]
+fn install_console_ctrl_trace() {
+    if !reconnect_log_enabled() {
+        return;
+    }
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn trace(ctrl_type: u32) -> i32 {
+        let name = match ctrl_type {
+            0 => "CTRL_C_EVENT",
+            1 => "CTRL_BREAK_EVENT",
+            2 => "CTRL_CLOSE_EVENT",
+            5 => "CTRL_LOGOFF_EVENT",
+            6 => "CTRL_SHUTDOWN_EVENT",
+            _ => "UNKNOWN",
+        };
+        reconnect_log(&format!("console control event {} ({}), default handling follows", ctrl_type, name));
+        0
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(trace), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_console_ctrl_trace() {}
+
+/// tmux's wording for an attach that cannot reach its session, verbatim:
+/// `can't find session: NAME`, which `main` prints as `psmux: <msg>` and exits
+/// 1. `-L` namespaces are stored on disk as `<ns>__<session>`; the attach gate
+/// publishes the user-facing spelling in `PSMUX_SESSION_DISPLAY_NAME` so this
+/// message shows the name that was typed rather than the internal one.
+pub(crate) fn no_such_session(name: &str) -> io::Error {
+    let shown = std::env::var("PSMUX_SESSION_DISPLAY_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.to_string());
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("can't find session: {}", shown),
+    )
+}
+
+pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
+    // A client process exists only while a terminal is attached, so hold the
+    // 1ms timer period for its whole life. Without it every sub-tick wait in
+    // this process, including the input poll below, rounds up to the default
+    // 15.6ms tick. See src/timer_res.rs.
+    crate::timer_res::set_high(true);
+    install_client_panic_hook();
+    // Issue #675: a client that vanished after a successful reconnect left no
+    // trace of HOW it left. This guard logs every internal return of
+    // run_remote (a `?`, a break, an unwind); an external TerminateProcess
+    // never runs it, which is exactly the distinction the investigation needs.
+    struct ReturnTrace;
+    impl Drop for ReturnTrace {
+        fn drop(&mut self) {
+            if reconnect_log_enabled() {
+                reconnect_log(&format!("run_remote returning (panicking={})", std::thread::panicking()));
+            }
+        }
+    }
+    let _return_trace = ReturnTrace;
+    install_console_ctrl_trace();
+    crate::startup_trace::mark("cli.attach");
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let path = format!("{}\\.psmux\\{}.port", home, name);
+    let path = crate::paths::port_file(&name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
+        .ok_or_else(|| no_such_session(&name))?;
     let addr = format!("127.0.0.1:{}", port);
-    let session_key = read_session_key(&name).unwrap_or_default();
-    let last_path = format!("{}\\.psmux\\last_session", home);
+    // The .port file can be visible a beat before the .key has readable
+    // content (servers before the issue #496 fix wrote .port first, and a
+    // just-claimed warm server rewrites its files). Never AUTH with an empty
+    // key — that is guaranteed to fail — poll briefly for the credential.
+    let mut session_key = read_session_key(&name).unwrap_or_default();
+    if session_key.is_empty() {
+        for _ in 0..400 {
+            std::thread::sleep(Duration::from_millis(5));
+            session_key = read_session_key(&name).unwrap_or_default();
+            if !session_key.is_empty() { break; }
+        }
+    }
+    let session_key = session_key;
+    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        eprintln!(
+            "[auth-debug pid={}] run_remote name={} port={} key={}",
+            std::process::id(), name, port, session_key
+        );
+    }
+    let last_path = crate::paths::psmux_dir_file("last_session");
     if !crate::session::is_warm_session(&name) {
         let _ = std::fs::write(&last_path, &name);
     }
+    // Attaching is activity: tmux restamps the session in server-client.c when a
+    // client takes it (`server_client_set_session` -> `session_update_activity`).
+    // Bare CLI routing ranks by this stamp, so it has to be written here rather
+    // than left to the `last_session` file, which only ever names ONE session
+    // machine-wide and so cannot express "B is newer than A" (issue #603).
+    crate::session::touch_session_activity(&name);
+    // The name this client keeps restamping while the user types. `None` for a
+    // warm (standby) session, which is internal and never a routing candidate.
+    // A rename-session moves it along with `current_session` (below), as the
+    // server moves the stamp itself (carry_session_activity_file).
+    let mut activity_name: Option<String> =
+        if crate::session::is_warm_session(&name) { None } else { Some(name.clone()) };
 
     // ── Open persistent TCP connection ───────────────────────────────────
-    let (mut writer, mut frame_rx) = establish_connection(&addr, &session_key)?;
+    // A failure here is NOT something to report in the operating system's own
+    // words. The registry named a server; if it cannot be reached the session
+    // is gone, and tmux says so in one line. Letting the raw io::Error escape
+    // printed `psmux: No connection could be made because the target machine
+    // actively refused it. (os error 10061)` (issue #605), which names neither
+    // psmux's own concept (a session) nor anything the user can act on.
+    let (mut writer, mut frame_rx) =
+        match establish_connection_with_timeout(&addr, &session_key, ATTACH_CONNECT_TIMEOUT) {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Nothing answered on the registered port. Reap the entry so
+                // the next `ls`/`attach` is clean, but only once the pid anchor
+                // agrees the process is gone: a live server that was merely too
+                // slow must keep its registration (it rewrites these files on
+                // its own 5s tick anyway).
+                if crate::session::registry_pid_anchor_alive(&name) != Some(true) {
+                    crate::session::remove_session_registry(&name);
+                }
+                if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!(
+                        "[auth-debug pid={}] attach connect to {} failed: {} (kind {:?})",
+                        std::process::id(), addr, e, e.kind()
+                    );
+                }
+                return Err(no_such_session(&name));
+            }
+        };
+    crate::startup_trace::mark("cli.connected");
     // Pending background reconnect: Some(rx) while a reconnect thread is running.
     // Kept as None in normal operation. When the channel yields Some(result),
     // the result replaces writer/frame_rx; if it yields None all attempts failed.
@@ -1269,6 +3429,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut prefix_armed = false;
     let mut prefix_armed_at = Instant::now();
     let mut prefix_repeating = false;
+    // `switch-client -T <table>` latch (issue #640). tmux keeps the client in
+    // the named table (`c->keytable`) until the next key is dispatched: that
+    // key is looked up in the custom table, then the client falls back to the
+    // default (root) table. The prefix key always wins and forces the prefix
+    // table, exactly as in `server_client_handle_key`'s `table_changed` block.
+    let mut key_table_latch: Option<String> = None;
+    // Tables the server set without the client (CLI, command prompt,
+    // run-shell, hooks) arrive in the state frame and are adopted here.
+    let mut key_table_sync = KeyTableSync::default();
     // Track whether IME was open before we suppressed it for prefix mode (issue #286).
     #[cfg(windows)]
     let mut ime_was_open = false;
@@ -1276,38 +3445,132 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut renaming = false;
     let mut session_renaming = false;
     let mut rename_buf = String::new();
-    let mut pane_renaming = false;
-    let mut pane_title_buf = String::new();
+    // Where the cursor sits in `rename_buf`, counted in characters back from
+    // the end, the way the copy-mode prompts count it
+    // (`AppState::copy_prompt_back`). Zero is the end, where a prompt that has
+    // just opened puts it.
+    let mut rename_back: usize = 0;
+    // What C-w last cut, for C-y to insert again. One for the command prompt
+    // and the rename overlay, as tmux keeps one `prompt_saved` per client:
+    // only one of them is open at a time, and each opening clears it. The
+    // next prompt of a `-p a,b` keeps it, as tmux's status_prompt_update does.
+    let mut prompt_saved: Option<String> = None;
+    // The server's `word-separators`, which C-w, M-f and M-b split words with
+    // at the command prompt and the rename overlay. It arrives with every
+    // frame; before the first one no prompt can be open.
+    let mut word_separators = String::new();
     let mut command_input = false;
     let mut command_buf = String::new();
-    let mut command_cursor: usize = 0;
+    // Characters from the END of `command_buf`, the way the shared prompt
+    // editor and the rename overlay count (`copy_mode::prompt_edit`).
+    let mut command_back: usize = 0;
     let mut command_history: Vec<String> = Vec::new();
     let mut command_history_idx: usize = 0;
     // Template for command-prompt -I '#W' 'rename-window "%%"' style bindings.
     // When set, Enter substitutes %% with user input and executes the template.
     let mut command_template: Option<String> = None;
+    // `command-prompt -k` / `-1`: the next key, or character, answers the
+    // prompt on its own (status.c:1438 to :1470). Set on every open.
+    let mut command_key_answer = false;
+    let mut command_single = false;
+    // `-N`: digits only, any other key answers and then acts as itself.
+    let mut command_numeric = false;
+    // `-T search`: this prompt walks `search_history`, not `command_history`.
+    let mut command_search = false;
+    let mut search_history: Vec<String> = Vec::new();
+    // `-p a,b`: the prompts still to ask, and the answers given so far
+    // (cmd_command_prompt_callback, cmd-command-prompt.c:180).
+    let mut command_prompt_queue: Vec<(Option<String>, String)> = Vec::new();
+    let mut command_answers: Vec<String> = Vec::new();
+    // A prompt the server asked for (`psmux command-prompt`, a hook): its
+    // request id, reported back with `prompt-done <id>` once it closes, so
+    // a waiting command line returns (#789 follow up).
+    let mut command_request_id: Option<u64> = None;
+    let mut last_prompt_request_id: u64 = 0;
+    let mut prompt_done_pending: Vec<u64> = Vec::new();
+    // The server has a prompt open (a copy mode prompt): its frame carries the
+    // prompt's cursor. Every key goes to that prompt, the prefix key included.
+    let mut srv_prompt_open = false;
     // Custom prompt label from command-prompt -p 'prompt:'
     let mut command_prompt_label: Option<String> = None;
+    // Open the command prompt: the one place a prefix binding's prompt and a
+    // prompt the server asked for (#789 follow up) are set up, so the two
+    // behave the same. `$prompts` is one `(label, initial text)` per prompt.
+    macro_rules! open_command_prompt {
+        ($prompts:expr, $template:expr, $key:expr, $single:expr, $numeric:expr, $search:expr) => {{
+            let mut prompts: Vec<(Option<String>, String)> = $prompts;
+            let (label, initial) = if prompts.is_empty() { (None, String::new()) } else { prompts.remove(0) };
+            let single: bool = $single;
+            let numeric: bool = !single && $numeric;
+            let key: bool = !single && !numeric && $key;
+            let search: bool = $search;
+            command_input = true;
+            command_buf = initial;
+            command_back = 0;
+            prompt_saved = None;
+            command_prompt_label = label;
+            command_prompt_queue = prompts;
+            command_answers = Vec::new();
+            command_template = $template;
+            command_key_answer = key;
+            command_single = single;
+            command_numeric = numeric;
+            command_search = search;
+            command_history_idx = if search { search_history.len() } else { command_history.len() };
+        }};
+    }
     // Track active window name from last dump-state for #W expansion
     let mut active_window_name = String::new();
-    let mut window_idx_input = false;
-    let mut window_idx_buf = String::new();
 
     let mut tree_chooser = false;
+    // The VISIBLE rows of the chooser, which is what tmux calls line_list:
+    // the cursor, the renderer, Enter and the jump keys all index this list.
     let mut tree_entries: Vec<(bool, usize, usize, String, String)> = Vec::new();  // (is_win, id, sub_id, label, session_name)
+    // The full tree behind those rows. Panes of a collapsed window live here
+    // but never reach tree_entries, matching mode_tree_build_lines, which only
+    // recurses into the children of an expanded item.
+    let mut tree_all: Vec<(bool, usize, usize, String, String)> = Vec::new();
+    // (session base, window id) -> window index, for the `=s:idx.` target a
+    // choose-tree template is given (tmux window_tree_get_target).
+    let mut tree_win_index: std::collections::HashMap<(String, usize), usize> = std::collections::HashMap::new();
+    // choose-tree's template argument (#912): run for the chosen row in
+    // place of the chooser's own switch. None for prefix w / prefix s.
+    let mut chooser_template: Option<String> = None;
+    // Indices into tree_all that are collapsed. Seeded by
+    // choose_tree::default_collapsed so every window starts collapsed, which is
+    // what `choose-tree -w` (the command prefix+w runs) does in tmux.
+    let mut tree_collapsed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // visible row index -> tree_all index, so expand/collapse can find the
+    // model row behind the cursor.
+    let mut tree_vis_map: Vec<usize> = Vec::new();
     let mut tree_selected: usize = 0;
     let mut tree_scroll: usize = 0;
-    // Digit-jump buffer for the choose-tree / choose-window picker.
-    // Same UX as session_num_buffer: digits append, Enter jumps, Backspace
-    // edits, Esc clears. Numbered prefix is rendered next to each row so
-    // the digit-to-row mapping is visible.
-    let mut tree_num_buffer = String::new();
+    // How many list rows each chooser drew on its last frame. tmux pages by
+    // `mtd->height`, the list height (mode-tree.c:1318-1333), so Page Up and
+    // Page Down read these instead of a fixed 10 (discussion #776).
+    let mut tree_page_h: usize = 10;
+    let mut session_page_h: usize = 10;
+    let mut buffer_page_h: usize = 10;
     let mut buffer_chooser = false;
-    let mut buffer_entries: Vec<(usize, usize, String)> = Vec::new();  // (index, byte_len, preview)
+    let mut buffer_entries: Vec<(String, usize, String)> = Vec::new();  // (name, byte_len, preview)
     let mut buffer_selected: usize = 0;
     let mut buffer_scroll: usize = 0;
     // Digit-jump buffer for the choose-buffer picker.
     let mut buffer_num_buffer = String::new();
+    // Open the buffer chooser: the one place prefix = and the prompt's
+    // choose-buffer fetch its rows. With no buffers there is no chooser.
+    macro_rules! open_buffer_chooser {
+        () => {{
+            buffer_chooser = true;
+            buffer_selected = 0;
+            buffer_scroll = 0;
+            buffer_num_buffer.clear();
+            buffer_entries = fetch_buffer_entries(port, &session_key);
+            if buffer_entries.is_empty() {
+                buffer_chooser = false;
+            }
+        }};
+    }
     let mut session_chooser = false;
     let mut session_entries: Vec<(String, String)> = Vec::new();
     let mut session_selected: usize = 0;
@@ -1315,6 +3578,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Digits typed while the picker is open accumulate here and are consumed
     // when the user presses Enter — "12" + Enter jumps to the 12th session.
     let mut session_num_buffer = String::new();
+    let mut session_filter_active = false;
+    let mut session_filter = String::new();
     // Digit-jump buffer for the customize-mode picker. Customize lives on
     // the server, so Enter computes a navigate delta and dispatches
     // `customize-navigate <delta>` instead of mutating local state directly.
@@ -1322,12 +3587,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Live preview cache for choose-tree / choose-session pickers (issue #257).
     // Keyed by "session\twin_id\tpane_id"; pane_id == usize::MAX => active pane.
     let mut preview_cache: crate::preview::PreviewCache = std::collections::HashMap::new();
-    // Full-styled dump cache: every pane in a window with its own
-    // `rows_v2` content, fetched in one round trip via `window-dump`.
-    // This is the primary preview source — it sidesteps the per-pane
-    // `capture-pane -t` round trips that mis-targeted the active pane,
-    // and lets the client reuse the same renderer the main view uses.
-    let mut dump_cache: crate::preview::DumpCache = std::collections::HashMap::new();
+    // Target-window preview state keyed by session and window.
+    let mut preview_state_cache: crate::preview::PreviewWindowStateCache =
+        std::collections::HashMap::new();
     // Whether the right-side preview pane is shown. Toggled by `p`
     // while a chooser is open. Persisted across reopens.
     let mut preview_enabled: bool = false;
@@ -1343,14 +3605,37 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut popup_initial_offset: (i32, i32) = (0, 0);
     let mut popup_rect_last: Option<Rect> = None;
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
-    let current_session = name.clone();
-    let mut last_sent_size: (u16, u16) = (0, 0);
+    // The kill a chooser's `x` has asked about and is waiting on, with the
+    // chooser still open behind it, the way tmux's `status_prompt_set(...
+    // PROMPT_SINGLE ...)` leaves the mode open behind its own prompt
+    // (`window-tree.c:1306`).
+    let mut chooser_kill: Option<ChooserKill> = None;
+    // Whether any overlay was up on the previous loop pass, so the pass that
+    // closes one still draws a frame (#767): see `overlay_closed` below.
+    let mut prev_overlays_active = false;
+    // The port file base of this client's own session: under `-L ns` it reads
+    // `ns__name`. The choosers, prefix ( and ) and choose-buffer find "this
+    // session" by it, so it follows a rename-session: each parsed frame carries
+    // the live name (`session_name`) and session_base_after_rename turns it
+    // back into a base. The port and key this client attached with (`port`,
+    // `session_key`) need no such care, because a rename keeps both.
+    let mut current_session = name.clone();
+    // The namespace that base lives in, fixed at attach (see
+    // session_base_after_rename for why it is not read off a renamed base).
+    let own_namespace = client_namespace(&name);
+    // What the session is CALLED, as against `current_session`, which is the
+    // port file base. The server puts the live name in every frame
+    // (`session_name`, issue #7 batch D), so this follows a rename. Until the
+    // first frame lands there is nothing better than the base to show.
+    let mut session_label = name.clone();
+    let mut last_sent_size: (u16, u16) = SIZE_NOT_REPORTED;
     let mut last_status_lines: u16 = 1; // track server's status_lines for correct client-size height
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
     let mut force_dump = true;
     let mut last_tree: Vec<WinTree> = Vec::new();
     // Default prefix is Ctrl+B, updated dynamically from server config
-    let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+    // None after `set prefix None` (#802): no key arms the prefix table.
+    let mut prefix_key: Option<(KeyCode, KeyModifiers)> = Some((KeyCode::Char('b'), KeyModifiers::CONTROL));
     // Precompute the raw control character for the default prefix
     let mut prefix_raw_char: Option<char> = Some('\x02');
     // Secondary prefix key (prefix2), default None
@@ -1363,9 +3648,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut status_bold: bool = false;
     let mut custom_status_left: Option<String> = None;
     let mut custom_status_right: Option<String> = None;
-    let mut pane_border_fg: Color = Color::DarkGray;
-    let mut pane_active_border_fg: Color = Color::Green;
-    let mut pane_border_hover_fg: Color = Color::Yellow;
+    // Last `codepoint-widths` array applied to this process's width table, so
+    // a render frame that did not change the option costs nothing.
+    let mut last_codepoint_widths: Vec<String> = Vec::new();
     let mut win_status_fmt: String = "#I:#W#{?window_flags,#{window_flags}, }".to_string();
     let mut win_status_current_fmt: String = "#I:#W#{?window_flags,#{window_flags}, }".to_string();
     let mut win_status_sep: String = " ".to_string();
@@ -1378,6 +3663,38 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
     let mut defaults_suppressed: bool = false;
     let mut scroll_enter_copy_mode: bool = true;
+    // mouse-drag-enter-copy-mode (mirror of the server option): a drag
+    // enters copy mode instead of painting the client-side overlay.
+    let mut mouse_drag_enter_copy_mode: bool = false;
+    // ctrl-wheel-zoom (mirror of the server option, default off): Ctrl+Wheel
+    // is handed back to the hosting Windows Terminal as its font zoom key.
+    let mut ctrl_wheel_zoom: bool = false;
+    // Whether MouseDragEnd1Pane still has its built-in default (copy and
+    // leave) in the copy-mode table; when it does not, a client-side drag
+    // selection ends in server copy mode so the binding decides.
+    let mut drag_end_default: bool = true;
+    // Client routed mouse keys that are not their built-in default.
+    let mut mouse_overrides: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // B built-in (or absent), U user binding, F to the program, D nothing.
+    let mouse_route = |m: &std::collections::HashMap<String, String>, name: &str, in_copy: bool| -> char {
+        m.get(name)
+            .and_then(|s| s.chars().nth(if in_copy { 1 } else { 0 }))
+            .unwrap_or('B')
+    };
+    // The key name a mouse event is looked up by: with modifiers held and a
+    // binding for the modified name (`M-MouseDown3Pane`), that name; else the
+    // plain one, whose built-in behaviour has always ignored modifiers.
+    let routed_name = |m: &std::collections::HashMap<String, String>, base: &str, mods: KeyModifiers| -> String {
+        if m.is_empty() || mods.is_empty() {
+            return base.to_string();
+        }
+        let mut n = String::new();
+        if mods.contains(KeyModifiers::CONTROL) { n.push_str("C-"); }
+        if mods.contains(KeyModifiers::ALT) { n.push_str("M-"); }
+        if mods.contains(KeyModifiers::SHIFT) { n.push_str("S-"); }
+        n.push_str(base);
+        if m.contains_key(&n) { n } else { base.to_string() }
+    };
     // When false, Ctrl+V is forwarded to the child app instead of being
     // intercepted for paste detection.
     #[cfg(windows)]
@@ -1402,13 +3719,73 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Set to true when Ctrl+V Release is seen — confirms the burst was a paste.
     #[cfg(windows)]
     let mut paste_confirmed: bool = false;
-    // Buffer size at previous stage2 timeout check — for growth detection.
+    // Length of paste_pend when it last grew, and when that was.  Stage 2
+    // ends on a real gap between characters, measured from the last arrival
+    // (see stage2_paste_is_over), not on whether two loop wake ups happened
+    // to straddle one.
     #[cfg(windows)]
-    let mut paste_stage2_last_len: usize = 0;
+    let mut paste_seen_len: usize = 0;
+    #[cfg(windows)]
+    let mut paste_last_growth: Option<Instant> = None;
+    // Set when a paste went out because stage 2 ran quiet.  It keeps a late
+    // Ctrl+V Release from reading the clipboard back (that would paste the
+    // same text twice), and, unlike paste_suppress_until, it never discards
+    // characters: what arrives after a stage 2 send was never sent, so it is
+    // more of the user's input, not a duplicate of it.
+    #[cfg(windows)]
+    let mut paste_fallback_suppress_until: Option<Instant> = None;
     // Suppression window: after right-click copy, discard text key events
     // for a short period to prevent VS Code ConPTY duplicate injection.
-    #[cfg(windows)]
+    // Declared on every platform because the right-click handler assigns it
+    // unconditionally; only the Windows code paths ever read it.
+    #[allow(unused_variables)]
     let mut paste_suppress_until: Option<Instant> = None;
+    // The text of the last paste-shaped burst that already reached the pane,
+    // with the time it went out.  A Ctrl+V Release (or a late Event::Paste)
+    // must not deliver the same string a second time: a short CJK clipboard
+    // paste is flushed as individual characters by the IME heuristic (#91),
+    // and the clipboard read-back that follows hands the pane the same text
+    // again - that is the "pasted text appears twice" duplicate.  Declared on
+    // every platform so the read-back sites stay platform-agnostic; only the
+    // Windows paths ever populate it.
+    #[allow(unused_variables)]
+    let mut paste_gesture = PasteGesture::default();
+    // The Ctrl+V press that reached the client, if any (issue #858): with it,
+    // a release that nothing paste shaped preceded reads no clipboard, and an
+    // unbound press goes to the pane as C-v.
+    #[cfg(windows)]
+    let mut ctrlv_press = CtrlVPress::default();
+    // The clipboard's first characters, re-read only when the system's
+    // clipboard sequence number moves.  Consulted before a 1 to 2 character
+    // burst is committed as typing: if it is the start of what is on the
+    // clipboard it is the head of a paste, not a keystroke (#684 follow up).
+    #[cfg(windows)]
+    let mut paste_clip_head = ClipboardHeadCache::default();
+    // One log line per held group, not one per loop turn.
+    #[cfg(windows)]
+    let mut paste_head_logged = false;
+    // Whether the key that opened the current pending group was a character
+    // typed with Shift alone (issue #766, see PasteHeadEvidence::shifted_head).
+    #[cfg(windows)]
+    let mut paste_head_shifted = false;
+    // The key that opened the current pending group, and whether its release
+    // has been read yet (see PasteHeadEvidence::head_released).
+    #[cfg(windows)]
+    let mut paste_head_key: Option<char> = None;
+    #[cfg(windows)]
+    let mut paste_head_released = false;
+    // Whether this client's input has ever carried a key release. The VT
+    // input route (PSMUX_VT_INPUT, ssh) has no release events at all, so a
+    // missing release proves nothing there and the head is judged as before.
+    #[cfg(windows)]
+    let mut key_releases_seen = false;
+    // And only the console record route reads a host's press and release
+    // pair from one buffer in one drain. The VT route parses them on a reader
+    // thread, so a pasted character's release can trail its press past the
+    // drain (measured: the 19045 drip under PSMUX_VT_INPUT=1 split 43 of 43
+    // characters out of the bracket), so there the head is judged as before.
+    #[cfg(windows)]
+    let release_shape_is_evidence = matches!(input, crate::ssh_input::InputSource::Crossterm { .. });
 
     // Track whether a modified Enter Press was already handled this keypress
     // cycle.  WezTerm sends Shift+Enter as Release-only (no Press), so we
@@ -1429,7 +3806,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     #[allow(unused_assignments)]
     let mut srv_popup_active = false;
     #[allow(unused_assignments)]
-    let mut srv_popup_command = String::new();
+    // The frame the server resolved for the open popup (#792).
+    let mut srv_popup_frame = crate::popup::PopupFrame::new("", "single", crate::popup::DEFAULT_POPUP_BORDER_STYLE, "");
     #[allow(unused_assignments)]
     let mut srv_popup_width: u16 = 80;
     #[allow(unused_assignments)]
@@ -1439,7 +3817,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     #[allow(unused_assignments)]
     let mut srv_popup_rows: Vec<crate::layout::RowRunsJson> = Vec::new();
     #[allow(unused_assignments)]
+    let mut srv_floats: Vec<FloatJson> = Vec::new();
+    #[allow(unused_assignments)]
     let mut srv_popup_has_pty = false;
+    #[allow(unused_assignments)]
+    let mut srv_popup_cursor: Option<(u16, u16)> = None; // popup-inner (col, row)
     let mut srv_popup_scroll: u16 = 0;
     #[allow(unused_assignments)]
     let mut srv_confirm_active = false;
@@ -1479,7 +3861,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut srv_customize_options: Vec<CustomizeOption> = Vec::new();
 
     #[derive(serde::Deserialize, Default)]
-    struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool, #[serde(default)] tab_text: String }
+    struct WinStatus {
+        id: usize,
+        name: String,
+        active: bool,
+        #[serde(default)] activity: bool,
+        #[serde(default)] bell: bool,
+        #[serde(default)] last: bool,
+        #[serde(default)] tab_text: String,
+        #[serde(default)] idx: usize,
+        /// Per-window `window-status-*-style` overrides (#648). Absent for a
+        /// window that set none, which is the ordinary case, so the server
+        /// wide styles below keep doing all the work.
+        #[serde(default)] ws_style: Option<String>,
+        #[serde(default)] wsc_style: Option<String>,
+        #[serde(default)] wsa_style: Option<String>,
+        #[serde(default)] wsb_style: Option<String>,
+        #[serde(default)] wsl_style: Option<String>,
+    }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
@@ -1488,6 +3887,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     fn default_status_lines() -> usize { 1 }
     fn default_status_visible() -> bool { true }
     fn default_repeat_time() -> u64 { 500 }
+    fn default_escape_time() -> u64 { crate::types::DEFAULT_ESCAPE_TIME_MS }
     fn default_bold_is_bright() -> bool { true }
     // #431: default TRUE so a server without the `sixel` field still attempts
     // rendering (a non-capable outer terminal simply ignores the DCS).
@@ -1495,6 +3895,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     fn default_paste_detection() -> bool { true }
     fn default_mouse_selection() -> bool { true }
     fn default_scroll_enter_copy_mode() -> bool { true }
+    fn default_true_drag_end() -> bool { true }
 
     /// A single key binding synced from the server.
     #[derive(serde::Deserialize, Clone, Debug)]
@@ -1538,6 +3939,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     struct DumpState {
         layout: LayoutJson,
         windows: Vec<WinStatus>,
+        /// The session's own name, which a `rename-session` changes under the
+        /// client's feet. The port file base cannot stand in for it.
+        #[serde(default)]
+        session_name: Option<String>,
         #[serde(default)]
         prefix: Option<String>,
         #[serde(default)]
@@ -1560,10 +3965,35 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         pane_active_border_style: Option<String>,
         #[serde(default)]
         pane_border_hover_style: Option<String>,
+        #[serde(flatten)]
+        client_render_options: crate::render_state::ClientRenderOptions,
         #[serde(default)]
         pane_border_status: Option<String>,
         #[serde(default)]
         pane_border_format: Option<String>,
+        #[serde(default)]
+        pane_border_lines: Option<String>,
+        /// copy-mode-line-numbers option (off/default/absolute/relative/hybrid)
+        #[serde(default)]
+        copy_mode_line_numbers: Option<String>,
+        /// Active pane scrollback size, for absolute/hybrid line numbers.
+        #[serde(default)]
+        copy_hsize: usize,
+        /// toggle-position / copy-mode -H: hide the position indicator.
+        #[serde(default)]
+        copy_hide_position: bool,
+        #[serde(default)]
+        copy_mode_line_number_style: Option<String>,
+        #[serde(default)]
+        copy_mode_current_line_number_style: Option<String>,
+        /// copy-mode-match-style, copy-mode-current-match-style and
+        /// copy-mode-mark-style, sent only when the user set them (#694).
+        #[serde(default)]
+        copy_mode_match_style: Option<String>,
+        #[serde(default)]
+        copy_mode_current_match_style: Option<String>,
+        #[serde(default)]
+        copy_mode_mark_style: Option<String>,
         /// window-status-format (short key to save bandwidth)
         #[serde(default)]
         wsf: Option<String>,
@@ -1591,11 +4021,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a)
         #[serde(default)]
         defaults_suppressed: bool,
+        /// The key table the server holds for this client (`switch-client -T`),
+        /// absent for root. See `KeyTableSync`.
+        #[serde(default)]
+        key_table: Option<String>,
+        /// The session's `key-table` option, absent for root.
+        #[serde(default)]
+        default_key_table: Option<String>,
         /// scroll-enter-copy-mode option (mirror of server-side AppState field).
         /// When false, root key bindings that enter copy mode (e.g. PageUp ->
         /// copy-mode -u) are skipped so the key reaches the PTY (#284).
         #[serde(default = "default_scroll_enter_copy_mode")]
         scroll_enter_copy_mode: bool,
+        /// mouse-drag-enter-copy-mode option (mirror of the server-side
+        /// field). When true, a left-button drag in a pane that does not
+        /// track the mouse enters copy mode and selects there (tmux parity)
+        /// instead of painting the client-side selection overlay.
+        #[serde(default)]
+        mouse_drag_enter_copy_mode: bool,
+        /// ctrl-wheel-zoom option (mirror of the server-side field).
+        #[serde(default)]
+        ctrl_wheel_zoom: bool,
+        /// MouseDragEnd1Pane is its built-in default (absent from an older
+        /// server: true).
+        #[serde(default = "default_true_drag_end")]
+        drag_end_default: bool,
+        /// Client routed mouse keys that lost their built-in default:
+        /// name -> two dispatch letters (outside / inside copy mode), see
+        /// mouse_keys::client_overrides. Empty from an older server.
+        #[serde(default)]
+        mouse_overrides: std::collections::HashMap<String, String>,
         /// pwsh-mouse-selection option (mirror of server-side AppState field)
         #[serde(default)]
         pwsh_mouse_selection: bool,
@@ -1604,6 +4059,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// in-pane apps (opencode, etc.) can do their own mouse selection.
         #[serde(default = "default_mouse_selection")]
         mouse_selection: bool,
+        /// mouse-selection-force option. When true, client-side drag
+        /// selection overrides an application's mouse tracking.
+        #[serde(default)]
+        mouse_selection_force: bool,
         /// paste-detection option (mirror of server-side AppState field)
         #[serde(default = "default_paste_detection")]
         paste_detection: bool,
@@ -1645,6 +4104,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// Used as fallback when no child process has set a cursor shape.
         #[serde(default)]
         cursor_style_code: Option<u8>,
+        /// `cursor-blink` when it was set and `cursor-style` names no shape,
+        /// `null` otherwise. A shape carries its own blink in the DECSCUSR
+        /// code above; this is the blink on its own, which only DEC private
+        /// mode 12 can express.
+        #[serde(default)]
+        cursor_blink_mode: Option<bool>,
         /// One-shot clipboard text (base64-encoded) for OSC 52 delivery.
         #[serde(default)]
         clipboard_osc52: Option<String>,
@@ -1666,6 +4131,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// Repeat key timeout in ms (default: 500, synced from server)
         #[serde(default = "default_repeat_time")]
         repeat_time: u64,
+        /// escape-time in ms (issue #841 follow up): bounds how long the
+        /// input layer may hold an ambiguous Escape.
+        #[serde(default = "default_escape_time")]
+        escape_time: u64,
         /// bold-is-bright option (issue #425): controls whether the console
         /// writer rewrites crossterm's 256-indexed basic colors to standard SGR.
         /// The writer lives in this client process, so the value is synced from
@@ -1691,6 +4160,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         popup_active: bool,
         #[serde(default)]
         popup_command: Option<String>,
+        /// Popup frame (#792): title, border line set, border style and
+        /// content style, resolved by the server (crate::popup::popup_frame_wire).
+        #[serde(default)]
+        popup_title: String,
+        #[serde(default)]
+        popup_border_lines: Option<String>,
+        #[serde(default)]
+        popup_border_style: Option<String>,
+        #[serde(default)]
+        popup_style: String,
         #[serde(default)]
         popup_width: Option<u16>,
         #[serde(default)]
@@ -1701,11 +4180,26 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         popup_rows: Vec<crate::layout::RowRunsJson>,
         #[serde(default)]
         popup_has_pty: bool,
+        /// Cursor of the process running inside a PTY popup, relative to the
+        /// popup's inner (inside-the-border) area.
+        #[serde(default)]
+        popup_cursor_row: Option<u16>,
+        #[serde(default)]
+        popup_cursor_col: Option<u16>,
+        #[serde(default)]
+        popup_hide_cursor: bool,
+        /// Floating panes (tmux new-pane) overlaid on the active window.
+        #[serde(default)]
+        floats: Vec<FloatJson>,
         /// Confirm overlay active
         #[serde(default)]
         confirm_active: bool,
         #[serde(default)]
         confirm_prompt: Option<String>,
+        /// A command prompt the server asks one client to open (#789 follow
+        /// up): `psmux command-prompt`, or one a hook ran.
+        #[serde(default)]
+        prompt_request: Option<crate::types::PromptRequest>,
         /// Menu overlay active
         #[serde(default)]
         menu_active: bool,
@@ -1724,6 +4218,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// Status bar message from display-message (without -p)
         #[serde(default)]
         status_message: Option<String>,
+        /// Byte offset of the cursor inside `status_message`, sent only when
+        /// the message is an open copy-mode prompt (search, goto line, or a
+        /// command prompt from the copy-mode table). `None` for a
+        /// display-message, which has no cursor of its own.
+        #[serde(default)]
+        status_cursor: Option<usize>,
+        /// Byte length of that prompt's label, the part before the typed
+        /// text. Only the text after it scrolls when the prompt outgrows the
+        /// line, so the label stays readable (tmux status.c:922 to :948).
+        #[serde(default)]
+        status_label: Option<usize>,
         /// Customize-mode overlay active
         #[serde(default)]
         customize_active: bool,
@@ -1753,8 +4258,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Diagnostic latency log: set PSMUX_LATENCY_LOG=1 to enable
     let latency_log_enabled = env::var("PSMUX_LATENCY_LOG").unwrap_or_default() == "1";
     let mut latency_log: Option<std::fs::File> = if latency_log_enabled {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        let path = format!("{}\\.psmux\\latency.log", home);
+        let path = crate::paths::psmux_dir_file("latency.log");
         std::fs::File::create(&path).ok()
     } else { None };
     let mut loop_count: u64 = 0;
@@ -1765,7 +4269,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
     let mut rsel_end: Option<(u16, u16)> = None;
     let mut rsel_pane_rect: Option<Rect> = None;    // clip bounds of the originating pane
+    let mut rsel_pane_id: Option<usize> = None;     // pane the selection started in
     let mut rsel_dragged = false;
+    // The copy-mode selection endpoint this client last PAINTED (content
+    // row/col), so a release can re-report it instead of letting the server
+    // yank a motion that never reached the screen.  Cleared when a gesture
+    // starts and when copy mode ends, so it can never carry into the next one.
+    let mut client_drawn_sel: Option<(u16, u16)> = None;
+    // Server-side copy-mode drag tracking.  The pane the drag started in is
+    // remembered so drag/release events keep reaching the server after the
+    // pointer leaves the pane rect (out-of-range rows drive edge
+    // auto-scroll), and a 50ms repeat re-sends the last drag while the
+    // pointer dwells at/past the pane's first or last row so the view keeps
+    // scrolling without mouse movement (tmux drag-scroll parity).
+    let mut copy_drag_pane: Option<(usize, Rect)> = None; // (pane_id, rect at drag start)
+    let mut copy_drag_last: Option<(i16, i16)> = None;    // last pane-relative (col, row) sent
+    let mut copy_drag_repeat_at: Option<Instant> = None;  // next repeat due (armed only at an edge)
+    const COPY_DRAG_REPEAT: Duration = Duration::from_millis(50);
+    // mouse-drag-enter-copy-mode: a press recorded here turns into a
+    // server-side copy-mode selection on the first drag of the gesture
+    // (pane_id, pane rect at press, pane-relative col, row).
+    let mut copy_mode_drag_pending: Option<(usize, Rect, i16, i16)> = None;
+    // A click withheld from a mouse-aware pane while psmux determines whether
+    // the gesture is a click or a selection drag: (pane_id, col, row).
+    let mut deferred_left_click: Option<(usize, i16, i16)> = None;
     // Multi-click tracking for word/line selection.
     let mut last_click: Option<(Instant, (u16, u16))> = None;
     let mut click_count: u32 = 0;
@@ -1774,18 +4301,49 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut rsel_block: bool = false;
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
-    // Client-side tab position tracking for accurate mouse click detection.
-    // The server's update_tab_positions() uses a different algorithm than what
-    // the client actually renders, so we track positions at render time.
-    let mut client_tab_positions: Vec<(usize, u16, u16)> = Vec::new(); // (window_array_idx, x_start, x_end)
-    let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
-    let mut client_base_index: usize = 0; // base-index for window numbering
+    // A press on a separator whose MouseDrag1Border lost its built-in
+    // default: the dispatch letter (U runs the binding on every drag motion,
+    // F / D do nothing), until the release.
+    let mut border_drag_route: Option<char> = None;
+    // A left press in a pane while MouseDown1Pane or MouseDrag1Pane lost its
+    // built-in default: (pane, rect, press route, drag route, press cell
+    // pane-relative, drag handed to copy mode yet). The whole gesture then
+    // goes through the key tables instead of the client selection.
+    let mut pane_gesture: Option<(usize, Rect, char, char, (i16, i16), bool)> = None;
+    // tmux's click timer for the status line, used only while a
+    // Second/Double/TripleClick1Status binding exists: (presses so far, the
+    // window's end, target, col, row).
+    let mut status_clicks: Option<(u8, Instant, String, u16, u16)> = None;
+    // The copy-mode line number mode and scrollback size the frames are being
+    // painted with, which is what the gutter width is computed from. Kept out
+    // here because a copy-mode release re-reports a cell the server gave as a
+    // content column, and a mouse report carries a view column
+    // (`copy_release_repin`).
+    let mut client_copy_ln: (crate::copy_line_numbers::CopyLnMode, usize) =
+        (crate::copy_line_numbers::CopyLnMode::Off, 0);
+    // Track rendered tab positions for accurate mouse click detection.
+    // (row, window_display_idx, x_start, x_end) — one entry per clickable tab
+    // span, on WHICHEVER status row it renders (#593: multi-row bars carry
+    // clickable ranges on every line, matching tmux status_get_range).
+    let mut client_tab_positions: Vec<(u16, usize, u16, u16)> = Vec::new();
+    let mut client_status_row: u16 = u16::MAX; // first status bar row
+    let mut client_status_rows: u16 = 0; // status bar height in rows (0 = hidden)
+    // Display indices of windows that actually exist, so a click on a
+    // #[range=window|N] naming a nonexistent window is ignored like tmux
+    // (server-client.c returns KEYC_UNKNOWN when winlink_find_by_index fails).
+    let mut client_window_indices: Vec<usize> = Vec::new();
     let mut client_pane_rects: Vec<(usize, Rect)> = Vec::new();
+    // Per-pane live scrollback offset from the last dump (see view_offset).
+    let mut client_pane_view_offsets: Vec<(usize, usize)> = Vec::new();
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
     let mut client_content_area: Rect = Rect::default();
+    // Border status/format from the last draw, for cursor/mouse inner-rect calc.
+    let mut client_border_status: String = "off".to_string();
+    let mut client_border_format: String = String::new();
     let mut client_copy_mode: bool = false;
     let mut client_pwsh_selection: bool = false;
     let mut client_mouse_selection: bool = true;
+    let mut client_mouse_selection_force: bool = false;
     let mut client_zoomed: bool = false;
     let mut client_drag: Option<ClientDragState> = None;
     // Border hover highlight: (position, kind, area) of the border under the cursor.
@@ -1793,7 +4351,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Buffered OSC 52 clipboard text — written AFTER terminal.draw() to
     // avoid corrupting ratatui's output buffer.
     let mut pending_osc52: Option<String> = None;
-    let mut pending_bell = false;
     // Last OSC 0 (host terminal title) value emitted to the host terminal.
     // Tracked across iterations so we only re-emit when the title changes.
     let mut last_emitted_host_title: Option<String> = None;
@@ -1811,15 +4368,249 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // (deferred init: assigned at the top of every frame before any read).
     // M6 gates its emit block on this (plus outer-terminal capability).
     let mut sixel_enabled: bool;
-    // VT input mode: periodically re-send mouse-enable escape sequences.
-    // Covers SSH sessions and JetBrains JediTerm (which sends VT mouse
-    // sequences through ConPTY instead of native MOUSE_EVENT records).
+    // VT input mode (SSH / JediTerm / WezTerm): used to pick the Win32
+    // caret path below.  The periodic mouse-enable refresh keyed off
+    // last_mouse_enable runs in EVERY input mode via send_mouse_keepalive —
+    // Windows Terminal drops even a local client's mouse registration.
     let is_ssh_mode = crate::ssh_input::needs_vt_input();
     let mut last_mouse_enable = Instant::now();
+    // Raw VT pipe: cadence for the XTWINOPS size poll.
+    let mut last_pipe_size_query = Instant::now();
     // ── Cursor blink stabilisation ──────────────────────────────────
     // Cache the last-sent DECSCUSR code so we only write it when it
     // actually changes (avoids resetting WT's blink timer every frame).
-    let mut last_cursor_style: u8 = 255;
+    //
+    // It starts at 0, the code for "no shape asserted", because that is the
+    // state the terminal is in before this client writes anything: whatever
+    // cursor its user configured. A frame that also wants 0 therefore writes
+    // nothing, and the reset goes out only to undo a shape this client itself
+    // sent. tmux keeps the same latch and the same rule in
+    // `tty_update_cursor` (tty.c): for `SCREEN_CURSOR_DEFAULT` it sends `Se`,
+    // or `Ss 0`, only `if (tty->cstyle != SCREEN_CURSOR_DEFAULT)`.
+    let mut last_cursor_style: u8 = 0;
+    // The blink this client last asserted on its own, through DEC private mode
+    // 12, for a `cursor-style` that names no shape. `None` is "said nothing",
+    // which is where every client starts and what an unset `cursor-blink`
+    // leaves it at.
+    let mut last_blink_mode: Option<bool> = None;
+    // Open prefix+w's tree chooser and prefix+s's session list. A key
+    // binding opens them, and so does the server's CHOOSE-TREE or
+    // CHOOSE-SESSION directive, sent when choose-tree runs on the server (the
+    // command prompt, a root table binding, a hook, a menu, the CLI).
+    macro_rules! open_tree_chooser {
+        () => {{
+            tree_chooser = true;
+            tree_entries.clear();
+            tree_all.clear();
+            tree_collapsed.clear();
+            tree_vis_map.clear();
+            tree_win_index.clear();
+            tree_selected = 0;
+            tree_scroll = 0;
+            popup_offset = (0, 0);
+            popup_dragging = false;
+            popup_rect_last = None;
+            if choose_tree_preview_default { preview_enabled = true; }
+            // Query ALL sessions (like tmux choose-tree)
+            let dir = crate::paths::psmux_dir();
+            // A -L socket is a separate server in tmux; a client never
+            // sees another socket's sessions. Same rule `ls` applies
+            // and the same predicate the session picker uses (ed52715).
+            let tree_ns = crate::session::session_namespace(&current_session);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut sessions: Vec<(String, Vec<(usize, String, bool, Vec<(usize, String)>, usize)>)> = Vec::new();
+                for e in entries.flatten() {
+                    if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
+                        if let Some((base, ext)) = fname.rsplit_once('.') {
+                            if ext == "port" {
+                                if crate::session::is_warm_session(base) { continue; }
+                                if !crate::session::session_visible_from(base, tree_ns) { continue; }
+                                if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                    if let Ok(p) = port_str.trim().parse::<u16>() {
+                                        let sess_addr = format!("127.0.0.1:{}", p);
+                                        let sess_key = read_session_key(base).unwrap_or_default();
+                                        // Centralized AUTH+command helper handles the OK ack race
+                                        // (issue #250) and bounds the response size.
+                                        if let Some(tree_line) = crate::session::fetch_authed_response_multi(
+                                            &sess_addr,
+                                            &sess_key,
+                                            b"list-tree\n",
+                                            Duration::from_millis(50),
+                                            Duration::from_millis(100),
+                                        ) {
+                                            if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(tree_line.trim()) {
+                                                let mut win_data = Vec::new();
+                                                for w in &wins {
+                                                    let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
+                                                    win_data.push((w.id, w.name.clone(), w.active, panes, w.idx));
+                                                }
+                                                sessions.push((base.to_string(), win_data));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sessions.sort_by(|a, b| {
+                    if a.0 == current_session { std::cmp::Ordering::Less }
+                    else if b.0 == current_session { std::cmp::Ordering::Greater }
+                    else { a.0.cmp(&b.0) }
+                });
+                // Row index of the current session's active window, so the
+                // chooser opens its cursor on it (issue #373) instead of the
+                // hardcoded top row. The active window is also marked with `*`,
+                // glyph-adjacent, matching list_windows_tmux and real tmux.
+                let mut active_tree_row: Option<usize> = None;
+                for (sess_name, wins) in &sessions {
+                    let is_current = sess_name == &current_session;
+                    let nw = wins.len();
+                    // The row keeps the base to switch to and to
+                    // kill; the label shows the session's name.
+                    tree_all.push((true, usize::MAX, 0,
+                        tree_session_header(tree_ns, sess_name, nw, is_current),
+                        sess_name.clone()));
+                    // Every session's windows carry their panes, as
+                    // tmux's window_tree_build_window builds pane items
+                    // for every window of every session. Only the
+                    // current session's rows used to get them, so
+                    // another session's windows had nothing to expand
+                    // (discussion #776, note 3).
+                    for (wid, wname, active, panes, disp) in wins.iter() {
+                        tree_win_index.insert((sess_name.clone(), *wid), *disp);
+                        let marker = if *active { "*" } else { "" };
+                        if *active && is_current { active_tree_row = Some(tree_all.len()); }
+                        tree_all.push((true, *wid, 0,
+                            format!("  {}: {}{} ({} panes)", disp, wname, marker, panes.len()),
+                            sess_name.clone()));
+                        for (pid, ptitle) in panes {
+                            tree_all.push((false, *wid, *pid,
+                                format!("    {}", ptitle),
+                                sess_name.clone()));
+                        }
+                    }
+                }
+                if let Some(r) = active_tree_row { tree_selected = r; }
+            }
+            if tree_all.is_empty() {
+                for wi in &last_tree {
+                    let marker = if wi.active { "*" } else { "" };
+                    if wi.active { tree_selected = tree_all.len(); }
+                    tree_all.push((true, wi.id, 0, format!("{}{}", wi.name, marker), current_session.clone()));
+                    for pi in &wi.panes {
+                        tree_all.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
+                    }
+                }
+            }
+            // tmux `window_tree_build_window` under `choose-tree -w`:
+            // every window row opens collapsed, so the visible lines are
+            // the session headers and their windows and nothing else.
+            // That is what makes the jump digit line up with the window
+            // number in the status bar however many panes a window holds.
+            let kinds = tree_row_kinds(&tree_all);
+            tree_collapsed = crate::choose_tree::default_collapsed(&kinds);
+            let model_cursor = tree_selected;
+            let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+            tree_entries = rows;
+            tree_vis_map = map;
+            tree_selected = tree_vis_map
+                .iter()
+                .position(|&i| i == model_cursor)
+                .unwrap_or(0);
+        }};
+    }
+    macro_rules! open_session_chooser {
+        () => {{
+            session_chooser = true;
+            session_entries.clear();
+            session_selected = 0;
+            session_scroll = 0;
+            session_num_buffer.clear();
+            session_filter_active = false;
+            session_filter.clear();
+            popup_offset = (0, 0);
+            popup_dragging = false;
+            popup_rect_last = None;
+            if choose_tree_preview_default { preview_enabled = true; }
+            let dir = crate::paths::psmux_dir();
+            // Collect (label, addr, key) for every port file, then run ONE
+            // bounded liveness probe per session in parallel. This both lists
+            // and prunes: total wall time is ~one probe window regardless of
+            // how many sessions exist, so the picker stays responsive (no
+            // sequential O(N * timeout) cleanup pass).
+            let mut targets: Vec<(String, String, String)> = Vec::new();
+            // A -L socket is a separate server in tmux; a client never
+            // sees another socket's sessions. Same rule `ls` applies.
+            let picker_ns = crate::session::session_namespace(&current_session);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    if let Some(fname) = e.file_name().to_str() {
+                        if let Some((base, ext)) = fname.rsplit_once('.') {
+                            if ext == "port" {
+                                if crate::session::is_warm_session(base) { continue; }
+                                if !crate::session::session_visible_from(base, picker_ns) { continue; }
+                                if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                    if let Ok(p) = port_str.trim().parse::<u16>() {
+                                        let sess_addr = format!("127.0.0.1:{}", p);
+                                        let sess_key = read_session_key(base).unwrap_or_default();
+                                        targets.push((base.to_string(), sess_addr, sess_key));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Issue #259 (batch D): sort by label so the picker's order is
+            // deterministic, matching the tree_chooser's established
+            // convention (session.rs::list_all_sessions_tree sorts by name)
+            // and the g/G Home/End contract. Without this, order followed
+            // raw directory-enumeration order, which the Win32 API
+            // explicitly does not guarantee to be stable or alphabetical.
+            targets.sort_by(|a, b| a.0.cmp(&b.0));
+            let verdicts = crate::session::classify_sessions_parallel(
+                targets,
+                Duration::from_millis(50),
+                Duration::from_millis(250),
+            );
+            for (label, liveness) in verdicts {
+                match liveness {
+                    crate::session::SessionLiveness::Alive(info) => {
+                        session_entries.push((label, info));
+                    }
+                    crate::session::SessionLiveness::Dead => {
+                        // Server gone (crashed, killed by a reboot, or its
+                        // port reused by another server). Reap it so it never
+                        // shows as a "(not responding)" zombie. A live-but-slow
+                        // server self-heals on its next 5s registry tick.
+                        if crate::debug_log::session_log_enabled() {
+                            crate::debug_log::session_log("picker",
+                                &format!("reaping dead session '{}' from chooser", label));
+                        }
+                        crate::session::remove_session_registry(&label);
+                    }
+                    crate::session::SessionLiveness::Unreachable => {
+                        // Could not connect (transient, non-refused). Keep it
+                        // and show the honest "(not responding)" rather than
+                        // deleting on an ambiguous failure.
+                        session_entries.push((label.clone(), format!("{}: (not responding)", label)));
+                    }
+                }
+            }
+            if session_entries.is_empty() {
+                session_entries.push((current_session.clone(), format!("{}: (current)", current_session)));
+            }
+            for (i, (sname, _)) in session_entries.iter().enumerate() {
+                if sname == &current_session { session_selected = i; break; }
+            }
+        }};
+    }
+    // Trap Ctrl+Break (and stray Ctrl+C) console signals so they interrupt the
+    // pane's foreground program instead of terminating this client and
+    // detaching the still-running session (issue #454).  The signal is drained
+    // into cmd_batch as `send-key C-Break` at the top of each iteration.
+    crate::platform::install_client_console_ctrl_handler();
     loop {
         // ── Poll background reconnect result (non-blocking) ──────────────────
         // If a background reconnect thread has finished, apply its result here
@@ -1827,6 +4618,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         if let Some(ref rx) = reconnect_pending {
             if let Ok(result) = rx.try_recv() {
                 reconnect_pending = None;
+                if reconnect_log_enabled() {
+                    reconnect_log(&format!(
+                        "result applied: {} (quit={})",
+                        if result.is_some() { "reattached" } else { "gave up" },
+                        quit));
+                }
                 if let Some((new_writer, new_rx)) = result {
                     if !quit {
                         // Normal reconnect: apply fresh writer + frame channel.
@@ -1834,6 +4631,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         frame_rx = new_rx;
                         force_dump = true;
                         dump_in_flight = false;
+                        // The reconnect is a new TCP connection, and the server
+                        // keys client sizes on the connection: the size it sized
+                        // the window with is gone. Report it again on the next
+                        // tick, or `window-size latest` can never pick this
+                        // client again (SIZE_NOT_REPORTED above).
+                        last_sent_size = SIZE_NOT_REPORTED;
                     }
                     // If quit is already set (user detached while reconnect was
                     // in-flight), let new_writer drop here so the TcpStream
@@ -1844,10 +4647,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
         }
-        // Expire stale key_send_instant after 30ms — ConPTY echo should
-        // have arrived by then; stop force-dumping to save CPU.
+        // Expire the fast-poll window on time, and ONLY on time. One constant
+        // governs how long it stays open; see key_echo_window_expired.
         if let Some(ks) = key_send_instant {
-            if ks.elapsed().as_millis() > 30 { key_send_instant = None; }
+            if key_echo_window_expired(ks.elapsed().as_millis()) { key_send_instant = None; }
         }
         // Safety valve: if dump_in_flight is stuck for >500ms (e.g. server
         // did not respond), release it so the client doesn't spin at 1ms.
@@ -1858,6 +4661,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // Drain channel, keeping only the most recent frame.
         let mut got_frame = false;
         let mut _nc_count = 0u32;
+        let mut drained_oneshots = crate::frame_oneshot::OneShots::default();
+        let mut pending_chooser: Option<(crate::choose_tree::ChooserKind, Option<String>)> = None;
         loop {
             match frame_rx.try_recv() {
                 Ok(line) => {
@@ -1867,12 +4672,31 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // without touching dump_buf (saves 50-100KB clone + parse).
                         dump_in_flight = false;
                         last_dump_time = Instant::now();
-                        // If we're waiting for a key echo, force an
-                        // immediate dump-state re-request (~1ms TCP RTT)
-                        // instead of waiting the full 10ms typing interval.
-                        if key_send_instant.is_some() {
-                            force_dump = true;
-                        }
+                        // Deliberately NOT re-requesting here.
+                        //
+                        // "NC" means the server has nothing new, and asking it
+                        // again immediately cannot change that: the echo is not
+                        // late because the client failed to ask, it is late
+                        // because the shell has not produced it yet. Re-asking
+                        // turned the echo window into a TCP busy poll running at
+                        // round-trip rate, burning CPU in both processes to
+                        // learn "still nothing" over and over.
+                        //
+                        // The echo does not need polling for. The server pushes
+                        // a frame to every attached client whenever pane state
+                        // changes (see the `(state_dirty || meta_dirty) &&
+                        // has_frame_receivers()` push in server/mod.rs), which
+                        // is the path the echo actually arrives on, and the
+                        // client's input wait is woken by that push landing.
+                        //
+                        // Measured over 40 single keystrokes into a raw echo
+                        // child, counting `pty_trace` marks. Before: 1872 lines
+                        // read off the socket, the echo arriving as 47 full
+                        // dump-state responses and only 3 server pushes. After:
+                        // 548 lines, 49 pushes and 1 dump-state response. Same
+                        // 40 characters on screen, a third of the traffic, and
+                        // the echo now travels on the push rather than on the
+                        // client's next poll.
                     } else if line.trim().starts_with("SWITCH ") {
                         // Server is telling us to switch to another session
                         let target_session = line.trim().strip_prefix("SWITCH ").unwrap_or("").to_string();
@@ -1892,10 +4716,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // parent shell on exit (tmux -P parity, issue #275).
                         kill_parent_on_exit = true;
                         quit = true;
+                    } else if let Some(open) = crate::choose_tree::parse_directive(line.trim()) {
+                        // choose-tree ran on the server (the command prompt,
+                        // a root table binding, a hook, a menu, the CLI).
+                        // Opened after the drain, as a key binding opens it.
+                        pending_chooser = Some(open);
                     } else {
                         if client_log_enabled() {
                             client_log("frame", &format!("received {} bytes", line.len()));
                         }
+                        crate::pty_trace::mark_plain("d", line.len());
+                        if crate::startup_trace::on() {
+                            crate::startup_trace::mark_detail("cli.frame", &format!("len={}", line.len()));
+                        }
+                        // The clipboard write and bell come off the frame
+                        // here, before the next frame in this drain replaces
+                        // it, and the frame kept for rendering never carries
+                        // them, so a redraw from it cannot repeat them.
+                        let mut line = line;
+                        drained_oneshots.merge_newer(crate::frame_oneshot::take(&mut line));
                         dump_buf = line; got_frame = true; dump_in_flight = false;
                     }
                 }
@@ -1905,22 +4744,51 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     // file (all clean-shutdown paths do this before calling
                     // shutdown_persistent_streams), treat the disconnect as intentional
                     // and quit immediately instead of burning 5 s of reconnect backoff.
-                    if !quit && !std::path::Path::new(&path).exists() {
-                        quit = true;
-                    } else if reconnect_pending.is_none() && !quit {
-                        let addr_c = addr.clone();
-                        let key_c = session_key.clone();
-                        let (rtx, rrx) = std::sync::mpsc::channel();
-                        reconnect_pending = Some(rrx);
-                        std::thread::spawn(move || {
-                            let _ = rtx.send(try_reconnect(&addr_c, &key_c));
-                        });
-                    }
+                    on_connection_lost(&mut reconnect_pending, &mut quit, &path, &addr, &session_key, "connection dropped");
                     break;
                 }
             }
         }
-        if quit && !got_frame { break; }
+        // One chooser at a time, as a pane holds one mode in tmux.
+        match pending_chooser {
+            Some((crate::choose_tree::ChooserKind::Tree, template)) => {
+                session_chooser = false;
+                buffer_chooser = false;
+                open_tree_chooser!();
+                chooser_template = template;
+            }
+            Some((crate::choose_tree::ChooserKind::Session, template)) => {
+                tree_chooser = false;
+                buffer_chooser = false;
+                open_session_chooser!();
+                chooser_template = template;
+            }
+            None => {}
+        }
+        // ── OSC 52 and bell from the server, once each, now ─────────────
+        // Not tied to drawing a frame: the frame they came in may be
+        // identical to the last one drawn, or never be drawn at all. Neither
+        // moves the cursor or touches a cell, so writing them between frames
+        // cannot disturb ratatui's output.
+        if let Some(clip_b64) = drained_oneshots.clip_b64.take() {
+            if let Some(clip_text) = crate::util::base64_decode(&clip_b64) {
+                // Also set the local Win32 clipboard for non-SSH scenarios
+                copy_to_system_clipboard(&clip_text);
+                crate::copy_mode::emit_osc52(&mut std::io::stdout(), &clip_text);
+            }
+        }
+        if drained_oneshots.bell {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if quit && !got_frame {
+            if reconnect_log_enabled() {
+                reconnect_log(&format!(
+                    "main loop leaving on quit (reconnect pending={})",
+                    reconnect_pending.is_some()));
+            }
+            break;
+        }
 
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
         let since_dump = last_dump_time.elapsed().as_millis() as u64;
@@ -1938,34 +4806,46 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         #[cfg(not(windows))]
         let paste_pend_active = false;
 
-        let poll_ms = if paste_pend_active { 1 }
-            else if got_frame { 0 }
-            else if dump_in_flight { 5 }
-            else if force_dump { 0 }
-            else if typing_active {
-                // Rate-limit to ~100fps (10ms) when typing.  The snapshot-
-                // based serialisation in dump_layout_json_fast now holds
-                // the parser mutex for only ~1ms (cell snapshot), so
-                // polling at 10ms no longer starves the ConPTY reader
-                // thread.  10ms is notably shorter than ConPTY's ~16ms
-                // render interval, avoiding systematic alignment delays.
-                let remaining = 10u64.saturating_sub(since_dump);
-                remaining
-            }
-            else {
-                // Server pushes frames proactively via auto-push —
-                // no need for fast idle polling.  16ms (~60fps) ensures
-                // pushed frames render within one vsync while using
-                // negligible CPU (vs 50ms poll + dump-state roundtrip).
-                16
-            };
+        let poll_ms = input_poll_ms(
+            paste_pend_active,
+            got_frame,
+            key_send_instant.map(|t| t.elapsed().as_millis()),
+            dump_in_flight,
+            force_dump,
+            typing_active,
+            since_dump,
+        );
 
         cmd_batch.clear();
+
+        // ── Ctrl+Break signal → forward to pane (issue #454) ───────────
+        // A trapped Ctrl+Break console signal can't come through the key loop,
+        // so drain it here and relay it to the active pane's foreground process.
+        // Write straight to the server rather than via cmd_batch: cmd_batch is
+        // cleared every iteration and some event branches `continue` before the
+        // batch flush, which could silently drop the break.
+        if crate::platform::take_client_ctrl_break() {
+            let _ = writer.write_all(b"send-key C-Break\n");
+            let _ = writer.flush();
+        }
 
         // ── Windows paste pending-buffer management ────────────────────
         // Flush or promote chars based on how long they've been buffered.
         #[cfg(windows)]
         {
+            // An unbound Ctrl+V press that no paste followed within the
+            // gesture window is the pane's C-v (issue #858), even with the key
+            // still held down.
+            if ctrlv_press.take_due(PASTE_GESTURE_WINDOW) {
+                if input_log_enabled() {
+                    input_log("paste", "Ctrl+V press: nothing followed it, sending C-v to the pane");
+                }
+                cmd_batch.push("send-key C-v\n".to_string());
+            }
+            if paste_pend.len() != paste_seen_len {
+                paste_seen_len = paste_pend.len();
+                paste_last_growth = if paste_pend.is_empty() { None } else { Some(Instant::now()) };
+            }
             if let Some(start) = paste_pend_start {
                 let elapsed = start.elapsed();
                 if paste_confirmed {
@@ -1975,6 +4855,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
                                 paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                         }
+                        paste_gesture.record(&paste_pend);
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
                         // Suppress clipboard-read fallback
@@ -1984,6 +4865,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     paste_pend_start = None;
                     paste_stage2 = false;
                     paste_confirmed = false;
+                    paste_gesture.finish();
                 } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
                     // 20ms window expired
                     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
@@ -1993,7 +4875,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // because IME routinely generates 3+ chars in <20ms and would
                         // trigger a false-positive 300ms delay (fixes #91).
                         paste_stage2 = true;
-                        paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
                         }
@@ -2002,7 +4883,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // containing Unicode content (em-dashes, CJK, etc.), not
                         // IME composition (which rarely exceeds a few chars).
                         paste_stage2 = true;
-                        paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2 (large non-ASCII): {} chars in 20ms", paste_pend.len()));
                         }
@@ -2012,6 +4892,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         if input_log_enabled() {
                             input_log("paste", &format!("flush {} chars as normal (non-ASCII / IME detected)", paste_pend.len()));
                         }
+                        // A burst delivered as typing can still be a clipboard
+                        // paste (the Ctrl+V Release read-back would then paste
+                        // the same text twice), so remember what went out.
+                        paste_gesture.record(&paste_pend);
                         for c in paste_pend.chars() {
                             match c {
                                 '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -2034,6 +4918,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         if input_log_enabled() {
                             input_log("paste", &format!("flush {} chars as normal (< 3 in 20ms)", paste_pend.len()));
                         }
+                        // Even a 1-2 character burst can be a clipboard paste
+                        // ("ab" pasted twice is the same bug as a CJK word), so
+                        // remember it for the read-back check.
+                        paste_gesture.record(&paste_pend);
                         for c in paste_pend.chars() {
                             match c {
                                 '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -2053,36 +4941,61 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         paste_pend_start = None;
                     }
                 } else if paste_stage2 && elapsed > Duration::from_millis(300) {
-                    // Stage 2 timeout — no Ctrl+V Release arrived.
-                    // Growth detection: if the buffer grew since last check,
-                    // ConPTY is still injecting characters (large paste).
-                    // Extend the window instead of splitting the paste.
-                    if paste_pend.len() > paste_stage2_last_len {
-                        paste_stage2_last_len = paste_pend.len();
-                        paste_pend_start = Some(Instant::now() - Duration::from_millis(280));
-                    } else {
-                        // Buffer stopped growing — send accumulated chars as
-                        // send-paste so the server wraps in bracketed paste.
+                    // Stage 2 timeout — no Ctrl+V Release arrived.  While
+                    // characters keep arriving the paste is still coming in
+                    // (a large paste, or one sshd's ConPTY hands over in
+                    // fragments), so it is held until it has been quiet for
+                    // PASTE_STAGE2_QUIET since its LAST character.
+                    let quiet = paste_last_growth.map_or(Duration::MAX, |t| t.elapsed());
+                    if stage2_paste_is_over(elapsed, quiet) {
+                        // Quiet: send accumulated chars as send-paste so the
+                        // server wraps them in one bracketed paste.
                         if input_log_enabled() {
-                            input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
+                            input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste (quiet {} ms)", paste_pend.len(), quiet.as_millis()));
                         }
+                        paste_gesture.record(&paste_pend);
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
                         paste_pend.clear();
                         paste_pend_start = None;
                         paste_stage2 = false;
-                        paste_stage2_last_len = 0;
                         // Suppress the clipboard-read fallback that fires
                         // when Ctrl+V Release arrives later (the paste was
-                        // already sent via stage2).
-                        paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                        // already sent via stage2).  Characters are NOT
+                        // suppressed: this paste went out because input went
+                        // quiet, so anything after it is input nobody has
+                        // forwarded yet.  Dropping it lost the middle of a
+                        // fragmented paste (issue #598, sweep 2026-10-01).
+                        paste_fallback_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                     }
                 }
             }
         }
 
         {
-            let mut _pending_evt = input.read_timeout(Duration::from_millis(poll_ms))?;
+            // This `?` ends the client: the error travels out of run_remote and
+            // the process exits, printing to a terminal that is being torn down
+            // and leaving no trace anywhere. Issue #675 is what that looks like
+            // from outside, a client that reconnects in a millisecond and is
+            // simply gone a moment later, with the reconnect result still
+            // sitting unapplied in its channel. Say what the error was before
+            // letting it go.
+            let mut _pending_evt = match input.read_timeout(Duration::from_millis(poll_ms)) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::debug_log::reconnect_log(&format!(
+                        "input wait FAILED, client is exiting: kind={:?} err={}",
+                        e.kind(), e
+                    ));
+                    return Err(e);
+                }
+            };
+            if crate::pty_trace::on() && matches!(_pending_evt, Some(Event::Key(_))) {
+                crate::pty_trace::mark_plain("k", poll_ms as usize);
+            }
+            // A key a `command-prompt -N` answered goes round again, so it is
+            // handled as the key it is once the prompt is closed (status.c:1456).
+            let mut redispatch_evt: Option<Event> = None;
             while let Some(_cur_evt) = _pending_evt {
                 // Input debug: log every raw event BEFORE filtering
                 if input_log_enabled() {
@@ -2104,6 +5017,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                         other => {
                             input_log("event", &format!("Other {:?}", other));
+                        }
+                    }
+                }
+                // Real input from a real client is what tmux counts as session
+                // activity (server-client.c `server_client_handle_key` restamps
+                // `activity_time` before dispatching, and mouse arrives on the
+                // same path as a key). Resize is deliberately excluded: it is
+                // the terminal talking, not the user. Bare CLI commands rank
+                // sessions by this stamp, so typing in the session you are
+                // sitting in is what makes it win (issue #603).
+                if let Some(ref sess) = activity_name {
+                    if matches!(_cur_evt, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+                        crate::session::touch_session_activity_throttled(sess);
+                    }
+                }
+                // The release of the key that opened a pending group, read in
+                // the same drain as its press, is what a host writing text
+                // into the console input buffer looks like (it writes each
+                // character as a press and release pair). A hand on a keyboard
+                // lets go tens of milliseconds later.
+                #[cfg(windows)]
+                if let Event::Key(k) = &_cur_evt {
+                    if k.kind == KeyEventKind::Release {
+                        key_releases_seen = true;
+                    }
+                    if k.kind == KeyEventKind::Release && !paste_pend.is_empty() {
+                        if let (KeyCode::Char(c), Some(h)) = (k.code, paste_head_key) {
+                            if c.to_lowercase().eq(h.to_lowercase()) {
+                                paste_head_released = true;
+                            }
                         }
                     }
                 }
@@ -2131,6 +5074,51 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     // as a bracketed-paste so child apps (Claude CLI, etc.)
                     // can distinguish paste from typed input.
                     // Skipped when paste-detection is off.
+                    //
+                    // Measured for #858 on Windows Terminal (26200, default
+                    // ctrl+v binding): no press arrives, the clipboard DOES
+                    // arrive as key records, then this release with Ctrl
+                    // held.  So in practice the release confirms a burst the
+                    // client already holds, and the clipboard read is the
+                    // fallback for a host whose characters never show up.
+                    //
+                    // All of that is only true when the press did NOT reach the
+                    // client.  When it did (issue #858: a terminal with no
+                    // Ctrl+V paste binding, or one that delivers the press and
+                    // then the clipboard as key records) the press is what
+                    // decides: nothing paste shaped after it means nothing was
+                    // pasted, and the release must not read the clipboard.
+                    #[cfg(windows)]
+                    Event::Key(key) if key.kind == KeyEventKind::Release
+                        && matches!(key.code, KeyCode::Char('v'))
+                        && paste_detection_enabled
+                        && ctrlv_press.pending() =>
+                    {
+                        match ctrlv_press.release() {
+                            Some(CtrlVRelease::NoPaste { send_cv }) => {
+                                if input_log_enabled() {
+                                    input_log("paste", &format!(
+                                        "Ctrl+V Release after a press with nothing pasted between: no clipboard read{}",
+                                        if send_cv { ", sending C-v to the pane" } else { "" }));
+                                }
+                                if send_cv {
+                                    cmd_batch.push("send-key C-v\n".to_string());
+                                }
+                                paste_gesture.finish();
+                            }
+                            _ => {
+                                if input_log_enabled() {
+                                    input_log("paste", &format!("Ctrl+V Release after a pasting press, paste_pend len={}", paste_pend.len()));
+                                }
+                                // Same as before #858: a release with Ctrl
+                                // still held confirms the paste; one with Ctrl
+                                // already up leaves it to the stage 2 timer.
+                                if key.modifiers == KeyModifiers::CONTROL {
+                                    paste_confirmed = true;
+                                }
+                            }
+                        }
+                    }
                     #[cfg(windows)]
                     Event::Key(key) if key.kind == KeyEventKind::Release
                         && matches!(key.code, KeyCode::Char('v'))
@@ -2154,7 +5142,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         crate::platform::augment_enter_shift(&mut key);
                         modified_enter_press_handled = true;
                         // Skip paste buffering — forward directly like a Press.
-                        let is_prefix = (key.code, key.modifiers) == prefix_key
+                        let is_prefix = prefix_key == Some((key.code, key.modifiers))
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c))
                             || prefix2_key.map_or(false, |p2| (key.code, key.modifiers) == p2)
                             || prefix2_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
@@ -2166,6 +5154,49 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                     }
                     Event::Key(mut key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // Fold NUL onto C-Space before anything looks at the key.
+                        // The console reports Ctrl+Space, Ctrl+2, Ctrl+Shift+2 and a
+                        // NUL byte sent by a ConPTY-hosted terminal identically, and
+                        // all of them ARE NUL.  Folding here (not just in the binding
+                        // lookup) is what lets the raw `is_prefix` comparison below
+                        // match a `C-Space` prefix, and makes the byte forwarded to
+                        // the pane 0x00 instead of 0x12 (issue #504).
+                        {
+                            let folded = crate::config::fold_nul_to_ctrl_space((key.code, key.modifiers));
+                            key.code = folded.0;
+                            key.modifiers = folded.1;
+                        }
+                        // Issue #858: note a Ctrl+V press that reached the
+                        // client, and whether what follows it is a paste (the
+                        // host's characters) or an ordinary key, before which
+                        // a held back C-v has to go out.
+                        #[cfg(windows)]
+                        if paste_detection_enabled {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            let alt = key.modifiers.contains(KeyModifiers::ALT);
+                            let owed = if matches!(key.code, KeyCode::Char('v')) && key.modifiers == KeyModifiers::CONTROL {
+                                ctrlv_press.press()
+                            } else {
+                                let paste_shaped = match key.code {
+                                    // AltGr arrives as Ctrl+Alt on a non letter.
+                                    KeyCode::Char(c) => (!ctrl && !alt) || (ctrl && alt && !c.is_ascii_lowercase()),
+                                    KeyCode::Enter | KeyCode::Tab => !ctrl && !alt,
+                                    _ => false,
+                                };
+                                if paste_shaped {
+                                    ctrlv_press.note_paste_input();
+                                    false
+                                } else {
+                                    ctrlv_press.take_before_key()
+                                }
+                            };
+                            if owed {
+                                if input_log_enabled() {
+                                    input_log("paste", "Ctrl+V press: nothing followed it, sending C-v to the pane before the next key");
+                                }
+                                cmd_batch.push("send-key C-v\n".to_string());
+                            }
+                        }
                         // On Windows, VS Code's xterm.js sends ESC+CR for
                         // Shift+Enter.  ConPTY interprets the ESC as Alt, so
                         // crossterm reports Alt+Enter.  Poll the physical
@@ -2180,6 +5211,55 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 modified_enter_press_handled = true;
                             } else {
                                 modified_enter_press_handled = false;
+                            }
+                        }
+                        // A key that arrives after a held paste has gone quiet
+                        // is not part of that paste (issue #766). The paste goes
+                        // out first, as its own bracketed paste, and the key is
+                        // handled after it, in the order the two were written.
+                        // Before this, stage 2 kept holding the paste until its
+                        // 300 ms window ran out and appended whatever came in
+                        // meanwhile, so an Enter written 150 ms after a paste
+                        // reached the pane as `text CR ESC[201~`, a pasted
+                        // newline instead of a submit. Chars pushed earlier in
+                        // this same batch count as arriving now: they came in
+                        // together with this key, so there was no gap.
+                        #[cfg(windows)]
+                        {
+                            if paste_pend.len() != paste_seen_len {
+                                paste_seen_len = paste_pend.len();
+                                paste_last_growth = if paste_pend.is_empty() { None } else { Some(Instant::now()) };
+                            }
+                            let quiet = paste_last_growth.map_or(Duration::MAX, |t| t.elapsed());
+                            if stage2_paste_ended_by_new_key(paste_stage2, !paste_pend.is_empty(), quiet) {
+                                if input_log_enabled() {
+                                    input_log("paste", &format!(
+                                        "stage2 paste ended by a key after {} ms quiet, sending {} chars as send-paste before it",
+                                        quiet.as_millis(), paste_pend.len()));
+                                }
+                                paste_gesture.record(&paste_pend);
+                                let encoded = base64_encode(&paste_pend);
+                                cmd_batch.push(format!("send-paste {}\n", encoded));
+                                paste_pend.clear();
+                                paste_pend_start = None;
+                                paste_stage2 = false;
+                                paste_seen_len = 0;
+                                paste_last_growth = None;
+                                // Same reason as the stage 2 timeout send: a late
+                                // Ctrl+V Release must not read the clipboard back,
+                                // and nothing that follows is discarded.
+                                paste_fallback_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                            }
+                            // The key that opens a pending group decides whether
+                            // its head is a shifted character (issue #766).
+                            if paste_pend.is_empty() {
+                                paste_head_shifted = key.modifiers == KeyModifiers::SHIFT
+                                    && matches!(key.code, KeyCode::Char(c) if c != ' ');
+                                paste_head_key = match key.code {
+                                    KeyCode::Char(c) => Some(c),
+                                    _ => None,
+                                };
+                                paste_head_released = false;
                             }
                         }
                         // Flush pending paste buffer before processing any non-bufferable key.
@@ -2204,12 +5284,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     _ => false,
                                 };
                                 if !is_bufferable {
-                                    flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch);
+                                    flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch, &mut paste_gesture);
                                 }
                             }
                         }
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
-                        let is_prefix = (key.code, key.modifiers) == prefix_key
+                        let is_prefix = prefix_key == Some((key.code, key.modifiers))
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c))
                             || prefix2_key.map_or(false, |p2| (key.code, key.modifiers) == p2)
                             || prefix2_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
@@ -2236,7 +5316,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             if srv_popup_has_pty {
                                 // PTY popup: forward all keys to server
                                 match key.code {
-                                    KeyCode::Esc => { cmd_batch.push("overlay-close\n".into()); }
+                                    KeyCode::Esc => {
+                                        // Forward Esc to the popup PTY, not to the overlay (#471).
+                                        // A PTY popup runs a real interactive app (nvim, fzf, a
+                                        // shell); Esc belongs to that app. tmux forwards it too and
+                                        // only closes the popup when its child process exits (e.g.
+                                        // `:q` in nvim), which close-on-exit already handles. The
+                                        // previous overlay-close swallowed Esc and killed the popup.
+                                        let encoded = crate::util::base64_encode("\x1b");
+                                        cmd_batch.push(format!("popup-input {}\n", encoded));
+                                    }
                                     KeyCode::Char(c) => {
                                         let bytes = if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                                             vec![(c as u8) & 0x1F]
@@ -2375,15 +5464,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     KeyCode::Esc => { cmd_batch.push("customize-edit-cancel\n".into()); }
                                     KeyCode::Enter => { cmd_batch.push("customize-edit-confirm\n".into()); }
                                     KeyCode::Backspace => {
-                                        if srv_customize_cursor > 0 {
-                                            let mut buf = srv_customize_edit_buf.clone();
-                                            buf.remove(srv_customize_cursor - 1);
+                                        // The cursor is a byte offset (the server parks it
+                                        // at edit_buffer.len()); remove the whole character
+                                        // before it, not byte cursor-1, which panicked on a
+                                        // value ending in a multi byte char (#712 audit).
+                                        let mut buf = srv_customize_edit_buf.clone();
+                                        if crate::util::str_remove_char_before(&mut buf, srv_customize_cursor) {
                                             cmd_batch.push(format!("customize-edit-update {}\n", buf));
                                         }
                                     }
                                     KeyCode::Char(c) => {
                                         let mut buf = srv_customize_edit_buf.clone();
-                                        buf.insert(srv_customize_cursor, c);
+                                        let at = crate::util::str_prefix_within(&buf, srv_customize_cursor).len();
+                                        buf.insert(at, c);
                                         cmd_batch.push(format!("customize-edit-update {}\n", buf));
                                     }
                                     _ => {}
@@ -2447,25 +5540,59 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                             }
                         }
-                        else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
-                            command_input = false;
-                            command_cursor = 0;
-                            renaming = false;
-                            pane_renaming = false;
-                            tree_chooser = false;
-                            buffer_chooser = false;
-                            session_chooser = false;
-                            keys_viewer = false;
-                            confirm_cmd = None;
-                            // Drop any pending digit-jump buffers when the
-                            // pickers are dismissed via Esc.
-                            tree_num_buffer.clear();
-                            buffer_num_buffer.clear();
-                            session_num_buffer.clear();
-                            // Also clear any lingering selection
-                            rsel_start = None;
-                            rsel_end = None;
-                            selection_changed = true;
+                        // A `-k` prompt is answered by Escape like any other
+                        // key ("Escape", status.c:1438), so it is left to the
+                        // prompt's own arm.
+                        else if matches!(key.code, KeyCode::Esc) && ((command_input && !command_key_answer && !command_numeric) || renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
+                            if chooser_kill.is_some() {
+                                // Escape answers a chooser's kill question with
+                                // "no" and leaves the chooser open, which is
+                                // what tmux's single key prompt does with any
+                                // key that is not `y`. Without this the branch
+                                // below would take Escape and close the chooser
+                                // under the question.
+                                chooser_kill = None;
+                            } else if session_chooser && !session_filter.is_empty() {
+                                let selected_entry = session_filter_escape_selection(
+                                    &session_entries,
+                                    &session_filter,
+                                    session_selected,
+                                );
+                                session_filter.clear();
+                                session_filter_active = false;
+                                session_selected = selected_entry.unwrap_or(0);
+                                session_scroll = 0;
+                                session_num_buffer.clear();
+                            } else {
+                                command_input = false;
+                                command_back = 0;
+                                command_template = None;
+                                command_prompt_label = None;
+                                renaming = false;
+                                // Which of the two renames the overlay was
+                                // doing goes with it. Without this the flag
+                                // outlived the cancelled prompt and the next
+                                // `,` renamed the session: the arm further
+                                // down that clears both never runs, because
+                                // this branch takes Escape first.
+                                session_renaming = false;
+                                tree_chooser = false;
+                                buffer_chooser = false;
+                                session_chooser = false;
+                                session_filter_active = false;
+                                session_filter.clear();
+                                keys_viewer = false;
+                                confirm_cmd = None;
+                                // Drop any pending digit-jump buffers when the
+                                // pickers are dismissed via Esc. The tree chooser
+                                // has none: its jump keys act immediately.
+                                buffer_num_buffer.clear();
+                                session_num_buffer.clear();
+                                // Also clear any lingering selection
+                                rsel_start = None;
+                                rsel_end = None;
+                                selection_changed = true;
+                            }
                         }
                         else if rsel_start.is_some() && matches!(key.code, KeyCode::Esc) {
                             // Escape clears any active text selection
@@ -2473,40 +5600,100 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             rsel_end = None;
                             selection_changed = true;
                         }
-                        else if is_prefix {
+                        // An open prompt takes the key first, the prefix key
+                        // included. tmux hands a key to `status_prompt_key`
+                        // before the key table that holds the prefix is even
+                        // looked at (`server-client.c:1485` to `:1489`, tag
+                        // 3.7c), so `C-b` at a prompt with the default prefix
+                        // moves the cursor one character left. psmux armed the
+                        // prefix instead, which left the prompt's own `C-b`
+                        // unreachable on a default configuration and ate the
+                        // next key as a prefix command. Only the two prompts
+                        // with an editor are excluded here; the choosers keep
+                        // what they had. The window index prompt is the
+                        // command prompt since #821, so it is one of the two.
+                        // A prompt the SERVER has open (a copy mode prompt) takes
+                        // it too: the client sees that prompt only as a status
+                        // line with a cursor, and used to arm the prefix on C-b,
+                        // which is cursor left there and the answer at a -k
+                        // prompt (#789 follow up).
+                        else if is_prefix && !prefix_armed && !command_input && !renaming && !srv_prompt_open {
                             // Suppress IME while in prefix mode so command keys
                             // are not intercepted by the input method (issue #286).
                             #[cfg(windows)]
                             { ime_was_open = crate::platform::ime_disable(); }
+                            // tmux: "The prefix always takes precedence and
+                            // forces a switch to the prefix table", so a
+                            // pending `switch-client -T` latch is dropped here.
+                            key_table_latch = None;
+                            // prefix-begin clears the server's table too.
+                            key_table_sync.note_own_write(None);
                             prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into());
                         }
+                        // NOTE: when the prefix key is pressed while the prefix is
+                        // ALREADY armed we deliberately do NOT re-arm here. Falling
+                        // through lets the prefix-table dispatch below handle it, so
+                        // `bind -T prefix C-b send-prefix` fires and a literal prefix
+                        // byte is forwarded to the active pane. This is what lets a
+                        // nested multiplexer (e.g. tmux over SSH) receive its own
+                        // prefix via prefix+prefix (discussion #310).
                         // Check root-table bindings (bind-key -n / bind-key -T root)
-                        // These fire without prefix, before keys are forwarded to PTY
-                        else if !command_input && !renaming && !pane_renaming && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
+                        // These fire without prefix, before keys are forwarded to PTY.
+                        // Skip them entirely when the prefix is armed so the prefix
+                        // table takes exclusive priority, matching tmux: once the prefix
+                        // is pressed a key bound in both tables must fire its prefix
+                        // binding, not its root binding (issue #472).
+                        // A pending `switch-client -T` latch is checked before
+                        // the root table, so `key_table_latch.is_none()` gates
+                        // this arm and lets the dispatch arm below run instead.
+                        else if !prefix_armed && key_table_latch.is_none() && !command_input && !renaming && !srv_prompt_open && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             synced_bindings.iter().any(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                                 // Skip scroll-triggered copy mode bindings when option is off (#284)
-                                && !(b.c.starts_with("copy-mode") && b.c.contains("-u") && !scroll_enter_copy_mode)
+                                && !(!scroll_enter_copy_mode && crate::copy_mode::is_page_up_copy_mode_command(&b.c))
                             })
                         } {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             if let Some(entry) = synced_bindings.iter().find(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
-                                && !(b.c.starts_with("copy-mode") && b.c.contains("-u") && !scroll_enter_copy_mode)
+                                b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                && !(!scroll_enter_copy_mode && crate::copy_mode::is_page_up_copy_mode_command(&b.c))
                             }) {
                                 if entry.c == "detach-client" || entry.c == "detach" {
                                     quit = true;
                                 } else {
-                                    // Split on \; to support command chaining (issue #192)
-                                    let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
-                                    for sub in &sub_cmds {
-                                        cmd_batch.push(format!("{}\n", sub));
+                                    // A root binding goes through the same
+                                    // dispatch as a prefix or latched one, so a
+                                    // `bind -n F6 switch-client -T mytbl` latches
+                                    // the table for the next key. Forwarding the
+                                    // chain verbatim told the server (so
+                                    // #{client_key_table} said mytbl) but never
+                                    // armed the client, which kept looking the
+                                    // next key up in root. Chaining on \; is
+                                    // preserved (issue #192).
+                                    match dispatch_binding_commands(&entry.c) {
+                                        BindingDispatch::SessionNav { .. } => {
+                                            // Unchanged: root session
+                                            // navigation stays a server command.
+                                            let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
+                                            cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                        }
+                                        BindingDispatch::Commands { cmds, latch } => {
+                                            cmd_batch.extend(binding_wire_lines(&cmds));
+                                            if latch.is_some() {
+                                                key_table_sync.note_own_write(latch.as_deref());
+                                                key_table_latch = key_table_sync.latch_for(latch);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                        else if prefix_armed {
+                        else if prefix_armed
+                            || (key_table_latch.is_some() && !command_input && !renaming
+                                && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer
+                                && confirm_cmd.is_none())
+                        {
                             // Pending flags for complex client-side UI commands
                             // (shared between synced_bindings dispatch and pre-sync hardcoded fallback)
                             let mut do_choose_tree = false;
@@ -2514,11 +5701,48 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             let mut do_choose_buffer = false;
                             let mut do_session_nav: Option<bool> = None; // Some(true)=next, Some(false)=prev
 
+                            // Which table this key is looked up in. The prefix
+                            // table when the prefix is armed, otherwise the
+                            // table a previous `switch-client -T` latched. The
+                            // latch is consumed here (tmux resets the client to
+                            // the default table as soon as a key is handled),
+                            // so a binding that latches a new table below wins.
+                            let latched_table = if prefix_armed { None } else { key_table_latch.take() };
+                            let active_table: &str = latched_table.as_deref().unwrap_or("prefix");
+                            // tmux `server_client_handle_key` puts the client
+                            // back on the default table BEFORE it dispatches
+                            // the binding (server-client.c:1572
+                            // `server_client_set_key_table(c, NULL)`, then
+                            // :1577 `key_bindings_dispatch(...)`). That
+                            // ordering is what lets a `switch-client -T`
+                            // inside the binding survive, which is how a
+                            // sticky table is built. Emitting the reset here,
+                            // ahead of every command the binding queues,
+                            // gives the server the same ordering as the
+                            // client's own latch, which `take()` above has
+                            // already cleared.
+                            if latched_table.is_some() {
+                                // Back to the session's key-table, which is
+                                // root unless `key-table` is set.
+                                cmd_batch.push(format!("switch-client -T {}\n",
+                                    crate::util::quote_arg_if_needed(key_table_sync.default_table())));
+                                key_table_sync.note_own_write(None);
+                            }
+
                             // Check synced bindings from server (includes defaults from PREFIX_DEFAULTS)
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
-                            let user_binding = synced_bindings.iter().find(|b| {
-                                b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                            let mut user_binding = synced_bindings.iter().find(|b| {
+                                b.t == active_table && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                             });
+                            // tmux: a key with no binding in a custom table
+                            // falls back to the default table (root unless
+                            // `key-table` is set) before being swallowed
+                            // ("trying in root table").
+                            if user_binding.is_none() && latched_table.is_some() {
+                                user_binding = synced_bindings.iter().find(|b| {
+                                    b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                });
+                            }
                             if let Some(entry) = user_binding {
                                 // Dispatch binding (handles both defaults and user overrides).
                                 // Client-side UI commands need special handling here since
@@ -2536,57 +5760,40 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     // Direct kill without confirmation (user explicitly bound without confirm-before)
                                     cmd_batch.push(format!("{}\n", cmd));
                                 } else if cmd == "rename-window" {
-                                    renaming = true; rename_buf.clear();
+                                    // Say which rename this is rather than
+                                    // leaving whatever the last one set, and
+                                    // open on the current name, as tmux does
+                                    // with `command-prompt -I'#W'`.
+                                    renaming = true; session_renaming = false;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{window_name}", &active_window_name);
+                                    rename_back = 0;
+                                    prompt_saved = None;
                                 } else if cmd == "rename-session" {
-                                    renaming = true; rename_buf.clear(); session_renaming = true;
+                                    renaming = true; session_renaming = true;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{session_name}", &session_label);
+                                    rename_back = 0;
+                                    prompt_saved = None;
                                 } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
-                                    command_input = true;
-                                    command_cursor = 0;
-                                    command_history_idx = command_history.len();
-                                    command_template = None;
-                                    command_prompt_label = None;
-                                    if cmd.starts_with("command-prompt ") {
-                                        // Parse -I initial_text, -p prompt, and template argument
-                                        let cp_args = &cmd["command-prompt ".len()..];
-                                        let tokens = crate::config::shell_words(cp_args);
-                                        let mut initial = String::new();
-                                        let mut prompt_text: Option<String> = None;
-                                        let mut positional: Vec<String> = Vec::new();
-                                        let mut i = 0;
-                                        while i < tokens.len() {
-                                            if tokens[i] == "-I" && i + 1 < tokens.len() {
-                                                initial = tokens[i + 1].clone();
-                                                i += 2;
-                                            } else if tokens[i] == "-p" && i + 1 < tokens.len() {
-                                                prompt_text = Some(tokens[i + 1].clone());
-                                                i += 2;
-                                            } else if tokens[i] == "-1" || tokens[i] == "-N" || tokens[i] == "-W" {
-                                                i += 1; // skip flags
-                                            } else if tokens[i].starts_with('-') {
-                                                i += 1; // skip unknown flags
-                                            } else {
-                                                positional.push(tokens[i].clone());
-                                                i += 1;
-                                            }
-                                        }
-                                        // Expand format variables in initial text
-                                        let initial = initial
-                                            .replace("#W", &active_window_name)
-                                            .replace("#{window_name}", &active_window_name)
-                                            .replace("#S", &current_session)
-                                            .replace("#{session_name}", &current_session);
-                                        command_buf = initial.clone();
-                                        command_cursor = command_buf.len();
-                                        // Join all positional args to form the template
-                                        // e.g. 'rename-window "%%"' → single arg, or
-                                        //       rename-window %%    → two args joined
-                                        if !positional.is_empty() {
-                                            command_template = Some(positional.join(" "));
-                                        }
-                                        command_prompt_label = prompt_text;
-                                    } else {
-                                        command_buf.clear();
-                                    }
+                                    let spec = parse_command_prompt_args(
+                                        cmd.strip_prefix("command-prompt")
+                                            .unwrap_or("")
+                                            .trim_start(),
+                                    );
+                                    // Expand format variables in initial text
+                                    let prompts: Vec<(Option<String>, String)> = spec
+                                        .prompts()
+                                        .into_iter()
+                                        .map(|(label, initial)| {
+                                            (label, initial
+                                                .replace("#W", &active_window_name)
+                                                .replace("#{window_name}", &active_window_name)
+                                                .replace("#S", &session_label)
+                                                .replace("#{session_name}", &session_label))
+                                        })
+                                        .collect();
+                                    open_command_prompt!(prompts, spec.template, spec.key, spec.single, spec.numeric, spec.search);
                                 } else if cmd == "list-keys" {
                                     keys_viewer_scroll = 0;
                                     let user_binds: Vec<(bool, String, String, String)> = synced_bindings
@@ -2596,23 +5803,44 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     keys_viewer_lines = help::build_overlay_lines(&user_binds, defaults_suppressed);
                                     keys_viewer = true;
                                 } else if cmd == "select-window-index" {
-                                    window_idx_input = true; window_idx_buf.clear();
-                                } else if cmd == "choose-tree" || cmd == "choose-window" {
-                                    do_choose_tree = true;
+                                    // The name the key had before it became
+                                    // tmux's prompt (#821), kept for a config
+                                    // that binds it: it opens the same prompt
+                                    // as the default `'` binding.
+                                    let spec = parse_command_prompt_args(help::WINDOW_INDEX_PROMPT_ARGS);
+                                    open_command_prompt!(spec.prompts(), spec.template, spec.key, spec.single, spec.numeric, spec.search);
+                                } else if let Some(kind) = local_chooser(cmd) {
+                                    match kind {
+                                        crate::choose_tree::ChooserKind::Tree => do_choose_tree = true,
+                                        crate::choose_tree::ChooserKind::Session => do_choose_session = true,
+                                    }
                                 } else if cmd == "choose-buffer" || cmd == "chooseb" {
                                     do_choose_buffer = true;
-                                } else if cmd == "choose-session" {
-                                    do_choose_session = true;
-                                } else if cmd.starts_with("switch-client") {
-                                    do_session_nav = Some(cmd.contains("-n"));
                                 } else {
-                                    // Generic: split on \; for command chaining (issue #192)
-                                    let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
-                                    for sub in &sub_cmds {
-                                        cmd_batch.push(format!("{}\n", sub));
+                                    // Generic: the binding is a command list,
+                                    // split on \; for chaining (issue #192).
+                                    // `switch-client -n`/`-p`/`-l` is the one
+                                    // form the client performs itself; a
+                                    // `switch-client -T` anywhere in the list
+                                    // latches a key table for the next key, and
+                                    // because the reset to the default table
+                                    // was already emitted above, that latch
+                                    // survives and the table becomes sticky
+                                    // (issue #640).
+                                    match dispatch_binding_commands(&entry.c) {
+                                        BindingDispatch::SessionNav { next } => {
+                                            do_session_nav = Some(next);
+                                        }
+                                        BindingDispatch::Commands { cmds, latch } => {
+                                            cmd_batch.extend(binding_wire_lines(&cmds));
+                                            if latch.is_some() {
+                                                key_table_sync.note_own_write(latch.as_deref());
+                                                key_table_latch = key_table_sync.latch_for(latch);
+                                            }
+                                        }
                                     }
                                 }
-                            } else if synced_bindings.is_empty() {
+                            } else if synced_bindings.is_empty() && latched_table.is_none() {
                             // Pre-sync hardcoded fallback (only used before first server state sync)
                             match key.code {
                                 KeyCode::Char('c') => { cmd_batch.push("new-window\n".into()); }
@@ -2622,7 +5850,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('&') => { confirm_cmd = Some("kill-window".into()); }
                                 KeyCode::Char('z') => { cmd_batch.push("zoom-pane\n".into()); }
                                 KeyCode::Char('[') => { cmd_batch.push("copy-enter\n".into()); }
-                                KeyCode::Char(']') => { cmd_batch.push("paste-buffer\n".into()); }
+                                // tmux key-bindings.c:422 binds ] to
+                                // `paste-buffer -p` (issue #684).
+                                KeyCode::Char(']') => { cmd_batch.push("paste-buffer -p\n".into()); }
                                 KeyCode::Char('{') => { cmd_batch.push("swap-pane -U\n".into()); }
                                 KeyCode::Char('}') => { cmd_batch.push("swap-pane -D\n".into()); }
                                 KeyCode::Char('n') => { cmd_batch.push("next-window\n".into()); }
@@ -2652,14 +5882,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Left => { cmd_batch.push("select-pane -L\n".into()); }
                                 KeyCode::Right => { cmd_batch.push("select-pane -R\n".into()); }
                                 KeyCode::Char('d') => { quit = true; }
-                                KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
+                                KeyCode::Char(',') => {
+                                    renaming = true; session_renaming = false;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{window_name}", &active_window_name);
+                                    rename_back = 0;
+                                    prompt_saved = None;
+                                }
                                 KeyCode::Char('$') => {
-                                    // Rename session — reuse rename overlay
+                                    // Rename session, through the same overlay,
+                                    // opened on the current name as tmux does
+                                    // with `command-prompt -I'#S'`.
                                     renaming = true;
-                                    rename_buf.clear();
-                                    // Mark that we're renaming the session, not a window
-                                    // We'll detect this by checking if pane_renaming is used as a flag
                                     session_renaming = true;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{session_name}", &session_label);
+                                    rename_back = 0;
+                                    prompt_saved = None;
                                 }
                                 KeyCode::Char('?') => {
                                     // Build comprehensive help overlay from help.rs
@@ -2674,8 +5913,33 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
                                 KeyCode::Char('=') => { do_choose_buffer = true; }
                                 KeyCode::Char('#') => { cmd_batch.push("list-buffers\n".into()); }
-                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len(); }
-                                KeyCode::Char('\'') => { window_idx_input = true; window_idx_buf.clear(); }
+                                // `:` is a bare command-prompt: whatever is typed
+                                // IS the command. Clear the template here too,
+                                // because the `.` fallback below sets one and
+                                // this table is read before the first state dump
+                                // has a chance to rebuild either prompt.
+                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_back = 0; prompt_saved = None; command_history_idx = command_history.len(); command_template = None; command_prompt_label = None; command_key_answer = false; command_single = false; }
+                                // Same command as the PREFIX_DEFAULTS entry for
+                                // `'`, for the moment before the first state
+                                // sync arrives.
+                                KeyCode::Char('\'') => {
+                                    let spec = parse_command_prompt_args(help::WINDOW_INDEX_PROMPT_ARGS);
+                                    open_command_prompt!(spec.prompts(), spec.template, spec.key, spec.single, spec.numeric, spec.search);
+                                }
+                                // Same command as the PREFIX_DEFAULTS entry for
+                                // `.`, so the key is not dead for the moment
+                                // before the first state sync arrives.
+                                KeyCode::Char('.') => {
+                                    command_input = true;
+                                    command_buf.clear();
+                                    command_back = 0;
+                                    prompt_saved = None;
+                                    command_history_idx = command_history.len();
+                                    command_template = Some("move-window -t '%%'".into());
+                                    command_prompt_label = Some("(move-window)".into());
+                                    command_key_answer = false;
+                                    command_single = false;
+                                }
                                 KeyCode::Char('w') => { do_choose_tree = true; }
                                 KeyCode::Char('s') => { do_choose_session = true; }
                                 KeyCode::Char('q') => { cmd_batch.push("display-panes\n".into()); }
@@ -2702,229 +5966,28 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             // Dispatch pending flags for complex client-side UI commands.
                             // These are shared between synced_bindings dispatch and pre-sync fallback.
                             if do_choose_tree {
-                                tree_chooser = true;
-                                tree_entries.clear();
-                                tree_selected = 0;
-                                tree_scroll = 0;
-                                tree_num_buffer.clear();
-                                popup_offset = (0, 0);
-                                popup_dragging = false;
-                                popup_rect_last = None;
-                                if choose_tree_preview_default { preview_enabled = true; }
-                                // Query ALL sessions (like tmux choose-tree)
-                                let dir = format!("{}\\.psmux", home);
-                                if let Ok(entries) = std::fs::read_dir(&dir) {
-                                    let mut sessions: Vec<(String, Vec<(usize, String, bool, Vec<(usize, String)>)>)> = Vec::new();
-                                    for e in entries.flatten() {
-                                        if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
-                                            if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                if ext == "port" {
-                                                    if crate::session::is_warm_session(base) { continue; }
-                                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                        if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                            let sess_addr = format!("127.0.0.1:{}", p);
-                                                            let sess_key = read_session_key(base).unwrap_or_default();
-                                                            // Centralized AUTH+command helper handles the OK ack race
-                                                            // (issue #250) and bounds the response size.
-                                                            if let Some(tree_line) = crate::session::fetch_authed_response_multi(
-                                                                &sess_addr,
-                                                                &sess_key,
-                                                                b"list-tree\n",
-                                                                Duration::from_millis(50),
-                                                                Duration::from_millis(100),
-                                                            ) {
-                                                                if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(tree_line.trim()) {
-                                                                    let mut win_data = Vec::new();
-                                                                    for w in &wins {
-                                                                        let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
-                                                                        win_data.push((w.id, w.name.clone(), w.active, panes));
-                                                                    }
-                                                                    sessions.push((base.to_string(), win_data));
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    sessions.sort_by(|a, b| {
-                                        if a.0 == current_session { std::cmp::Ordering::Less }
-                                        else if b.0 == current_session { std::cmp::Ordering::Greater }
-                                        else { a.0.cmp(&b.0) }
-                                    });
-                                    // Row index of the current session's active window, so the
-                                    // chooser opens its cursor on it (issue #373) instead of the
-                                    // hardcoded top row. The active window is also marked with `*`,
-                                    // glyph-adjacent, matching list_windows_tmux and real tmux.
-                                    let mut active_tree_row: Option<usize> = None;
-                                    for (sess_name, wins) in &sessions {
-                                        let is_current = sess_name == &current_session;
-                                        let attached = if is_current { " (attached)" } else { "" };
-                                        let nw = wins.len();
-                                        tree_entries.push((true, usize::MAX, 0,
-                                            format!("{}: {} windows{}", sess_name, nw, attached),
-                                            sess_name.clone()));
-                                        if is_current {
-                                            for (wi, (wid, wname, active, panes)) in wins.iter().enumerate() {
-                                                let marker = if *active { "*" } else { "" };
-                                                if *active { active_tree_row = Some(tree_entries.len()); }
-                                                tree_entries.push((true, *wid, 0,
-                                                    format!("  {}: {}{} ({} panes)", wi, wname, marker, panes.len()),
-                                                    sess_name.clone()));
-                                                for (pid, ptitle) in panes {
-                                                    tree_entries.push((false, *wid, *pid,
-                                                        format!("    {}", ptitle),
-                                                        sess_name.clone()));
-                                                }
-                                            }
-                                        } else {
-                                            for (wi, (wid, wname, active, panes)) in wins.iter().enumerate() {
-                                                let marker = if *active { "*" } else { "" };
-                                                tree_entries.push((true, *wid, 0,
-                                                    format!("  {}: {}{} ({} panes)", wi, wname, marker, panes.len()),
-                                                    sess_name.clone()));
-                                            }
-                                        }
-                                    }
-                                    if let Some(r) = active_tree_row { tree_selected = r; }
-                                }
-                                if tree_entries.is_empty() {
-                                    for wi in &last_tree {
-                                        let marker = if wi.active { "*" } else { "" };
-                                        if wi.active { tree_selected = tree_entries.len(); }
-                                        tree_entries.push((true, wi.id, 0, format!("{}{}", wi.name, marker), current_session.clone()));
-                                        for pi in &wi.panes {
-                                            tree_entries.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
-                                        }
-                                    }
-                                }
+                                open_tree_chooser!();
+                                chooser_template = None;
                             }
                             if do_choose_session {
-                                session_chooser = true;
-                                session_entries.clear();
-                                session_selected = 0;
-                                session_scroll = 0;
-                                session_num_buffer.clear();
-                                popup_offset = (0, 0);
-                                popup_dragging = false;
-                                popup_rect_last = None;
-                                if choose_tree_preview_default { preview_enabled = true; }
-                                let dir = format!("{}\\.psmux", home);
-                                // Collect (label, addr, key) for every port file, then run ONE
-                                // bounded liveness probe per session in parallel. This both lists
-                                // and prunes: total wall time is ~one probe window regardless of
-                                // how many sessions exist, so the picker stays responsive (no
-                                // sequential O(N * timeout) cleanup pass).
-                                let mut targets: Vec<(String, String, String)> = Vec::new();
-                                if let Ok(entries) = std::fs::read_dir(&dir) {
-                                    for e in entries.flatten() {
-                                        if let Some(fname) = e.file_name().to_str() {
-                                            if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                if ext == "port" {
-                                                    if crate::session::is_warm_session(base) { continue; }
-                                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                        if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                            let sess_addr = format!("127.0.0.1:{}", p);
-                                                            let sess_key = read_session_key(base).unwrap_or_default();
-                                                            targets.push((base.to_string(), sess_addr, sess_key));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let verdicts = crate::session::classify_sessions_parallel(
-                                    targets,
-                                    Duration::from_millis(50),
-                                    Duration::from_millis(250),
-                                );
-                                for (label, liveness) in verdicts {
-                                    match liveness {
-                                        crate::session::SessionLiveness::Alive(info) => {
-                                            session_entries.push((label, info));
-                                        }
-                                        crate::session::SessionLiveness::Dead => {
-                                            // Server gone (crashed, killed by a reboot, or its
-                                            // port reused by another server). Reap it so it never
-                                            // shows as a "(not responding)" zombie. A live-but-slow
-                                            // server self-heals on its next 5s registry tick.
-                                            if crate::debug_log::session_log_enabled() {
-                                                crate::debug_log::session_log("picker",
-                                                    &format!("reaping dead session '{}' from chooser", label));
-                                            }
-                                            crate::session::remove_session_registry(&label);
-                                        }
-                                        crate::session::SessionLiveness::Unreachable => {
-                                            // Could not connect (transient, non-refused). Keep it
-                                            // and show the honest "(not responding)" rather than
-                                            // deleting on an ambiguous failure.
-                                            session_entries.push((label.clone(), format!("{}: (not responding)", label)));
-                                        }
-                                    }
-                                }
-                                if session_entries.is_empty() {
-                                    session_entries.push((current_session.clone(), format!("{}: (current)", current_session)));
-                                }
-                                for (i, (sname, _)) in session_entries.iter().enumerate() {
-                                    if sname == &current_session { session_selected = i; break; }
-                                }
+                                open_session_chooser!();
+                                chooser_template = None;
                             }
                             if do_choose_buffer {
-                                buffer_chooser = true;
-                                buffer_entries.clear();
-                                buffer_selected = 0;
-                                buffer_scroll = 0;
-                                buffer_num_buffer.clear();
-                                // Fetch buffer list from server via TCP
-                                let port_file = format!("{}\\.psmux\\{}.port", home, current_session);
-                                if let Ok(port_str) = std::fs::read_to_string(&port_file) {
-                                    if let Ok(p) = port_str.trim().parse::<u16>() {
-                                        let sess_key = read_session_key(&current_session).unwrap_or_default();
-                                        let addr = format!("127.0.0.1:{}", p);
-                                        if let Some(buf_line) = crate::session::fetch_authed_response_multi(
-                                            &addr,
-                                            &sess_key,
-                                            b"choose-buffer\n",
-                                            Duration::from_millis(100),
-                                            Duration::from_millis(200),
-                                        ) {
-                                            {
-                                                // Parse "buffer0: 17 bytes: "content"\nbuffer1: ..."
-                                                for line in buf_line.trim().split('\n') {
-                                                    let line = line.trim();
-                                                    if line.is_empty() { continue; }
-                                                    // Format: "bufferN: M bytes: "preview""
-                                                    if let Some(rest) = line.strip_prefix("buffer") {
-                                                        if let Some(colon_pos) = rest.find(':') {
-                                                            if let Ok(idx) = rest[..colon_pos].parse::<usize>() {
-                                                                let after_colon = &rest[colon_pos+1..].trim_start();
-                                                                let byte_len = after_colon.split_whitespace().next()
-                                                                    .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                                                                // Extract preview (after "bytes: ")
-                                                                let preview = if let Some(bp) = after_colon.find('"') {
-                                                                    let p = &after_colon[bp+1..];
-                                                                    p.trim_end_matches('"').to_string()
-                                                                } else {
-                                                                    after_colon.to_string()
-                                                                };
-                                                                buffer_entries.push((idx, byte_len, preview));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if buffer_entries.is_empty() {
-                                    // No buffers — don't show chooser
-                                    buffer_chooser = false;
-                                }
+                                open_buffer_chooser!();
                             }
                             if let Some(dir_next) = do_session_nav {
-                                let dir = format!("{}\\.psmux", home);
+                                let dir = crate::paths::psmux_dir();
+                                // A `-L` socket is a separate server, so the
+                                // cycle must never leave this client's own
+                                // namespace (the rule ed52715 applied to the
+                                // choosers). Every namespace shares one
+                                // registry directory here, so the enumeration
+                                // has to filter explicitly: without this,
+                                // cycling off the last session of `nsA`
+                                // wrapped into `nsB`'s first session.
+                                let nav_ns = crate::session::session_namespace(&current_session)
+                                    .map(|s| s.to_string());
                                 let mut names: Vec<String> = Vec::new();
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     for e in entries.flatten() {
@@ -2932,6 +5995,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             if let Some((base, ext)) = fname.rsplit_once('.') {
                                                 if ext == "port" {
                                                     if crate::session::is_warm_session(base) { continue; }
+                                                    if !crate::session::session_visible_from(base, nav_ns.as_deref()) { continue; }
                                                     if let Ok(ps) = std::fs::read_to_string(e.path()) {
                                                         if let Ok(p) = ps.trim().parse::<u16>() {
                                                             let a = format!("127.0.0.1:{}", p);
@@ -2969,7 +6033,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
                             );
                             let is_user_repeat = user_binding.map_or(false, |e| e.r);
-                            if is_repeatable_default || is_user_repeat {
+                            if latched_table.is_some() {
+                                // The key came from a `switch-client -T` table,
+                                // not from the prefix table: the prefix is not
+                                // armed, so there is nothing to disarm and no
+                                // repeat window to open. The drop back to the
+                                // default table already happened above, before
+                                // the binding ran, so a `switch-client -T` in
+                                // the binding has re-armed the latch by now and
+                                // must not be undone here.
+                                prefix_repeating = false;
+                            } else if is_repeatable_default || is_user_repeat {
                                 prefix_armed_at = Instant::now();
                                 prefix_repeating = true;
                             } else {
@@ -2990,22 +6064,236 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 paste_suppress_until.map_or(false, |t| Instant::now() < t);
                             #[cfg(not(windows))]
                             let paste_burst_active = false;
-                            match key.code {
+                            // tmux `mode_tree_key`: a jump key is not a prompt and
+                            // never waits for Enter. It looks the key up among the
+                            // visible lines, moves the cursor there and REWRITES
+                            // itself to `\r`, so `window_tree_key` activates the
+                            // target on the very same keystroke:
+                            //
+                            //     mtd->current = choice;
+                            //     *key = '\r';
+                            //
+                            // `mode_tree_build_lines` stamps '0'..'9' on the first
+                            // ten VISIBLE lines and M-a..M-z on lines 10..35, so the
+                            // key is a zero based visible line index.
+                            let mut effective_code = key.code;
+                            if tree_chooser && chooser_kill.is_none() {
+                                let jump = match key.code {
+                                    KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
+                                        crate::choose_tree::meta_line(c)
+                                    }
+                                    KeyCode::Char(c) => crate::choose_tree::digit_line(c),
+                                    _ => None,
+                                };
+                                if let Some(line) = jump {
+                                    // A line with no such key is simply not found by
+                                    // tmux's lookup loop, so the key does nothing.
+                                    if line < tree_entries.len() {
+                                        tree_selected = line;
+                                        effective_code = KeyCode::Enter;
+                                    }
+                                }
+                            }
+                            // tmux `mode_tree_key` aliases the choosers did not
+                            // know (discussion #776): `q` and `C-g` exit every
+                            // mode (mode-tree.c:1289-1293), `C-p`/`C-n`/`C-b`/`C-f`
+                            // move like Up/Down/PageUp/PageDown (:1301, :1307,
+                            // :1319, :1327), and in the tree, whose rows have
+                            // depth, `h`/`-` collapse and `l`/`+` expand like
+                            // Left/Right (:1390-1412). Each alias becomes the key
+                            // the chooser already handles. A session filter
+                            // being typed keeps its printable keys.
+                            let mut chooser_exit = false;
+                            let filter_typing = session_chooser
+                                && session_filter_active
+                                && !key.modifiers.contains(KeyModifiers::CONTROL);
+                            if (tree_chooser || session_chooser || buffer_chooser)
+                                && chooser_kill.is_none()
+                                && !filter_typing
+                                && effective_code == key.code
+                            {
+                                use crate::choose_tree::ModeKey;
+                                match crate::choose_tree::mode_tree_alias(key.code, key.modifiers, tree_chooser) {
+                                    Some(ModeKey::Exit) => chooser_exit = true,
+                                    Some(ModeKey::Up) => effective_code = KeyCode::Up,
+                                    Some(ModeKey::Down) => effective_code = KeyCode::Down,
+                                    Some(ModeKey::PageUp) => effective_code = KeyCode::PageUp,
+                                    Some(ModeKey::PageDown) => effective_code = KeyCode::PageDown,
+                                    Some(ModeKey::Collapse) => effective_code = KeyCode::Left,
+                                    Some(ModeKey::Expand) => effective_code = KeyCode::Right,
+                                    None => {}
+                                }
+                            }
+                            match effective_code {
+                                // A chooser's kill question takes the very next key, as
+                                // tmux's prompt does: it is set with PROMPT_SINGLE, so it
+                                // ends on one key (`window-tree.c:1306`), and its callback
+                                // kills only when that key was `y` (`:1137`). The chooser is
+                                // still open underneath either way, as tmux's mode is. This
+                                // arm comes before the chooser arms because theirs absorb
+                                // every remaining printable key, so an answer placed after
+                                // them would never be seen.
+                                code if chooser_kill.is_some() => {
+                                    // The question comes down whatever the key was, and
+                                    // survives as an answer only if that key was a yes.
+                                    let asked = chooser_kill.take().filter(|_| chooser_kill_confirmed(code));
+                                    if let Some(asked) = asked {
+                                        if tree_chooser {
+                                            // Copy out the fields we need so the immutable borrow
+                                            // ends before we mutate the model below.
+                                            if let Some((is_win, wid, sess_name)) = tree_entries
+                                                .get(tree_selected)
+                                                .map(|(iw, w, _p, _l, s)| (*iw, *w, s.clone()))
+                                            {
+                                                if is_win
+                                                    && Some(wid) == asked.window
+                                                    && sess_name == asked.session
+                                                    && sess_name == current_session
+                                                {
+                                                    cmd_batch.push(format!("focus-window {}\n", wid));
+                                                    cmd_batch.push("kill-window\n".into());
+                                                    // Drop the killed window and the panes underneath
+                                                    // it from the model, then rebuild the visible
+                                                    // lines so the chooser stays open for more kills.
+                                                    if let Some(model) = tree_vis_map.get(tree_selected).copied() {
+                                                        let kinds = tree_row_kinds(&tree_all);
+                                                        let mut end = model + 1;
+                                                        while end < kinds.len()
+                                                            && crate::choose_tree::depth(kinds[end])
+                                                                > crate::choose_tree::depth(kinds[model])
+                                                        {
+                                                            end += 1;
+                                                        }
+                                                        tree_all.drain(model..end);
+                                                        let shift = end - model;
+                                                        tree_collapsed = tree_collapsed
+                                                            .iter()
+                                                            .filter_map(|&i| {
+                                                                if i >= end { Some(i - shift) }
+                                                                else if i >= model { None }
+                                                                else { Some(i) }
+                                                            })
+                                                            .collect();
+                                                        let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+                                                        tree_entries = rows;
+                                                        tree_vis_map = map;
+                                                    }
+                                                    if tree_selected >= tree_entries.len() && tree_selected > 0 {
+                                                        tree_selected -= 1;
+                                                    }
+                                                    if tree_entries.is_empty() {
+                                                        tree_chooser = false;
+                                                    }
+                                                }
+                                            }
+                                        } else if session_chooser {
+                                            // Kill the selected session (like tmux session chooser)
+                                            let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                                .get(session_selected)
+                                                .copied();
+                                            // The cursor has to be on the row the question
+                                            // named, which the wheel could have moved it off.
+                                            let selected = selected_entry
+                                                .and_then(|i| session_entries.get(i))
+                                                .map(|(sname, _)| sname.clone())
+                                                .filter(|sname| *sname == asked.session);
+                                            if let Some(sname) = selected {
+                                                if sname == current_session {
+                                                    // Killing the current session, so exit after the kill
+                                                    cmd_batch.push("kill-session\n".into());
+                                                    session_chooser = false;
+                                                    quit = true;
+                                                } else {
+                                                    // Kill another session by connecting to it
+                                                    let port_path = crate::paths::port_file(&sname);
+                                                    let key_path = crate::paths::key_file(&sname);
+                                                    if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+                                                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                                                            let addr = format!("127.0.0.1:{}", port);
+                                                            let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
+                                                            if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
+                                                                &addr.parse().unwrap(), Duration::from_millis(100)
+                                                            ) {
+                                                                let _ = write!(ss, "AUTH {}\n", sess_key.trim());
+                                                                let _ = ss.write_all(b"kill-session\n");
+                                                            }
+                                                        }
+                                                    }
+                                                    // Remove the killed session from the list
+                                                    if let Some(idx) = selected_entry {
+                                                        session_entries.remove(idx);
+                                                    }
+                                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                                    if session_selected >= visible_len && session_selected > 0 {
+                                                        session_selected -= 1;
+                                                    }
+                                                    if session_entries.is_empty() {
+                                                        session_chooser = false;
+                                                    }
+                                                    // Indexes shifted; drop any pending jump buffer.
+                                                    session_num_buffer.clear();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // `q` or `C-g`: the mode exits, as Escape does.
+                                _ if chooser_exit => {
+                                    tree_chooser = false;
+                                    session_chooser = false;
+                                    session_filter_active = false;
+                                    session_filter.clear();
+                                    session_num_buffer.clear();
+                                    buffer_chooser = false;
+                                    buffer_num_buffer.clear();
+                                    selection_changed = true;
+                                }
                                 KeyCode::Up if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Down if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Down if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
+                                KeyCode::Backspace if session_chooser && session_filter_active => {
+                                    session_filter.pop();
+                                    session_selected = 0;
+                                    session_scroll = 0;
+                                    session_num_buffer.clear();
+                                }
+                                KeyCode::Char(c) if session_chooser && session_filter_active => {
+                                    if session_filter.len() < 256 {
+                                        session_filter.push(c);
+                                        session_selected = 0;
+                                        session_scroll = 0;
+                                        session_num_buffer.clear();
+                                    }
+                                }
                                 // hjkl parity with tmux mode-tree (issue #259): for flat lists
                                 // tmux treats h/k as up and j/l as down. g/G map to Home/End.
                                 KeyCode::Char('k') if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Char('j') if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Char('j') if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
                                 KeyCode::Char('h') if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Char('l') if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Char('l') if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
                                 KeyCode::Char('g') if session_chooser => { session_selected = 0; }
-                                KeyCode::Char('G') if session_chooser => { session_selected = session_entries.len().saturating_sub(1); }
-                                KeyCode::PageUp if session_chooser => { session_selected = session_selected.saturating_sub(10); }
-                                KeyCode::PageDown if session_chooser => { session_selected = (session_selected + 10).min(session_entries.len().saturating_sub(1)); }
+                                KeyCode::Char('G') if session_chooser => {
+                                    session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
+                                }
+                                KeyCode::PageUp if session_chooser => { session_selected = crate::choose_tree::page_up(session_selected, session_page_h); }
+                                KeyCode::PageDown if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    session_selected = crate::choose_tree::page_down(session_selected, visible_len, session_page_h);
+                                }
                                 KeyCode::Home if session_chooser => { session_selected = 0; }
-                                KeyCode::End if session_chooser => { session_selected = session_entries.len().saturating_sub(1); }
+                                KeyCode::End if session_chooser => {
+                                    session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
+                                }
                                 KeyCode::Enter if session_chooser => {
+                                    let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
                                     // If the user has typed a number, that wins over the arrow cursor.
                                     // Buffer is 1-based: "1" → first entry, "12" → twelfth. Out-of-range
                                     // or unparseable → do nothing (keep buffer so user can Backspace).
@@ -3013,67 +6301,60 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         Some(session_selected)
                                     } else {
                                         match session_num_buffer.parse::<usize>() {
-                                            Ok(n) if n >= 1 && n <= session_entries.len() => Some(n - 1),
+                                            Ok(n) if n >= 1 && n <= filtered_indices.len() => Some(n - 1),
                                             _ => None,
                                         }
                                     };
-                                    if let Some(idx) = target_idx {
+                                    if let Some(idx) = target_idx.and_then(|i| filtered_indices.get(i).copied()) {
                                         if let Some((sname, _)) = session_entries.get(idx) {
-                                            if sname != &current_session {
+                                            if let Some(template) = chooser_template.take() {
+                                                // choose-tree -s [template] (#912): the
+                                                // session row's target `=name:` goes in.
+                                                let ns = crate::session::session_namespace(&current_session);
+                                                let target = crate::choose_tree::session_row_target(
+                                                    crate::session::display_session_name(ns, sname));
+                                                let command = crate::choose_tree::template_command(&template, &target);
+                                                if !command.trim().is_empty() {
+                                                    let sub_cmds = crate::config::split_chained_commands_pub(&command);
+                                                    cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                                }
+                                            } else if sname != &current_session {
                                                 cmd_batch.push("client-detach\n".into());
                                                 env::set_var("PSMUX_SWITCH_TO", sname);
                                                 quit = true;
                                             }
                                             session_chooser = false;
                                             session_num_buffer.clear();
+                                            session_filter_active = false;
+                                            session_filter.clear();
                                         }
                                     }
-                                }
-                                KeyCode::Esc if session_chooser => {
-                                    session_chooser = false;
-                                    session_num_buffer.clear();
                                 }
                                 KeyCode::Backspace if session_chooser => {
                                     session_num_buffer.pop();
                                 }
+                                // The same question for the session chooser, where tmux asks
+                                // `"Kill session %s? "` (`window-tree.c:1290`).
                                 KeyCode::Char('x') if session_chooser => {
-                                    // Kill the selected session (like tmux session chooser)
-                                    if let Some((sname, _)) = session_entries.get(session_selected) {
-                                        let sname = sname.clone();
-                                        if sname == current_session {
-                                            // Killing current session — exit after kill
-                                            cmd_batch.push("kill-session\n".into());
-                                            session_chooser = false;
-                                            quit = true;
-                                        } else {
-                                            // Kill another session by connecting to it
-                                            let h = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                                            let port_path = format!("{}\\.psmux\\{}.port", h, sname);
-                                            let key_path = format!("{}\\.psmux\\{}.key", h, sname);
-                                            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                                                if let Ok(port) = port_str.trim().parse::<u16>() {
-                                                    let addr = format!("127.0.0.1:{}", port);
-                                                    let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
-                                                    if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                        &addr.parse().unwrap(), Duration::from_millis(100)
-                                                    ) {
-                                                        let _ = write!(ss, "AUTH {}\n", sess_key.trim());
-                                                        let _ = ss.write_all(b"kill-session\n");
-                                                    }
-                                                }
-                                            }
-                                            // Remove the killed session from the list
-                                            session_entries.remove(session_selected);
-                                            if session_selected >= session_entries.len() && session_selected > 0 {
-                                                session_selected -= 1;
-                                            }
-                                            if session_entries.is_empty() {
-                                                session_chooser = false;
-                                            }
-                                            // Indexes shifted; drop any pending jump buffer.
-                                            session_num_buffer.clear();
-                                        }
+                                    let sname = session_filtered_indices(&session_entries, &session_filter)
+                                        .get(session_selected)
+                                        .copied()
+                                        .and_then(|i| session_entries.get(i))
+                                        .map(|(sname, _)| sname.clone());
+                                    if let Some(sname) = sname {
+                                        chooser_kill = Some(ChooserKill {
+                                            prompt: chooser_kill_session_prompt(&current_session, &sname),
+                                            window: None,
+                                            session: sname,
+                                        });
                                     }
+                                }
+                                KeyCode::Char('f') if session_chooser => {
+                                    session_filter_active = true;
+                                    session_filter.clear();
+                                    session_selected = 0;
+                                    session_scroll = 0;
+                                    session_num_buffer.clear();
                                 }
                                 KeyCode::Char(c) if session_chooser && c.is_ascii_digit() => {
                                     // Accumulate into the jump buffer — Enter consumes it.
@@ -3089,114 +6370,160 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 // Absorb any other char while the session picker is open so
                                 // it cannot leak through to the focused pane's PTY.
                                 KeyCode::Char(_) if session_chooser => {}
+                                // Left/Right collapse and expand, ported from the
+                                // KEYC_LEFT and KEYC_RIGHT arms of tmux's mode_tree_key.
+                                // Left on an already collapsed row climbs to the parent and
+                                // collapses that; Right on an expanded row just steps down.
+                                // `h`/`-` and `l`/`+` arrive here too, rewritten by
+                                // choose_tree::mode_tree_alias above, because tmux puts them
+                                // in the same arms (mode-tree.c:1390-1412, discussion #776).
+                                KeyCode::Left if tree_chooser => {
+                                    let kinds = tree_row_kinds(&tree_all);
+                                    let model = tree_vis_map.get(tree_selected).copied();
+                                    match model.map(|m| crate::choose_tree::collapse_action(&kinds, &tree_collapsed, m)) {
+                                        Some(crate::choose_tree::CollapseAction::Collapse(t)) => {
+                                            tree_collapsed.insert(t);
+                                            let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+                                            tree_entries = rows;
+                                            tree_vis_map = map;
+                                            tree_selected = tree_vis_map.iter().position(|&i| i == t).unwrap_or(0);
+                                        }
+                                        _ => { if tree_selected > 0 { tree_selected -= 1; } }
+                                    }
+                                }
+                                KeyCode::Right if tree_chooser => {
+                                    let kinds = tree_row_kinds(&tree_all);
+                                    let model = tree_vis_map.get(tree_selected).copied();
+                                    match model.map(|m| crate::choose_tree::expand_action(&kinds, &tree_collapsed, m)) {
+                                        Some(crate::choose_tree::ExpandAction::Expand(t)) => {
+                                            tree_collapsed.remove(&t);
+                                            let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+                                            tree_entries = rows;
+                                            tree_vis_map = map;
+                                            tree_selected = tree_vis_map.iter().position(|&i| i == t).unwrap_or(tree_selected);
+                                        }
+                                        _ => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
+                                    }
+                                }
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
-                                // hjkl parity with tmux mode-tree (issue #259): h/k = up, j/l = down
-                                // for flat lists. g/G map to Home/End.
+                                // k/j move (issue #259); h/l are the Left/Right arms above.
+                                // g/G map to Home/End.
                                 KeyCode::Char('k') if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Char('j') if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
-                                KeyCode::Char('h') if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
-                                KeyCode::Char('l') if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Char('g') if tree_chooser => { tree_selected = 0; }
                                 KeyCode::Char('G') if tree_chooser => { tree_selected = tree_entries.len().saturating_sub(1); }
-                                KeyCode::PageUp if tree_chooser => { tree_selected = tree_selected.saturating_sub(10); }
-                                KeyCode::PageDown if tree_chooser => { tree_selected = (tree_selected + 10).min(tree_entries.len().saturating_sub(1)); }
+                                KeyCode::PageUp if tree_chooser => { tree_selected = crate::choose_tree::page_up(tree_selected, tree_page_h); }
+                                KeyCode::PageDown if tree_chooser => { tree_selected = crate::choose_tree::page_down(tree_selected, tree_entries.len(), tree_page_h); }
                                 KeyCode::Home if tree_chooser => { tree_selected = 0; }
                                 KeyCode::End if tree_chooser => { tree_selected = tree_entries.len().saturating_sub(1); }
                                 KeyCode::Enter if tree_chooser => {
-                                    // Digit-jump: if a number was typed, prefer it over the
-                                    // arrow cursor. Buffer is 1-based: "1" -> first row,
-                                    // "12" -> twelfth. Out-of-range or unparseable -> no-op
-                                    // (keep buffer so user can Backspace and fix).
-                                    let target_idx: Option<usize> = if tree_num_buffer.is_empty() {
-                                        Some(tree_selected)
-                                    } else {
-                                        match tree_num_buffer.parse::<usize>() {
-                                            Ok(n) if n >= 1 && n <= tree_entries.len() => Some(n - 1),
-                                            _ => None,
-                                        }
-                                    };
-                                    if let Some(sel_idx) = target_idx {
-                                        if let Some((is_win, wid, pid, _label, sess_name)) = tree_entries.get(sel_idx) {
-                                            if *wid == usize::MAX {
-                                                // Session header — switch to that session
-                                                if *sess_name != current_session {
-                                                    cmd_batch.push("client-detach\n".into());
-                                                    env::set_var("PSMUX_SWITCH_TO", sess_name);
-                                                    quit = true;
+                                    // tmux `window_tree_key`, case '\r': resolve the row
+                                    // under the cursor, run the chooser's command against it
+                                    // and finish. Reached either by a real Enter or by a jump
+                                    // key that mode_tree_key rewrote to '\r' above, so both
+                                    // paths always close the chooser.
+                                    //
+                                    // tmux ends the mode with window_pane_reset_mode, which
+                                    // sets PANE_REDRAW. Closing on a target that needs no
+                                    // command (the current session's own header, `0` in a
+                                    // single session tree) queues nothing for the server, so
+                                    // without this the popup stayed painted until the next
+                                    // keystroke forced a frame.
+                                    selection_changed = true;
+                                    if let Some(template) = chooser_template.take() {
+                                        // choose-tree [template] (#912): tmux puts the
+                                        // row's target where the template says and runs
+                                        // that instead (window_tree_key '\r',
+                                        // mode_tree_run_command). No switch of its own.
+                                        if let Some((is_win, wid, pid, _label, sess_name)) = tree_entries.get(tree_selected) {
+                                            let ns = crate::session::session_namespace(&current_session);
+                                            let name = crate::session::display_session_name(ns, sess_name);
+                                            let target = if *wid == usize::MAX {
+                                                crate::choose_tree::session_row_target(name)
+                                            } else {
+                                                match tree_win_index.get(&(sess_name.clone(), *wid)) {
+                                                    Some(&idx) if *is_win => crate::choose_tree::window_row_target(name, idx),
+                                                    Some(&idx) => crate::choose_tree::pane_row_target(name, idx, *pid),
+                                                    None if *is_win => format!("@{}", wid),
+                                                    None => format!("%{}", pid),
                                                 }
-                                                tree_chooser = false;
-                                                tree_num_buffer.clear();
-                                            } else if *sess_name != current_session {
-                                                // Window/pane in another session — switch to that session
+                                            };
+                                            let command = crate::choose_tree::template_command(&template, &target);
+                                            if !command.trim().is_empty() {
+                                                let sub_cmds = crate::config::split_chained_commands_pub(&command);
+                                                cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                            }
+                                        }
+                                        tree_chooser = false;
+                                    } else if let Some((is_win, wid, pid, _label, sess_name)) = tree_entries.get(tree_selected) {
+                                        if *wid == usize::MAX {
+                                            // Session header: switch to that session
+                                            if *sess_name != current_session {
                                                 cmd_batch.push("client-detach\n".into());
                                                 env::set_var("PSMUX_SWITCH_TO", sess_name);
                                                 quit = true;
-                                                tree_chooser = false;
-                                                tree_num_buffer.clear();
-                                            } else if *is_win {
-                                                cmd_batch.push(format!("focus-window {}\n", wid));
-                                                tree_chooser = false;
-                                                tree_num_buffer.clear();
-                                            } else {
-                                                cmd_batch.push(format!("focus-pane {}\n", pid));
-                                                tree_chooser = false;
-                                                tree_num_buffer.clear();
                                             }
+                                            tree_chooser = false;
+                                        } else if *sess_name != current_session {
+                                            // Window/pane in another session: make the row the
+                                            // current window (and pane) of that session, then
+                                            // switch to it. tmux runs `switch-client -t` with
+                                            // the row's own target (window_tree_get_target),
+                                            // so the client lands on the window that was
+                                            // chosen, not on whatever that session had active.
+                                            let focus = if *is_win {
+                                                format!("focus-window {}\n", wid)
+                                            } else {
+                                                format!("focus-pane {}\n", pid)
+                                            };
+                                            chooser_focus_in_session(sess_name, &focus);
+                                            cmd_batch.push("client-detach\n".into());
+                                            env::set_var("PSMUX_SWITCH_TO", sess_name);
+                                            quit = true;
+                                            tree_chooser = false;
+                                        } else if *is_win {
+                                            cmd_batch.push(format!("focus-window {}\n", wid));
+                                            tree_chooser = false;
+                                        } else {
+                                            cmd_batch.push(format!("focus-pane {}\n", pid));
+                                            tree_chooser = false;
                                         }
+                                    } else {
+                                        // An empty list has nothing to activate; tmux's
+                                        // mode_tree_key returns finished for line_size == 0.
+                                        tree_chooser = false;
                                     }
                                 }
-                                KeyCode::Esc if tree_chooser => { tree_chooser = false; tree_num_buffer.clear(); }
-                                KeyCode::Backspace if tree_chooser => { tree_num_buffer.pop(); }
+                                KeyCode::Esc if tree_chooser => { tree_chooser = false; }
                                 // 'p' toggles the live preview pane in choose-tree
                                 KeyCode::Char('p') if tree_chooser => {
                                     preview_enabled = !preview_enabled;
                                 }
-                                // 'x' kills the highlighted window (mirrors the session
-                                // chooser's `x`). Scoped to a window row in the current
-                                // session: focus the window, then kill it. The digit-jump
-                                // buffer wins over the arrow cursor, same as Enter.
+                                // 'x' asks before it kills the highlighted window, which is what
+                                // tmux does (`window-tree.c:1282-1310`) and what psmux itself does
+                                // for the same act from `prefix &` (`src/help.rs:35`). Scoped to a
+                                // window row in the current session, as before. The kill runs from
+                                // the answer arm above.
                                 KeyCode::Char('x') if tree_chooser => {
-                                    let target_idx: Option<usize> = if tree_num_buffer.is_empty() {
-                                        Some(tree_selected)
-                                    } else {
-                                        match tree_num_buffer.parse::<usize>() {
-                                            Ok(n) if n >= 1 && n <= tree_entries.len() => Some(n - 1),
-                                            _ => None,
+                                    if let Some((is_win, wid, label, sess_name)) = tree_entries
+                                        .get(tree_selected)
+                                        .map(|(iw, w, _p, l, s)| (*iw, *w, l.clone(), s.clone()))
+                                    {
+                                        if is_win && wid != usize::MAX && sess_name == current_session {
+                                            chooser_kill = Some(ChooserKill {
+                                                prompt: format!(
+                                                    "kill-window {}", chooser_kill_target(&label)),
+                                                window: Some(wid),
+                                                session: sess_name,
+                                            });
                                         }
-                                    };
-                                    if let Some(sel_idx) = target_idx {
-                                        // Copy out the fields we need so the immutable borrow
-                                        // ends before we mutate tree_entries below.
-                                        if let Some((is_win, wid, sess_name)) = tree_entries
-                                            .get(sel_idx)
-                                            .map(|(iw, w, _p, _l, s)| (*iw, *w, s.clone()))
-                                        {
-                                            if is_win && wid != usize::MAX && sess_name == current_session {
-                                                cmd_batch.push(format!("focus-window {}\n", wid));
-                                                cmd_batch.push("kill-window\n".into());
-                                                // Drop the killed row and clamp the cursor so
-                                                // the picker stays open for further kills.
-                                                tree_entries.remove(sel_idx);
-                                                if tree_selected >= tree_entries.len() && tree_selected > 0 {
-                                                    tree_selected -= 1;
-                                                }
-                                                if tree_entries.is_empty() {
-                                                    tree_chooser = false;
-                                                }
-                                                tree_num_buffer.clear();
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char(c) if tree_chooser && c.is_ascii_digit() => {
-                                    // Append to the digit-jump buffer; Enter consumes it.
-                                    if tree_num_buffer.len() < 6 {
-                                        tree_num_buffer.push(c);
                                     }
                                 }
                                 // Absorb any other char while the tree picker is open so
-                                // it cannot leak through to the focused pane's PTY.
+                                // it cannot leak through to the focused pane's PTY. Digits
+                                // and M-<letter> never reach here: mode_tree_key rewrote
+                                // them to Enter above.
                                 KeyCode::Char(_) if tree_chooser => {}
                                 // --- buffer chooser (C-b =) ---
                                 KeyCode::Up | KeyCode::Char('k') if buffer_chooser => {
@@ -3210,8 +6537,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('l') if buffer_chooser => { if buffer_selected + 1 < buffer_entries.len() { buffer_selected += 1; } }
                                 KeyCode::Char('g') if buffer_chooser => { buffer_selected = 0; }
                                 KeyCode::Char('G') if buffer_chooser => { buffer_selected = buffer_entries.len().saturating_sub(1); }
-                                KeyCode::PageUp if buffer_chooser => { buffer_selected = buffer_selected.saturating_sub(10); }
-                                KeyCode::PageDown if buffer_chooser => { buffer_selected = (buffer_selected + 10).min(buffer_entries.len().saturating_sub(1)); }
+                                KeyCode::PageUp if buffer_chooser => { buffer_selected = crate::choose_tree::page_up(buffer_selected, buffer_page_h); }
+                                KeyCode::PageDown if buffer_chooser => { buffer_selected = crate::choose_tree::page_down(buffer_selected, buffer_entries.len(), buffer_page_h); }
                                 KeyCode::Home if buffer_chooser => { buffer_selected = 0; }
                                 KeyCode::End if buffer_chooser => { buffer_selected = buffer_entries.len().saturating_sub(1); }
                                 KeyCode::Enter if buffer_chooser => {
@@ -3227,8 +6554,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     };
                                     if let Some(sel) = target_idx {
                                         if sel < buffer_entries.len() {
-                                            let (idx, _, _) = &buffer_entries[sel];
-                                            cmd_batch.push(format!("paste-buffer-at {}\n", idx));
+                                            let (name, _, _) = &buffer_entries[sel];
+                                            cmd_batch.push(format!("paste-buffer-named {}\n",
+                                                crate::util::quote_arg_if_needed(name)));
                                             buffer_chooser = false;
                                             buffer_num_buffer.clear();
                                         }
@@ -3237,13 +6565,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('d') | KeyCode::Delete if buffer_chooser => {
                                     // Delete selected buffer
                                     if buffer_selected < buffer_entries.len() {
-                                        let (idx, _, _) = &buffer_entries[buffer_selected];
-                                        cmd_batch.push(format!("delete-buffer-at {}\n", idx));
+                                        let (name, _, _) = &buffer_entries[buffer_selected];
+                                        cmd_batch.push(format!("delete-buffer -b {}\n",
+                                            crate::util::quote_arg_if_needed(name)));
                                         buffer_entries.remove(buffer_selected);
-                                        // Re-index remaining entries
-                                        for (i, entry) in buffer_entries.iter_mut().enumerate() {
-                                            entry.0 = i;
-                                        }
                                         if buffer_selected >= buffer_entries.len() && buffer_selected > 0 {
                                             buffer_selected -= 1;
                                         }
@@ -3289,49 +6614,221 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if confirm_cmd.is_some() => {
                                     confirm_cmd = None;
                                 }
-                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); }
-                                KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); }
-                                KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() && !paste_burst_active => { window_idx_buf.push(c); }
-                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); }
-                                KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
-                                KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
-                                KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
-                                KeyCode::Backspace if command_input => {
-                                    if command_cursor > 0 {
-                                        // Walk back to the previous char boundary so we never split a UTF-8 sequence.
-                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
-                                        let new_cursor = command_cursor - prev_len;
-                                        command_buf.replace_range(new_cursor..command_cursor, "");
-                                        command_cursor = new_cursor;
+                                // A control character is an editing key, not
+                                // text, so it goes to the editor. AltGr is the
+                                // exception: Windows reports it as Ctrl+Alt, so
+                                // `@` on a German layout arrives as Ctrl+Alt+@
+                                // and has to be typed, which the text arm below
+                                // does. C-c and C-g close the prompt, as tmux's
+                                // prompt.c does.
+                                KeyCode::Char(c) if renaming
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !is_altgr_char(c, key.modifiers) => {
+                                    if rename_overlay_ctrl_key(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, c,
+                                        || top_paste_buffer(port, &session_key)) {
+                                        renaming = false;
+                                        session_renaming = false;
+                                        // Nothing else asks for a repaint here:
+                                        // on an idle pane no frame comes, and the
+                                        // closed overlay stayed drawn. Escape's
+                                        // branch does the same.
+                                        selection_changed = true;
                                     }
+                                }
+                                // Alt with a character is a key, not text: M-f
+                                // and M-b move by word, and the editor has no
+                                // use for the rest, which tmux's prompt drops
+                                // rather than types (status.c:1710 to :1718).
+                                KeyCode::Char(c) if renaming
+                                    && key.modifiers.contains(KeyModifiers::ALT)
+                                    && !is_altgr_char(c, key.modifiers) => {
+                                    let name = crate::config::format_key_binding(&(key.code, key.modifiers));
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, &name, || None);
+                                }
+                                KeyCode::Char(c) if renaming && !paste_burst_active => {
+                                    let mut buf = [0u8; 4];
+                                    crate::copy_mode::prompt_insert(&mut rename_buf, rename_back, c.encode_utf8(&mut buf));
+                                    paste_gesture.record_char(c);
+                                }
+                                // Text goes in at the cursor, through the same
+                                // helper the rename overlay uses. AltGr is the
+                                // exception to the CONTROL guard: Windows reports
+                                // it as Ctrl+Alt, so `@` on a German layout
+                                // arrives as Ctrl+Alt+@ and is text. It used to
+                                // fail this guard and reach the AltGr arm below,
+                                // which hands the character to the PANE, so the
+                                // character never arrived in the prompt at all.
+                                // `-k` and `-1`: the prompt is answered by the
+                                // next key (its name) or the next character,
+                                // before any editing (status.c:1438 to :1470).
+                                // Both used to be dropped by the flag parser, so
+                                // the prompt waited for Enter and ran with
+                                // whatever had been typed.
+                                // `-N`: a digit is typed (status.c:1450); any
+                                // other key answers with the digits so far and
+                                // is then handled as the key it is, which tmux
+                                // does by returning 1 from status_prompt_key
+                                // (status.c:1456), so the key is re-dispatched.
+                                KeyCode::Char(c) if command_input && command_numeric
+                                    && c.is_ascii_digit()
+                                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !key.modifiers.contains(KeyModifiers::ALT) => {
+                                    command_buf.push(c);
+                                    command_back = 0;
+                                }
+                                _ if command_input && (command_key_answer || command_single || command_numeric) => {
+                                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                    let answer: Option<String> = if command_key_answer {
+                                        Some(prompt_key_answer_name(key.code, key.modifiers))
+                                    } else if command_numeric {
+                                        redispatch_evt = Some(Event::Key(key));
+                                        Some(command_buf.clone())
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Char(c) if !ctrl || is_altgr_char(c, key.modifiers) => Some(c.to_string()),
+                                            KeyCode::Enter => Some(String::new()),
+                                            _ => None,
+                                        }
+                                    };
+                                    let cancel = command_single
+                                        && (key.code == KeyCode::Esc
+                                            || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('g'))));
+                                    if let Some(answer) = answer.as_ref() {
+                                        let final_cmd = match command_template {
+                                            Some(ref tmpl) => {
+                                                let mut answers = std::mem::take(&mut command_answers);
+                                                answers.push(answer.clone());
+                                                crate::copy_prompt::final_command_tmux(Some(tmpl), &answers)
+                                            }
+                                            None => answer.clone(),
+                                        };
+                                        let sub_cmds = crate::config::split_chained_commands_pub(&final_cmd);
+                                        cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                    }
+                                    if answer.is_some() || cancel {
+                                        command_input = false;
+                                        command_back = 0;
+                                        command_template = None;
+                                        command_prompt_label = None;
+                                        command_key_answer = false;
+                                        command_single = false;
+                                        command_numeric = false;
+                                        command_prompt_queue.clear();
+                                        command_answers.clear();
+                                        selection_changed = true;
+                                    }
+                                }
+                                // Alt with a character is not text either: it
+                                // goes on to the editor below, where M-f and M-b
+                                // move by word and the rest are dropped, as
+                                // tmux's prompt drops them (status.c:1710 to
+                                // :1718).
+                                KeyCode::Char(c) if command_input
+                                    && (!key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                                        || is_altgr_char(c, key.modifiers))
+                                    && !paste_burst_active => {
+                                    let mut buf = [0u8; 4];
+                                    crate::copy_mode::prompt_insert(&mut command_buf, command_back, c.encode_utf8(&mut buf));
+                                    paste_gesture.record_char(c);
+                                }
+                                // A character inside the paste suppress window is
+                                // the host's duplicate of a paste the prompt has
+                                // already taken (#290), so it is dropped here. The
+                                // catch all arm below would hand it to the prompt
+                                // editor, which types a Space as a space: pasting
+                                // "a b c d" left "a b c d   " in the line.
+                                KeyCode::Char(c) if command_input
+                                    && paste_burst_active
+                                    && (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || is_altgr_char(c, key.modifiers)) => {}
+                                // The copy-mode prompt editor, as it stands,
+                                // reused here: tmux reaches this overlay
+                                // through `command-prompt`, which has the full
+                                // editor, so the keys a user tries are the
+                                // same ones. `prompt_edit` is not changed by
+                                // this, only called.
+                                KeyCode::Backspace if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, "backspace", || None);
+                                }
+                                KeyCode::Delete if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, "delete", || None);
+                                }
+                                // With Ctrl, Left and Right move by word, as
+                                // M-b and M-f do (status.c:1598, :1620).
+                                KeyCode::Left if renaming => {
+                                    let name = if key.modifiers.contains(KeyModifiers::CONTROL) { "c-left" } else { "left" };
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, name, || None);
+                                }
+                                KeyCode::Right if renaming => {
+                                    let name = if key.modifiers.contains(KeyModifiers::CONTROL) { "c-right" } else { "right" };
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, name, || None);
+                                }
+                                KeyCode::Home if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, "home", || None);
+                                }
+                                KeyCode::End if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, &word_separators, "end", || None);
                                 }
                                 KeyCode::Enter if renaming => {
                                     if session_renaming {
                                         cmd_batch.push(format!("rename-session {}\n", quote_arg(&rename_buf)));
+                                        // Take the new name now rather than wait
+                                        // for the frame that carries it. The
+                                        // rename moves the port file, so the
+                                        // next frame is a second or two away
+                                        // across the reconnect, and a `prefix $`
+                                        // in between would open on the old name
+                                        // again. The frame still has the last
+                                        // word, so a name the server refuses
+                                        // corrects itself. `current_session`
+                                        // waits for that frame: a refused name
+                                        // can be another live session's, and
+                                        // taking it here would make that row
+                                        // this client's own in the choosers,
+                                        // where `x` kills it as if it were.
+                                        session_label = rename_buf.clone();
                                         session_renaming = false;
                                     } else {
                                         cmd_batch.push(format!("rename-window {}\n", quote_arg(&rename_buf)));
                                     }
                                     renaming = false;
                                 }
-                                KeyCode::Enter if pane_renaming => { cmd_batch.push(format!("set-pane-title {}\n", quote_arg(&pane_title_buf))); pane_renaming = false; }
-                                KeyCode::Enter if window_idx_input => {
-                                    if !window_idx_buf.is_empty() {
-                                        cmd_batch.push(format!("select-window -t :{}\n", window_idx_buf));
+                                // `-p a,b`: Enter answers this prompt and asks
+                                // the next one (cmd_command_prompt_callback,
+                                // cmd-command-prompt.c:180 to :205); the
+                                // command runs after the last.
+                                KeyCode::Enter if command_input && !command_prompt_queue.is_empty() => {
+                                    let typed = command_buf.trim().to_string();
+                                    if !typed.is_empty() {
+                                        let hist = if command_search { &mut search_history } else { &mut command_history };
+                                        hist.push(typed.clone());
                                     }
-                                    window_idx_input = false;
+                                    command_answers.push(typed);
+                                    let (label, initial) = command_prompt_queue.remove(0);
+                                    command_prompt_label = label;
+                                    command_buf = initial;
+                                    command_back = 0;
+                                    command_history_idx = if command_search { search_history.len() } else { command_history.len() };
+                                    selection_changed = true;
                                 }
                                 KeyCode::Enter if command_input => {
                                     let trimmed = command_buf.trim().to_string();
                                     if !trimmed.is_empty() || command_template.is_some() {
                                         if !trimmed.is_empty() {
-                                            command_history.push(trimmed.clone());
-                                            command_history_idx = command_history.len();
+                                            // tmux keeps one history per prompt
+                                            // type (status.c:1666).
+                                            let hist = if command_search { &mut search_history } else { &mut command_history };
+                                            hist.push(trimmed.clone());
+                                            command_history_idx = hist.len();
                                         }
                                         // If we have a template (from command-prompt -I ... 'cmd "%%"'),
-                                        // substitute %% with user input and send that command instead.
+                                        // put every answer in, the way tmux does: %% and %1
+                                        // for the first, %2 for the second, %%% and %1% the
+                                        // double quoted spellings (cmd_template_replace).
                                         let final_cmd = if let Some(ref tmpl) = command_template {
-                                            tmpl.replace("%%", &trimmed)
+                                            let mut answers = std::mem::take(&mut command_answers);
+                                            answers.push(trimmed.clone());
+                                            crate::copy_prompt::final_command_tmux(Some(tmpl), &answers)
                                         } else {
                                             trimmed.clone()
                                         };
@@ -3339,49 +6836,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         let first_word = final_cmd.split_whitespace().next().unwrap_or("");
                                         if first_word == "choose-buffer" || first_word == "chooseb" {
                                             // Open interactive buffer chooser instead of sending to server
-                                            buffer_chooser = true;
-                                            buffer_entries.clear();
-                                            buffer_selected = 0;
-                                            buffer_scroll = 0;
-                                            buffer_num_buffer.clear();
-                                            let port_file = format!("{}\\.psmux\\{}.port", home, current_session);
-                                            if let Ok(port_str) = std::fs::read_to_string(&port_file) {
-                                                if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                    let sess_key = read_session_key(&current_session).unwrap_or_default();
-                                                    let addr = format!("127.0.0.1:{}", p);
-                                                    if let Some(buf_line) = crate::session::fetch_authed_response_multi(
-                                                        &addr,
-                                                        &sess_key,
-                                                        b"choose-buffer\n",
-                                                        Duration::from_millis(100),
-                                                        Duration::from_millis(200),
-                                                    ) {
-                                                        {
-                                                            for line in buf_line.trim().split('\n') {
-                                                                let line = line.trim();
-                                                                if line.is_empty() { continue; }
-                                                                if let Some(rest) = line.strip_prefix("buffer") {
-                                                                    if let Some(colon_pos) = rest.find(':') {
-                                                                        if let Ok(idx) = rest[..colon_pos].parse::<usize>() {
-                                                                            let after_colon = &rest[colon_pos+1..].trim_start();
-                                                                            let byte_len = after_colon.split_whitespace().next()
-                                                                                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                                                                            let preview = if let Some(bp) = after_colon.find('"') {
-                                                                                let p = &after_colon[bp+1..];
-                                                                                p.trim_end_matches('"').to_string()
-                                                                            } else {
-                                                                                after_colon.to_string()
-                                                                            };
-                                                                            buffer_entries.push((idx, byte_len, preview));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if buffer_entries.is_empty() { buffer_chooser = false; }
+                                            open_buffer_chooser!();
                                         } else {
                                             // Split on \; or ; to support command chaining (issue #192)
                                             let sub_cmds = crate::config::split_chained_commands_pub(&final_cmd);
@@ -3400,73 +6855,117 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                         quit_on_detach = true;
                                                     }
                                                 }
-                                                cmd_batch.push(format!("{}\n", sub));
                                             }
+                                            cmd_batch.extend(binding_wire_lines(&sub_cmds));
                                             if quit_on_detach {
                                                 quit = true;
                                             }
                                         }
                                     }
                                     command_input = false;
-                                    command_cursor = 0;
+                                    command_back = 0;
+                                    command_template = None;
+                                    command_prompt_label = None;
                                 }
                                 KeyCode::Esc if renaming => { renaming = false; session_renaming = false; }
-                                KeyCode::Esc if pane_renaming => { pane_renaming = false; }
-                                KeyCode::Esc if window_idx_input => { window_idx_input = false; }
-                                KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; }
+                                KeyCode::Esc if command_input => { command_input = false; command_back = 0; command_template = None; command_prompt_label = None; }
 
-                                // Command prompt: cursor movement, history, and editing keys
-                                KeyCode::Left if command_input => {
-                                    if command_cursor > 0 {
-                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
-                                        command_cursor -= prev_len;
+                                // Every key the rename overlay has no use for
+                                // stops here. Up, Down, Tab, PageUp, F keys and
+                                // the rest used to fall through to the arms
+                                // below and reach the pane's shell while the
+                                // overlay sat on top of it, the way C-c did
+                                // before the overlay had an editor. tmux's
+                                // prompt keeps every key it is given.
+                                _ if renaming => {}
+
+                                // Every other key at the command prompt goes to
+                                // the shared prompt editor, the one the rename
+                                // overlay and the copy mode prompts already use,
+                                // and stops here whether the editor had a use for
+                                // it or not. tmux's prompt does the same: its own
+                                // `default` case appends the key to the buffer
+                                // (`status.c:1704`), so no key pressed at a prompt
+                                // reaches a pane. These used to fall through to
+                                // the arms below, where a Ctrl plus letter becomes
+                                // `send-key C-<letter>` for the focused pane:
+                                // `C-l` cleared the shell's screen behind the
+                                // prompt and `C-p` recalled the shell's own
+                                // history (discussion #782).
+                                _ if command_input => {
+                                    match command_prompt_key(
+                                        &mut command_buf,
+                                        &mut command_back,
+                                        &mut prompt_saved,
+                                        &word_separators,
+                                        effective_code,
+                                        key.modifiers,
+                                        || top_paste_buffer(port, &session_key),
+                                    ) {
+                                        PromptKeyAction::Close => {
+                                            command_input = false;
+                                            command_back = 0;
+                                            command_template = None;
+                                            command_prompt_label = None;
+                                            // Nothing else asks for a repaint
+                                            // here: on an idle pane no frame
+                                            // comes, and the closed overlay
+                                            // stayed drawn. Escape's branch and
+                                            // the rename overlay's cancel do the
+                                            // same.
+                                            selection_changed = true;
+                                        }
+                                        PromptKeyAction::HistoryUp => {
+                                            let hist = if command_search { &search_history } else { &command_history };
+                                            if command_history_idx > 0 {
+                                                command_history_idx -= 1;
+                                                command_buf = hist[command_history_idx].clone();
+                                                command_back = 0;
+                                            }
+                                        }
+                                        PromptKeyAction::HistoryDown => {
+                                            let hist = if command_search { &search_history } else { &command_history };
+                                            if command_history_idx < hist.len() {
+                                                command_history_idx += 1;
+                                                command_buf = if command_history_idx < hist.len() {
+                                                    hist[command_history_idx].clone()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                command_back = 0;
+                                            }
+                                        }
+                                        PromptKeyAction::Edited => {}
                                     }
-                                }
-                                KeyCode::Right if command_input => {
-                                    if command_cursor < command_buf.len() {
-                                        let next_len = command_buf[command_cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                                        command_cursor += next_len;
-                                    }
-                                }
-                                KeyCode::Home if command_input => { command_cursor = 0; }
-                                KeyCode::End if command_input => { command_cursor = command_buf.len(); }
-                                KeyCode::Delete if command_input => { if command_cursor < command_buf.len() { command_buf.remove(command_cursor); } }
-                                KeyCode::Up if command_input => {
-                                    if command_history_idx > 0 {
-                                        command_history_idx -= 1;
-                                        command_buf = command_history[command_history_idx].clone();
-                                        command_cursor = command_buf.len();
-                                    }
-                                }
-                                KeyCode::Down if command_input => {
-                                    if command_history_idx < command_history.len() {
-                                        command_history_idx += 1;
-                                        command_buf = if command_history_idx < command_history.len() {
-                                            command_history[command_history_idx].clone()
-                                        } else {
-                                            String::new()
-                                        };
-                                        command_cursor = command_buf.len();
-                                    }
-                                }
-                                KeyCode::Char('a') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => { command_cursor = 0; }
-                                KeyCode::Char('e') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => { command_cursor = command_buf.len(); }
-                                KeyCode::Char('u') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    command_buf.drain(..command_cursor);
-                                    command_cursor = 0;
-                                }
-                                KeyCode::Char('k') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    command_buf.truncate(command_cursor);
-                                }
-                                KeyCode::Char('w') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let mut pos = command_cursor;
-                                    while pos > 0 && command_buf.as_bytes().get(pos - 1) == Some(&b' ') { pos -= 1; }
-                                    while pos > 0 && command_buf.as_bytes().get(pos - 1) != Some(&b' ') { pos -= 1; }
-                                    command_buf.drain(pos..command_cursor);
-                                    command_cursor = pos;
                                 }
 
-                                KeyCode::Char(' ') => {
+                                // The CONTROL guard is load bearing (issue #623).
+                                // `fold_nul_to_ctrl_space` has already rewritten a
+                                // physical Ctrl+Space, Ctrl+2 or Ctrl+Shift+2 into
+                                // Char(' ') with CONTROL by the time this match runs,
+                                // and this arm sits EARLIER than the CONTROL arm, so
+                                // without the guard every one of them was typed into
+                                // the pane as a literal space (0x20).  Measured with a
+                                // record reading pane child: Ctrl+2 arrived as
+                                // `vk=0x20 ch=0x0020 ctrl=0x0000`.  That also
+                                // contradicted the fold's own promise of NUL, which is
+                                // what tmux sends (input-keys.c `standard_map`).
+                                // `paste_burst_active` is load bearing too, for the
+                                // same reason the arms above carry it. Without it a
+                                // space was the one character that neither asked
+                                // whether an overlay had it nor whether the paste
+                                // suppress window was open: the generic Char arm
+                                // below checks the window and drops the character,
+                                // and this arm pushed it to the pane regardless.
+                                // Measured by pasting " abcdef" into the command
+                                // prompt several times a second: the letters went to
+                                // the prompt and a few of the spaces landed on the
+                                // shell's command line behind it (#744). With the
+                                // guard a space falls through to the generic arm and
+                                // is treated like every other character.
+                                KeyCode::Char(' ')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !paste_burst_active => {
                                     #[cfg(windows)]
                                     {
                                         paste_pend.push(' ');
@@ -3504,10 +7003,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     }
                                 }
                                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
-                                    cmd_batch.push(format!("send-key C-M-{}\n", c.to_ascii_lowercase()));
+                                    cmd_batch.push(send_key_line(&format!("C-M-{}", c.to_ascii_lowercase())));
                                 }
                                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
-                                    cmd_batch.push(format!("send-key M-{}\n", c));
+                                    cmd_batch.push(send_key_line(&format!("M-{}", c)));
                                 }
                                 // pwsh-mouse-selection: Ctrl+Shift+C / Ctrl+Shift+V
                                 // explicit copy/paste regardless of selection state.
@@ -3525,7 +7024,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -3537,6 +7036,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3548,6 +7048,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 {
                                     if let Some(text) = read_from_system_clipboard() {
                                         if !text.is_empty() {
+                                            paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
                                         }
@@ -3571,7 +7072,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
-                                                rsel_pane_rect,
+                                                rsel_pane_rect, &client_border_status, &client_border_format,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3582,6 +7083,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3592,7 +7094,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 // handles them.  When paste-detection is off, forward C-v
                                 // to the child app (e.g. neovim visual block mode).
                                 #[cfg(windows)]
-                                KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && paste_detection_enabled => {}
+                                KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && paste_detection_enabled => {
+                                    // Everything the host injects for this
+                                    // paste belongs to one gesture; a new Press
+                                    // starts a fresh one.
+                                    paste_gesture.start();
+                                    // Nothing is bound to it, so unless a paste
+                                    // follows, this is the pane's C-v (issue
+                                    // #858: nvim's visual block key never
+                                    // arrived).  It is held, not sent, until
+                                    // the release, the gesture window or the
+                                    // next key shows that no paste is coming.
+                                    ctrlv_press.defer();
+                                }
                                 #[cfg(windows)]
                                 KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && !paste_detection_enabled => {
                                     cmd_batch.push("send-key C-v\n".to_string());
@@ -3603,10 +7117,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     // (issue #368).  tmux-style name: C-S-x.  The server
                                     // injects a native KEY_EVENT carrying both modifiers so
                                     // console-input apps can tell the two apart.
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        cmd_batch.push(format!("send-key C-S-{}\n", c.to_ascii_lowercase()));
+                                    if c == ' ' {
+                                        // A space cannot travel as the third character
+                                        // of "C-x": the command line is split on
+                                        // whitespace, so the argument would arrive as a
+                                        // bare "C-". Ctrl+Space (and the Ctrl+2 folded
+                                        // onto it) goes by name instead.
+                                        cmd_batch.push("send-key C-Space\n".to_string());
+                                    } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        cmd_batch.push(send_key_line(&format!("C-S-{}", c.to_ascii_lowercase())));
                                     } else {
-                                        cmd_batch.push(format!("send-key C-{}\n", c.to_ascii_lowercase()));
+                                        cmd_batch.push(send_key_line(&format!("C-{}", c.to_ascii_lowercase())));
                                     }
                                 }
                                 KeyCode::Char(c) if (c as u32) >= 0x01 && (c as u32) <= 0x1A => {
@@ -3688,9 +7209,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     { cmd_batch.push("send-key tab\n".into()); }
                                 }
                                 KeyCode::BackTab => { cmd_batch.push("send-key btab\n".into()); }
-                                KeyCode::Backspace => { cmd_batch.push("send-key backspace\n".into()); }
+                                // Backspace has to carry its modifiers like every
+                                // other special key here (issue #610).  Naming it
+                                // "backspace" unconditionally threw Ctrl away on the
+                                // wire, so the server could only ever write a plain
+                                // 0x7f and no bind-key C-BSpace could match.  The
+                                // unmodified case still lowercases to "backspace",
+                                // exactly as before.
+                                KeyCode::Backspace => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Backspace", key.modifiers))); }
                                 KeyCode::Delete => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Delete", key.modifiers))); }
-                                KeyCode::Esc => { cmd_batch.push("send-key esc\n".into()); }
+                                KeyCode::Esc => { cmd_batch.push(format!("send-key {}\n", escape_key_name(key.modifiers))); }
                                 KeyCode::Left => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Left", key.modifiers))); }
                                 KeyCode::Right => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Right", key.modifiers))); }
                                 KeyCode::Up => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Up", key.modifiers))); }
@@ -3706,19 +7234,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                     }
                     Event::Paste(data) => {
+                        // A paste event behind a Ctrl+V press is the host
+                        // pasting, so the press was the gesture (issue #858).
+                        #[cfg(windows)]
+                        ctrlv_press.note_paste_input();
                         // Route paste into the active client-side text overlay
                         // (issue #290) so it does not leak past the command
                         // prompt / rename prompts into the underlying pane.
                         let consumed = route_paste_to_overlay(
                             &data,
-                            command_input, &mut command_buf, &mut command_cursor,
+                            command_input, &mut command_buf, command_back,
                             renaming, &mut rename_buf,
-                            pane_renaming, &mut pane_title_buf,
-                            window_idx_input, &mut window_idx_buf,
                         );
-                        if !consumed {
+                        let duplicate = !consumed && paste_event_is_duplicate(&paste_gesture, &data);
+                        if duplicate {
+                            // Windows crossterm can emit Event::Paste *and* the
+                            // per-character key events for one Ctrl+V.  When the
+                            // characters were delivered first, forwarding this
+                            // event too pastes the same text twice.  Only the
+                            // text itself decides that: a paste after a key the
+                            // user typed, or after an earlier paste, is a new
+                            // paste (issue #598).
+                            if input_log_enabled() {
+                                input_log("paste", &format!(
+                                    "Event::Paste: dropping duplicate of {} char(s) already sent as characters",
+                                    data.len()));
+                            }
+                        } else if !consumed {
                             let encoded = base64_encode(&data);
                             cmd_batch.push(format!("send-paste {}\n", encoded));
+                            paste_gesture.record(&data);
                         }
                         // On Windows, crossterm with EnableBracketedPaste may
                         // emit Event::Paste AND individual Event::Key events
@@ -3739,6 +7284,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     }
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
+                        // Ctrl+Wheel zooms the terminal font, not the pane.
+                        // Windows Terminal hands it to us because mouse
+                        // reporting is on; give it back as its zoom key.
+                        // Anything else, or no foreground Windows Terminal,
+                        // falls through unchanged.
+                        if ctrl_wheel_zoom
+                            && crate::platform::terminal_zoom::wheel_zoom_direction(&me)
+                            .map_or(false, crate::platform::terminal_zoom::request)
+                        {
+                            _pending_evt = input.try_read()?;
+                            continue;
+                        }
                         // Intercept mouse events while a draggable picker is open
                         // so the user can move the popup by dragging its border
                         // and so clicks behind the popup don't leak through to
@@ -3774,7 +7331,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                                 MouseEventKind::ScrollDown => {
                                     if tree_chooser && tree_selected + 1 < tree_entries.len() { tree_selected += 1; }
-                                    if session_chooser && session_selected + 1 < session_entries.len() { session_selected += 1; }
+                                    if session_chooser {
+                                        let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                        if session_selected + 1 < visible_len { session_selected += 1; }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -3785,18 +7345,73 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                         match me.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                // Status bar tab click
-                                if me.row == client_status_row {
+                                // Status bar tab click. Every status row is
+                                // hit-tested (#593) — tmux server-client.c
+                                // accepts y anywhere in [statusat,
+                                // statusat+statuslines) and resolves the
+                                // clicked row's own ranges. A click on status
+                                // rows never falls through to pane handling.
+                                if client_status_rows > 0
+                                    && me.row >= client_status_row
+                                    && me.row < client_status_row.saturating_add(client_status_rows) {
                                     let mut clicked_tab: Option<usize> = None;
-                                    for &(win_idx, x_start, x_end) in &client_tab_positions {
-                                        if me.column >= x_start && me.column < x_end {
+                                    for &(row, win_idx, x_start, x_end) in &client_tab_positions {
+                                        if me.row == row && me.column >= x_start && me.column < x_end {
                                             clicked_tab = Some(win_idx);
                                             break;
                                         }
                                     }
-                                    if let Some(idx) = clicked_tab {
-                                        let display_idx = idx + client_base_index;
-                                        cmd_batch.push(format!("select-window -t :{}\n", display_idx));
+                                    // tmux MouseDown1Status: built in, select the
+                                    // window clicked; a user binding runs with that
+                                    // window as `-t =`; unbound, nothing.
+                                    // Status line multi clicks, when one is bound
+                                    // (tmux server_client_check_mouse).
+                                    if mouse_overrides.keys().any(|k| k.ends_with("Click1Status")) {
+                                        let target = clicked_tab
+                                            .filter(|i| client_window_indices.contains(i))
+                                            .map(|i| format!(":{}", i))
+                                            .unwrap_or_else(|| ":".to_string());
+                                        let now = Instant::now();
+                                        let window = Duration::from_millis(crate::mouse_keys::CLICK_TIMEOUT_MS);
+                                        let send = |name: &str, batch: &mut Vec<String>| {
+                                            if mouse_route(&mouse_overrides, name, client_copy_mode) == 'U' {
+                                                batch.push(format!("mouse-key {} {} {} {} 0\n", name, target, me.column, me.row));
+                                            }
+                                        };
+                                        status_clicks = match status_clicks.take() {
+                                            Some((1, end, ..)) if now < end => {
+                                                send("SecondClick1Status", &mut cmd_batch);
+                                                Some((2, now + window, target.clone(), me.column, me.row))
+                                            }
+                                            Some((2, end, ..)) if now < end => {
+                                                send("TripleClick1Status", &mut cmd_batch);
+                                                None
+                                            }
+                                            _ => Some((1, now + window, target.clone(), me.column, me.row)),
+                                        };
+                                    }
+                                    let status_name = routed_name(&mouse_overrides, "MouseDown1Status", me.modifiers);
+                                    match mouse_route(&mouse_overrides, &status_name, client_copy_mode) {
+                                        'B' => {
+                                            if let Some(idx) = clicked_tab {
+                                                // client_tab_positions stores the true display
+                                                // index (honors gaps from renumber-windows off).
+                                                // A range naming a window that does not exist
+                                                // is ignored, matching tmux.
+                                                if client_window_indices.contains(&idx) {
+                                                    cmd_batch.push(format!("select-window -t :{}\n", idx));
+                                                }
+                                            }
+                                        }
+                                        'U' => {
+                                            let target = clicked_tab
+                                                .filter(|i| client_window_indices.contains(i))
+                                                .map(|i| format!(":{}", i))
+                                                .unwrap_or_else(|| ":".to_string());
+                                            cmd_batch.push(format!("mouse-key {} {} {} {} 0\n",
+                                                status_name, target, me.column, me.row));
+                                        }
+                                        _ => {}
                                     }
                                 } else {
                                     // Border detection
@@ -3812,15 +7427,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 && me.column >= barea.x && me.column < barea.x + barea.width
                                             };
                                             if hit {
-                                                client_drag = Some(ClientDragState {
-                                                    path: bpath.clone(),
-                                                    kind: bkind.clone(),
-                                                    index: *bidx,
-                                                    start_pos: if bkind == "Horizontal" { me.column } else { me.row },
-                                                    initial_sizes: bsizes.clone(),
-                                                    total_pixels: *btotal,
-                                                });
-                                                border_drag = true;
+                                                // tmux MouseDrag1Border: built in, drag
+                                                // the separator; otherwise the table
+                                                // decides on each drag motion.
+                                                let route = mouse_route(&mouse_overrides, "MouseDrag1Border", client_copy_mode);
+                                                if route == 'B' {
+                                                    client_drag = Some(ClientDragState {
+                                                        path: bpath.clone(),
+                                                        kind: bkind.clone(),
+                                                        index: *bidx,
+                                                        start_pos: if bkind == "Horizontal" { me.column } else { me.row },
+                                                        initial_sizes: bsizes.clone(),
+                                                        total_pixels: *btotal,
+                                                    });
+                                                    border_drag = true;
+                                                } else {
+                                                    border_drag_route = Some(route);
+                                                }
                                                 on_border = true;
                                                 rsel_start = None;
                                                 rsel_end = None;
@@ -3834,33 +7457,102 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         let clicked_pane = client_pane_rects.iter().find(|(_, rect)| {
                                             rect.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                         });
+                                        // tmux MouseDown1Pane / MouseDrag1Pane: with both at
+                                        // their built-in default the code below runs as it
+                                        // always has; otherwise the gesture is routed.
+                                        let down_name = routed_name(&mouse_overrides, "MouseDown1Pane", me.modifiers);
+                                        let drag_name = routed_name(&mouse_overrides, "MouseDrag1Pane", me.modifiers);
+                                        let down_route = mouse_route(&mouse_overrides, &down_name, client_copy_mode);
+                                        let drag_route = mouse_route(&mouse_overrides, &drag_name, client_copy_mode);
+                                        let routed = (down_route != 'B' || drag_route != 'B')
+                                            .then_some(clicked_pane).flatten();
 
-                                        if let Some(&(pane_id, pane_rect)) = clicked_pane {
+                                        if let Some(&(pane_id, pane_rect)) = routed {
+                                            let rel_col = me.column as i16 - pane_rect.x as i16;
+                                            let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                            match down_route {
+                                                // The built-in press: focus, then the copy
+                                                // cursor (copy mode) or the program (if it
+                                                // wants the mouse), as the server decides.
+                                                'B' => {
+                                                    cmd_batch.push(format!("select-pane -t %{}\n", pane_id));
+                                                    cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n", pane_id, rel_col, rel_row));
+                                                }
+                                                'U' => cmd_batch.push(format!("mouse-key {} %{} {} {} 0\n", down_name, pane_id, rel_col, rel_row)),
+                                                'F' => cmd_batch.push(format!("mouse-forward {} 0 {} {} M\n", pane_id, rel_col, rel_row)),
+                                                _ => {}
+                                            }
+                                            pane_gesture = Some((pane_id, pane_rect, down_route, drag_route, (rel_col, rel_row), false));
+                                            deferred_left_click = None;
+                                            copy_mode_drag_pending = None;
+                                            rsel_start = None;
+                                            rsel_end = None;
+                                            rsel_pane_rect = None;
+                                            rsel_pane_id = None;
+                                            rsel_block = false;
+                                            rsel_dragged = false;
+                                            selection_changed = true;
+                                        } else if let Some(&(pane_id, pane_rect)) = clicked_pane {
                                             cmd_batch.push(format!("select-pane -t %{}\n", pane_id));
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
+                                            let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
 
                                             if client_copy_mode {
+                                                deferred_left_click = None;
+                                                client_drawn_sel = None; // a new gesture: nothing painted yet
                                                 cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
                                                     pane_id, rel_col, rel_row));
+                                                // Remember the pane so a drag that leaves its
+                                                // rect still reaches the server (edge auto-scroll).
+                                                copy_drag_pane = Some((pane_id, pane_rect));
+                                                copy_drag_last = None;
+                                                copy_drag_repeat_at = None;
                                                 rsel_start = None;
                                                 rsel_end = None;
                                                 rsel_pane_rect = None;
+                                                rsel_pane_id = None;
                                                 rsel_block = false;
                                                 selection_changed = true;
                                             } else {
-                                                cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
-                                                    pane_id, rel_col, rel_row));
                                                 border_drag = false;
 
                                                 // mouse-selection off: do not start any client-side
                                                 // drag selection.  In-pane apps (opencode, nvim, etc.)
                                                 // can implement their own mouse selection without
                                                 // psmux drawing on top.  (issue #245)
-                                                if !client_mouse_selection {
+                                                //
+                                                // Per-pane: even with mouse-selection on, normally
+                                                // yield to an app that enabled a mouse protocol. The
+                                                // force option instead withholds the press until
+                                                // release, so clicks can be replayed while drags stay
+                                                // available for psmux selection.
+                                                let pane_handles_mouse =
+                                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                                        .map(|s| pane_wants_mouse_json(&s.layout, pane_id))
+                                                        .unwrap_or(false);
+                                                let force_client_selection =
+                                                    client_selection_owns_drag(
+                                                        client_mouse_selection,
+                                                        client_mouse_selection_force,
+                                                        pane_handles_mouse,
+                                                    ) && pane_handles_mouse;
+                                                if force_client_selection {
+                                                    deferred_left_click = Some((pane_id, rel_col, rel_row));
+                                                } else {
+                                                    deferred_left_click = None;
+                                                    client_drawn_sel = None; // a new gesture: nothing painted yet
+                                                    cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
+                                                        pane_id, rel_col, rel_row));
+                                                }
+                                                if !client_selection_owns_drag(
+                                                    client_mouse_selection,
+                                                    client_mouse_selection_force,
+                                                    pane_handles_mouse,
+                                                ) {
                                                     rsel_start = None;
                                                     rsel_end = None;
                                                     rsel_pane_rect = None;
+                                                    rsel_pane_id = None;
                                                     rsel_block = false;
                                                     rsel_dragged = false;
                                                     selection_changed = true;
@@ -3886,6 +7578,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 } else if client_pwsh_selection {
                                                     rsel_block = me.modifiers.contains(KeyModifiers::ALT);
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
 
@@ -3905,6 +7598,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                                 last_sent_size.1,
                                                                 pane_rect,
                                                                 me.column, me.row,
+                                                                &client_border_status, &client_border_format,
                                                             ))
                                                     } else {
                                                         None
@@ -3929,12 +7623,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     rsel_start = Some((me.column, me.row));
                                                     rsel_end = Some((me.column, me.row));
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
                                                 }
-                                                } // end if client_mouse_selection
+                                                // mouse-drag-enter-copy-mode (tmux parity): the drag
+                                                // starts a server-side copy-mode selection, so undo the
+                                                // client-side selection armed above and remember
+                                                // where the button went down — the drag replays it
+                                                // so the selection anchors at the press cell.
+                                                if mouse_drag_enter_copy_mode && !pane_handles_mouse {
+                                                    copy_mode_drag_pending = Some((pane_id, pane_rect, rel_col, rel_row));
+                                                    rsel_start = None;
+                                                    rsel_end = None;
+                                                    rsel_pane_rect = None;
+                                                    rsel_pane_id = None;
+                                                    rsel_block = false;
+                                                    rsel_dragged = false;
+                                                    deferred_left_click = None;
+                                                    selection_changed = true;
+                                                }
+                                                } // end client-side selection gate (mouse-selection + per-pane wants_mouse)
                                             }
                                         } else {
+                                            deferred_left_click = None;
                                             cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
                                         }
                                     }
@@ -3950,13 +7662,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         .unwrap_or(false)
                                 } else { false };
 
-                                if tui_active {
+                                // tmux MouseDown3Pane: psmux's built-in right
+                                // click below while the default is in place;
+                                // otherwise the table decides.
+                                let name3 = routed_name(&mouse_overrides, "MouseDown3Pane", me.modifiers);
+                                let route3 = mouse_route(&mouse_overrides, &name3, client_copy_mode);
+                                if route3 != 'B' {
+                                    if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
+                                        r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                    }) {
+                                        let rel_col = me.column as i16 - pane_rect.x as i16;
+                                        let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                        match route3 {
+                                            'U' => cmd_batch.push(format!("mouse-key {} %{} {} {} 2\n", name3, pane_id, rel_col, rel_row)),
+                                            'F' => cmd_batch.push(format!("mouse-forward {} 2 {} {} M\n", pane_id, rel_col, rel_row)),
+                                            _ => {}
+                                        }
+                                    }
+                                } else if tui_active {
                                     // Forward right-click as pane-relative mouse event
                                     if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
                                         r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                     }) {
                                         let rel_col = me.column as i16 - pane_rect.x as i16;
-                                        let rel_row = me.row as i16 - pane_rect.y as i16;
+                                        let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                         cmd_batch.push(format!("pane-mouse {} 2 {} {} M\n",
                                             pane_id, rel_col, rel_row));
                                     }
@@ -3973,7 +7702,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
-                                                rsel_pane_rect,
+                                                rsel_pane_rect, &client_border_status, &client_border_format,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3984,6 +7713,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3997,6 +7727,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     selection_changed = true;
                                     if let Some(text) = read_from_system_clipboard() {
                                         if !text.is_empty() {
+                                            paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
                                         }
@@ -4008,7 +7739,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
                                     let rel_col = me.column as i16 - pane_rect.x as i16;
-                                    let rel_row = me.row as i16 - pane_rect.y as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                     cmd_batch.push(format!("pane-mouse {} 1 {} {} M\n",
                                         pane_id, rel_col, rel_row));
                                 } else {
@@ -4016,71 +7747,223 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
-                                if border_drag {
+                                if let Some((pane_id, pane_rect, _down, drag_route, anchor, in_copy_drag)) = pane_gesture.as_mut() {
+                                    let inner = pane_content_inner(*pane_rect, &client_border_status, &client_border_format);
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = me.row as i16 - inner.y as i16;
+                                    match *drag_route {
+                                        // The built-in drag: a copy-mode selection
+                                        // (tmux MouseDrag1Pane -> copy-mode -M, or
+                                        // begin-selection in copy mode).
+                                        'B' => {
+                                            if !client_copy_mode && !*in_copy_drag {
+                                                cmd_batch.push(format!("copy-drag-begin {} {} {} {} {}\n",
+                                                    pane_id, anchor.0, anchor.1, rel_col, rel_row));
+                                                client_copy_mode = true;
+                                            }
+                                            *in_copy_drag = true;
+                                            cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n", pane_id, rel_col, rel_row));
+                                        }
+                                        'U' => cmd_batch.push(format!("mouse-key {} %{} {} {} 32\n",
+                                            routed_name(&mouse_overrides, "MouseDrag1Pane", me.modifiers), pane_id, rel_col, rel_row)),
+                                        'F' => cmd_batch.push(format!("mouse-forward {} 32 {} {} M\n", pane_id, rel_col, rel_row)),
+                                        _ => {}
+                                    }
+                                } else if let Some(route) = border_drag_route {
+                                    if route == 'U' {
+                                        cmd_batch.push(format!("mouse-key MouseDrag1Border : {} {} 32\n", me.column, me.row));
+                                    }
+                                } else if border_drag {
                                     if let Some(ref d) = client_drag {
                                         let current_pos = if d.kind == "Horizontal" { me.column } else { me.row };
                                         let pixel_delta = current_pos as i32 - d.start_pos as i32;
-                                        let total_pct: i32 = d.initial_sizes.iter().map(|&s| s as i32).sum();
-                                        let total_px = d.total_pixels.max(1) as i32;
-                                        let pct_delta = (pixel_delta * total_pct) / total_px;
-                                        let min_pct = 5i32;
-
                                         let mut new_sizes = d.initial_sizes.clone();
-                                        let left = (d.initial_sizes[d.index] as i32 + pct_delta)
-                                            .clamp(min_pct, d.initial_sizes[d.index] as i32 + d.initial_sizes[d.index + 1] as i32 - min_pct) as u16;
-                                        let right = d.initial_sizes[d.index] + d.initial_sizes[d.index + 1] - left;
-                                        new_sizes[d.index] = left;
-                                        new_sizes[d.index + 1] = right;
+                                        crate::tree::drag_split_sizes(
+                                            &mut new_sizes, d.index, d.initial_sizes[d.index], pixel_delta, d.total_pixels, d.kind == "Horizontal",
+                                        );
 
                                         let path_str = if d.path.is_empty() { "_".to_string() } else { d.path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".") };
                                         let sizes_str = new_sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
                                         cmd_batch.push(format!("split-sizes {} {}\n", path_str, sizes_str));
                                     }
                                 } else if rsel_start.is_none() || !client_mouse_selection {
-                                    if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                    if client_copy_mode || copy_mode_drag_pending.is_some() {
+                                        if let Some((pending_id, pending_rect, pending_col, pending_row)) = copy_mode_drag_pending.take() {
+                                            // First drag of the gesture: enter copy mode and
+                                            // replay the press so the selection anchors where
+                                            // the button went down, like tmux's
+                                            // MouseDragStart -> copy-mode -M.
+                                            cmd_batch.push("copy-enter\n".into());
+                                            client_drawn_sel = None; // a new gesture: nothing painted yet
+                                            cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n", pending_id, pending_col, pending_row));
+                                            copy_drag_pane = Some((pending_id, pending_rect));
+                                        }
+                                        // Route the drag to the pane it started in (falling
+                                        // back to the pane under the pointer) and send the
+                                        // row UNCLAMPED: an out-of-range row tells the server
+                                        // the pointer crossed a pane edge, which auto-scrolls
+                                        // the copy-mode view (tmux drag-scroll parity).
+                                        if copy_drag_pane.is_none() {
+                                            copy_drag_pane = client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r));
+                                        }
+                                        if let Some((pane_id, pane_rect)) = copy_drag_pane {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
+                                            let rel_row = me.row as i16 - inner.y as i16;
                                             cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n",
                                                 pane_id, rel_col, rel_row));
+                                            copy_drag_last = Some((rel_col, rel_row));
+                                            // Arm the repeat while the pointer dwells on/past
+                                            // the pane's first or last row: the pre-flush tick
+                                            // re-sends this drag every 50ms so the view keeps
+                                            // scrolling without further mouse movement.
+                                            let at_edge = rel_row <= 0
+                                                || rel_row >= inner.height.saturating_sub(1) as i16;
+                                            copy_drag_repeat_at = if at_edge {
+                                                Some(Instant::now() + COPY_DRAG_REPEAT)
+                                            } else {
+                                                None
+                                            };
                                         }
                                     } else {
                                         cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
                                     }
                                 } else {
                                     if let Some(start) = rsel_start {
-                                        let (col, row) = if client_pwsh_selection {
-                                            if let Some(r) = rsel_pane_rect {
-                                                (
-                                                    me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
-                                                    me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
-                                                )
+                                        // tmux parity: a real drag reaching the pane's top
+                                        // row has run out of visible screen — hand the
+                                        // selection off to server-side copy mode so it
+                                        // continues into scrollback (with edge auto-scroll
+                                        // from here on).  The bottom row does the same, but
+                                        // only when the view is scrolled back (direct
+                                        // scrollback with scroll-enter-copy-mode off, #193)
+                                        // — at the live bottom there is nothing below to
+                                        // select.  Same-cell micro-jitter is excluded so a
+                                        // sloppy click on an edge row stays a click (#199
+                                        // parity).
+                                        let handoff = rsel_pane_rect.zip(rsel_pane_id)
+                                            .and_then(|(pane_rect, pane_id)| {
+                                                let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                                let moved = rsel_dragged || (me.column, me.row) != start;
+                                                let at_top = me.row <= inner.y;
+                                                let scrolled_back = client_pane_view_offsets.iter()
+                                                    .find(|(id, _)| *id == pane_id)
+                                                    .map_or(false, |(_, off)| *off > 0);
+                                                let at_bottom = scrolled_back
+                                                    && me.row >= inner.y + inner.height.saturating_sub(1);
+                                                ((at_top || at_bottom) && moved)
+                                                    .then_some((pane_rect, pane_id, inner))
+                                            });
+                                        if let Some((pane_rect, pane_id, inner)) = handoff {
+                                            let a_col = start.0 as i16 - pane_rect.x as i16;
+                                            let a_row = start.1 as i16 - inner.y as i16;
+                                            let cur_col = me.column as i16 - pane_rect.x as i16;
+                                            let cur_row = me.row as i16 - inner.y as i16;
+                                            cmd_batch.push(format!("copy-drag-begin {} {} {} {} {}{}\n",
+                                                pane_id, a_col, a_row, cur_col, cur_row,
+                                                if rsel_block { " b" } else { "" }));
+                                            // The gesture is definitively a selection drag,
+                                            // not a click — never replay a withheld press
+                                            // (mouse-selection-force) on release.
+                                            deferred_left_click = None;
+                                            // The server is in copy mode from here on; keep
+                                            // the local flag in sync until the next dump
+                                            // confirms it so follow-up drags take the
+                                            // copy-mode path above.
+                                            client_copy_mode = true;
+                                            copy_drag_pane = Some((pane_id, pane_rect));
+                                            copy_drag_last = Some((cur_col, cur_row));
+                                            copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                                            rsel_start = None;
+                                            rsel_end = None;
+                                            rsel_pane_rect = None;
+                                            rsel_pane_id = None;
+                                            rsel_block = false;
+                                            rsel_dragged = false;
+                                            selection_changed = true;
+                                        } else {
+                                            let (col, row) = if client_pwsh_selection {
+                                                if let Some(r) = rsel_pane_rect {
+                                                    (
+                                                        me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
+                                                        me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
+                                                    )
+                                                } else {
+                                                    (me.column, me.row)
+                                                }
                                             } else {
                                                 (me.column, me.row)
+                                            };
+                                            // Ignore micro-drags that stay on the
+                                            // initial click cell (#199 parity).
+                                            if (col, row) == start && !rsel_dragged {
+                                                // no-op
+                                            } else {
+                                                rsel_end = Some((col, row));
+                                                rsel_dragged = true;
+                                                selection_changed = true;
                                             }
-                                        } else {
-                                            (me.column, me.row)
-                                        };
-                                        // Ignore micro-drags that stay on the
-                                        // initial click cell (#199 parity).
-                                        if (col, row) == start && !rsel_dragged {
-                                            // no-op
-                                        } else {
-                                            rsel_end = Some((col, row));
-                                            rsel_dragged = true;
-                                            selection_changed = true;
                                         }
                                     }
                                 }
                             }
                             MouseEventKind::Drag(MouseButton::Right) => {}
                             MouseEventKind::Up(MouseButton::Left) => {
-                                if border_drag {
+                                if let Some((pane_id, pane_rect, down_route, drag_route, _, in_copy_drag)) = pane_gesture.take() {
+                                    let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = me.row as i16 - inner.y as i16;
+                                    deferred_left_click = None;
+                                    if in_copy_drag || (client_copy_mode && down_route == 'B') {
+                                        // The end of a copy-mode drag: the server looks
+                                        // up MouseDragEnd1Pane.
+                                        cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n", pane_id, rel_col, rel_row));
+                                    } else if down_route == 'F' || drag_route == 'F' || down_route == 'B' {
+                                        // Unbound (or the built-in press): the release
+                                        // goes to the program if it wants the mouse.
+                                        cmd_batch.push(format!("mouse-forward {} 0 {} {} m\n", pane_id, rel_col.max(0), rel_row.max(0)));
+                                    }
+                                } else if border_drag_route.take().is_some() {
+                                    deferred_left_click = None;
+                                } else if border_drag {
+                                    deferred_left_click = None;
                                     cmd_batch.push(format!("split-resize-done\n"));
                                     border_drag = false;
                                     client_drag = None;
+                                } else if rsel_dragged && !drag_end_default
+                                    && rsel_start.is_some() && rsel_pane_rect.is_some() && rsel_pane_id.is_some()
+                                {
+                                    // MouseDragEnd1Pane is not the built-in copy and
+                                    // leave (unbound or rebound in the copy-mode
+                                    // table). In tmux this drag is a copy-mode
+                                    // selection (MouseDrag1Pane -> copy-mode -M), so
+                                    // hand it to server copy mode and report the
+                                    // release there: the binding decides, and
+                                    // unbound the selection stays.
+                                    let start = rsel_start.unwrap();
+                                    let pane_rect = rsel_pane_rect.unwrap();
+                                    let pane_id = rsel_pane_id.unwrap();
+                                    let end = if client_pwsh_selection {
+                                        rsel_end.unwrap_or((me.column, me.row))
+                                    } else {
+                                        (me.column, me.row)
+                                    };
+                                    let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                    let (a_col, a_row) = (start.0 as i16 - pane_rect.x as i16, start.1 as i16 - inner.y as i16);
+                                    let (e_col, e_row) = (end.0 as i16 - pane_rect.x as i16, end.1 as i16 - inner.y as i16);
+                                    cmd_batch.push(format!("copy-drag-begin {} {} {} {} {}{}\n",
+                                        pane_id, a_col, a_row, e_col, e_row, if rsel_block { " b" } else { "" }));
+                                    cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n", pane_id, e_col, e_row));
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_pane_rect = None;
+                                    rsel_pane_id = None;
+                                    rsel_block = false;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                    deferred_left_click = None;
                                 } else if rsel_dragged {
                                     if client_pwsh_selection {
                                         // tmux-like copy-on-release for
@@ -4096,7 +7979,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -4107,6 +7990,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
@@ -4121,7 +8005,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     false,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -4132,33 +8016,131 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
                                     }
+                                    deferred_left_click = None;
                                 } else {
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     selection_changed = true;
-                                    if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                    if let Some((pane_id, down_col, down_row)) = deferred_left_click.take() {
+                                        let (up_col, up_row) = client_pane_rects.iter()
+                                            .find(|(id, _)| *id == pane_id)
+                                            .map(|(_, pane_rect)| {
+                                                let inner = pane_content_inner(
+                                                    *pane_rect,
+                                                    &client_border_status,
+                                                    &client_border_format,
+                                                );
+                                                (
+                                                    (me.column as i16 - pane_rect.x as i16)
+                                                        .max(0)
+                                                        .min(pane_rect.width.saturating_sub(1) as i16),
+                                                    (me.row as i16 - inner.y as i16)
+                                                        .max(0)
+                                                        .min(inner.height.saturating_sub(1) as i16),
+                                                )
+                                            })
+                                            .unwrap_or((down_col, down_row));
+                                        cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
+                                            pane_id, down_col, down_row));
+                                        cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
+                                            pane_id, up_col, up_row));
+                                    } else if client_copy_mode {
+                                        // Send the release to the pane the drag started in,
+                                        // even when the pointer ends outside its rect — the
+                                        // server clamps and finalizes the yank.
+                                        let target = copy_drag_pane.or_else(|| {
+                                            client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r))
+                                        });
+                                        if let Some((pane_id, pane_rect)) = target {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
-                                            cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
-                                                pane_id, rel_col, rel_row));
+                                            let rel_row = me.row as i16 - inner.y as i16;
+                                            // The gutter this pane is painted
+                                            // with, from the same three inputs
+                                            // the renderer uses.
+                                            let gutter = crate::copy_line_numbers::gutter_width(
+                                                client_copy_ln.0, client_copy_ln.1, inner.height as usize) as u16;
+                                            // The final motion may have been applied by the
+                                            // server (and written into a frame) without ever
+                                            // being drawn: re-report the endpoint that is
+                                            // actually on screen before reporting the button
+                                            // up, or the yank adds a character the user never
+                                            // saw highlighted (`copy_release_commands`).
+                                            if client_log_enabled() {
+                                                client_log("repin", &format!(
+                                                    "pane={} painted={:?} release=({},{}) dragged={}",
+                                                    pane_id, client_drawn_sel, rel_col, rel_row, copy_drag_last.is_some()
+                                                ));
+                                            }
+                                            for cmd in copy_release_commands(
+                                                pane_id, copy_drag_last.is_some(), client_drawn_sel, (rel_col, rel_row),
+                                                gutter, pane_rect.width,
+                                            ) {
+                                                cmd_batch.push(cmd);
+                                            }
                                         }
                                     } else {
                                         cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
                                     }
                                 }
+                                // The drag gesture is over in every branch above.
+                                copy_drag_pane = None;
+                                copy_mode_drag_pending = None;
+                                copy_drag_last = None;
+                                copy_drag_repeat_at = None;
                             }
-                            MouseEventKind::Up(MouseButton::Right) => {}
+                            MouseEventKind::Up(MouseButton::Right) => {
+                                // With MouseDown3Pane unbound the press went to the
+                                // program (tmux forward_key); so does the release
+                                // (MouseUp3Pane, unbound by default in tmux too).
+                                if mouse_route(&mouse_overrides, &routed_name(&mouse_overrides, "MouseDown3Pane", me.modifiers), client_copy_mode) == 'F' {
+                                    if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
+                                        r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                    }) {
+                                        let rel_col = me.column as i16 - pane_rect.x as i16;
+                                        let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                        cmd_batch.push(format!("mouse-forward {} 2 {} {} m\n", pane_id, rel_col, rel_row));
+                                    }
+                                }
+                            }
                             MouseEventKind::Up(MouseButton::Middle) => {}
                             MouseEventKind::Moved => {
+                                // A bare motion event means the left button is no longer
+                                // held.  If a copy-mode drag was being tracked, its release
+                                // was swallowed (e.g. it happened outside the terminal
+                                // window): finalize the gesture with a synthetic release so
+                                // the selection yanks, and stop the auto-scroll repeat.
+                                if copy_drag_pane.is_some() {
+                                    if client_copy_mode {
+                                        if let (Some((pane_id, pane_rect)), Some((rc, rr))) = (copy_drag_pane, copy_drag_last) {
+                                            // Same re-pin as the normal release: the
+                                            // synthetic release must not finalize a cell
+                                            // that was never painted either.
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                            let gutter = crate::copy_line_numbers::gutter_width(
+                                                client_copy_ln.0, client_copy_ln.1, inner.height as usize) as u16;
+                                            for cmd in copy_release_commands(
+                                                pane_id, true, client_drawn_sel, (rc, rr), gutter, pane_rect.width,
+                                            ) {
+                                                cmd_batch.push(cmd);
+                                            }
+                                        }
+                                    }
+                                    copy_drag_pane = None;
+                                    copy_drag_last = None;
+                                    copy_drag_repeat_at = None;
+                                    copy_mode_drag_pending = None;
+                                }
                                 // Detect border hover for visual preview
                                 let mut new_hover: Option<(u16, String, Rect)> = None;
                                 if !client_zoomed {
@@ -4186,7 +8168,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
                                     let rel_col = me.column as i16 - pane_rect.x as i16;
-                                    let rel_row = me.row as i16 - pane_rect.y as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                     cmd_batch.push(format!("pane-mouse {} 35 {} {} M\n",
                                         pane_id, rel_col, rel_row));
                                 } else {
@@ -4198,12 +8180,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 rsel_end = None;
                                 rsel_dragged = false;
                                 selection_changed = true;
-                                if let Some(&(pane_id, _)) = client_pane_rects.iter().find(|(_, r)| {
+                                if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
-                                    cmd_batch.push(format!("pane-scroll {} up\n", pane_id));
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                    // The held modifiers travel as tmux's mouse mask so the server
+                                    // can look up C-WheelUpPane and friends.
+                                    cmd_batch.push(format!("pane-scroll {} up {} {} {}\n", pane_id, rel_col, rel_row,
+                                        crate::mouse_keys::sgr_mod_bits(me.modifiers)));
                                 } else {
-                                    cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row));
+                                    // Over the status line the server looks up
+                                    // WheelUpStatus; the trailing mask and `S` are
+                                    // ignored by an older server.
+                                    let on_status = client_status_rows > 0
+                                        && me.row >= client_status_row
+                                        && me.row < client_status_row.saturating_add(client_status_rows);
+                                    cmd_batch.push(format!("scroll-up {} {} {}{}\n", me.column, me.row,
+                                        crate::mouse_keys::sgr_mod_bits(me.modifiers), if on_status { " S" } else { "" }));
                                 }
                             }
                             MouseEventKind::ScrollDown => {
@@ -4211,12 +8205,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 rsel_end = None;
                                 rsel_dragged = false;
                                 selection_changed = true;
-                                if let Some(&(pane_id, _)) = client_pane_rects.iter().find(|(_, r)| {
+                                if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
-                                    cmd_batch.push(format!("pane-scroll {} down\n", pane_id));
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                    cmd_batch.push(format!("pane-scroll {} down {} {} {}\n", pane_id, rel_col, rel_row,
+                                        crate::mouse_keys::sgr_mod_bits(me.modifiers)));
                                 } else {
-                                    cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row));
+                                    let on_status = client_status_rows > 0
+                                        && me.row >= client_status_row
+                                        && me.row < client_status_row.saturating_add(client_status_rows);
+                                    cmd_batch.push(format!("scroll-down {} {} {}{}\n", me.column, me.row,
+                                        crate::mouse_keys::sgr_mod_bits(me.modifiers), if on_status { " S" } else { "" }));
                                 }
                             }
                             _ => {}
@@ -4227,11 +8228,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     }
                     Event::FocusLost => {
                         cmd_batch.push("focus-out\n".into());
+                        // No more mouse events will arrive; don't keep
+                        // auto-scrolling a copy-mode drag on the timer alone.
+                        copy_drag_repeat_at = None;
                     }
                     _ => {}
                 }
                 if quit { break; }
-                _pending_evt = input.try_read()?;
+                _pending_evt = match redispatch_evt.take() {
+                    Some(evt) => Some(evt),
+                    None => input.try_read()?,
+                };
             }
         }
         if quit { break; }
@@ -4253,17 +8260,38 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // paste even though the user explicitly disabled paste detection.
         #[cfg(windows)]
         {
+            // The clipboard head is only consulted for a buffer that is still
+            // short enough to be a candidate, so an ordinary keystroke costs
+            // one GetClipboardSequenceNumber and a prefix compare.
+            let evidence = if paste_detection_enabled
+                && !paste_pend.is_empty()
+                && paste_pend.len() <= 2
+                && !paste_confirmed
+                && !paste_stage2
+            {
+                PasteHeadEvidence {
+                    gesture_open: paste_gesture.is_open(),
+                    clip_head: paste_clip_head.get(),
+                    held_for: paste_pend_start.map(|s| s.elapsed()).unwrap_or_default(),
+                    shifted_head: paste_head_shifted,
+                    head_released: paste_head_released || !key_releases_seen || !release_shape_is_evidence,
+                }
+            } else {
+                PasteHeadEvidence::default()
+            };
             if should_zero_latency_flush_paste_pend(
                 &paste_pend,
                 paste_detection_enabled,
                 paste_confirmed,
                 paste_stage2,
+                evidence,
             ) {
                 if input_log_enabled() {
                     input_log("paste", &format!(
                         "zero-latency flush {} char(s) as typing",
                         paste_pend.len()));
                 }
+                paste_gesture.record(&paste_pend);
                 for c in paste_pend.chars() {
                     match c {
                         '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -4281,6 +8309,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
                 paste_pend.clear();
                 paste_pend_start = None;
+                paste_head_logged = false;
+            } else if !paste_pend.is_empty()
+                && paste_pend.len() <= 2
+                && paste_detection_enabled
+                && !paste_confirmed
+                && !paste_stage2
+            {
+                if !paste_head_logged && input_log_enabled() {
+                    // Name the rule that held it.  A newline or tab is held by
+                    // the rule that predates the paste head (they never take
+                    // the zero latency path); calling that "head of a paste"
+                    // with two falses after it read as a contradiction (#684).
+                    let gesture = evidence.gesture_open;
+                    let prefix = evidence.clipboard_starts_with(&paste_pend);
+                    let shifted = evidence.shifted_head && paste_pend.chars().count() == 1;
+                    let why = if gesture || prefix || shifted {
+                        format!("head of a paste (ctrl-v gesture={}, clipboard prefix={}, shifted head={})", gesture, prefix, shifted)
+                    } else {
+                        "newline or tab never takes the zero latency path".to_string()
+                    };
+                    input_log("paste", &format!(
+                        "holding {} char(s): {}", paste_pend.len(), why));
+                    paste_head_logged = true;
+                }
+            } else {
+                paste_head_logged = false;
             }
         }
 
@@ -4294,8 +8348,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
                         paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                 }
-                let encoded = base64_encode(&paste_pend);
-                cmd_batch.push(format!("send-paste {}\n", encoded));
+                paste_gesture.record(&paste_pend);
+                // A prompt the client draws itself keeps the paste, the way an
+                // Event::Paste already does (#290). Sending it to the pane as
+                // well is #744: the text showed up on the shell's command line
+                // behind the prompt.
+                let consumed = route_paste_to_overlay(
+                    &paste_pend,
+                    command_input, &mut command_buf, command_back,
+                    renaming, &mut rename_buf,
+                );
+                if !consumed {
+                    let encoded = base64_encode(&paste_pend);
+                    cmd_batch.push(format!("send-paste {}\n", encoded));
+                }
                 paste_pend.clear();
                 paste_pend_start = None;
                 paste_stage2 = false;
@@ -4303,21 +8369,47 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 // Suppress subsequent char accumulation and clipboard-read
                 // fallback — the paste was already delivered.
                 paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                paste_gesture.finish();
             } else if paste_confirmed && paste_pend.is_empty() {
                 // Ctrl+V Release with no buffered chars.  If paste was
                 // already sent via stage2 timeout or Event::Paste, the
                 // suppress window prevents a redundant clipboard read.
                 let suppressed = paste_suppress_until
-                    .map_or(false, |t| Instant::now() < t);
+                    .map_or(false, |t| Instant::now() < t)
+                    || paste_fallback_suppress_until.map_or(false, |t| Instant::now() < t);
                 if !suppressed {
                     // No recent paste — read clipboard as fallback
                     if let Some(text) = read_from_system_clipboard() {
-                        if !text.is_empty() {
+                        if paste_gesture.blocks(&text) {
+                            // The same text already went out as a burst of
+                            // characters for this very Ctrl+V; reading the
+                            // clipboard again here is the duplicate paste.
+                            if input_log_enabled() {
+                                input_log("paste", &format!(
+                                    "paste CONFIRMED (no buffer): dropping read-back duplicate of {} char(s)",
+                                    text.len()));
+                            }
+                            // The delivery already happened, so keep a phantom
+                            // Release from reading the clipboard again.
+                            paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                        } else if !text.is_empty() {
                             if input_log_enabled() {
                                 input_log("paste", &format!("paste CONFIRMED (no buffer), clipboard read len={}", text.len()));
                             }
-                            let encoded = base64_encode(&text);
-                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                            // Same rule as the branch above: an open prompt
+                            // keeps it, and only a pane gets send-paste
+                            // (#744). This is the path that reaches a prompt
+                            // when the characters never arrived as key events
+                            // at all.
+                            let consumed = route_paste_to_overlay(
+                                &text,
+                                command_input, &mut command_buf, command_back,
+                                renaming, &mut rename_buf,
+                            );
+                            if !consumed {
+                                let encoded = base64_encode(&text);
+                                cmd_batch.push(format!("send-paste {}\n", encoded));
+                            }
                             // Suppress subsequent char accumulation — the
                             // clipboard chars may arrive later (async inject)
                             // and would cause a duplicate paste via stage2.
@@ -4326,6 +8418,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     }
                 }
                 paste_confirmed = false;
+                paste_gesture.finish();
             }
         }
 
@@ -4339,14 +8432,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 last_sent_size = new_size;
                 size_changed = true;
                 if writer.write_all(format!("client-size {} {}\n", new_size.0, new_size.1).as_bytes()).is_err() {
-                    break; // Connection lost
+                    // Not an exit (issue #675): the socket is stale, the
+                    // reconnect owns what happens next.
+                    on_connection_lost(&mut reconnect_pending, &mut quit, &path, &addr, &session_key, "client-size write failed");
                 }
-                // SSH: re-send mouse-enable on resize — terminal may reset
-                // mouse reporting mode after a window size change.
-                if is_ssh_mode {
-                    crate::ssh_input::send_mouse_enable();
-                    last_mouse_enable = Instant::now();
-                }
+                // Re-send mouse-enable on resize — the terminal may reset
+                // mouse reporting after a window size change.  A resize is
+                // the known trigger for Windows Terminal dropping a local
+                // client's mouse registration, so this runs in every input
+                // mode (the keepalive routes per mode), not just SSH.
+                crate::ssh_input::send_mouse_keepalive();
+                last_mouse_enable = Instant::now();
             }
         }
 
@@ -4368,6 +8464,48 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             cmd_batch.push("prefix-end\n".into());
         }
 
+        // tmux's click timer ran out after a second status line press:
+        // DoubleClick1Status.
+        if let Some((count, end, ref target, col, row)) = status_clicks {
+            if Instant::now() >= end {
+                if count == 2 && mouse_route(&mouse_overrides, "DoubleClick1Status", client_copy_mode) == 'U' {
+                    cmd_batch.push(format!("mouse-key DoubleClick1Status {} {} {} 0\n", target, col, row));
+                }
+                status_clicks = None;
+            }
+        }
+
+        // ── Copy-mode drag auto-scroll repeat ──────────────────────────
+        // While the left button is held with the pointer dwelling at/past
+        // the top or bottom row of the copy-mode pane, re-send the last drag
+        // position every 50ms so the server keeps scrolling the view (tmux
+        // repeats its drag timer at the same cadence).  The state clears on
+        // mouse-up / bare motion / focus loss; gating on client_copy_mode
+        // also pauses the repeat harmlessly if a stale dump briefly flips
+        // the flag right after a normal-mode handoff.
+        if client_copy_mode {
+            if let (Some((pane_id, _)), Some((rc, rr)), Some(due)) =
+                (copy_drag_pane, copy_drag_last, copy_drag_repeat_at)
+            {
+                if Instant::now() >= due {
+                    cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n", pane_id, rc, rr));
+                    copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                }
+            }
+        }
+
+        // A prompt the server asked for has closed (answered or cancelled,
+        // whichever arm closed it): say so after the command it ran, so a
+        // waiting `psmux command-prompt` returns once that command has run
+        // (#789 follow up).
+        if !command_input {
+            if let Some(id) = command_request_id.take() {
+                prompt_done_pending.push(id);
+            }
+        }
+        for id in prompt_done_pending.drain(..) {
+            cmd_batch.push(format!("prompt-done {}\n", id));
+        }
         // Send all batched commands immediately — keys reach the server
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
@@ -4383,46 +8521,86 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
             let _ = writer.flush(); // push keys to server NOW
-            last_key_send_time = Some(Instant::now());
-            key_send_instant = Some(Instant::now());
-            // Force immediate dump-state so we start the echo-detection
-            // polling chain right away (eliminates 0-10ms initial wait).
-            force_dump = true;
+            if crate::pty_trace::on() {
+                for cmd in &cmd_batch {
+                    crate::pty_trace::mark("x", 0, cmd.trim_end().as_bytes());
+                }
+            }
+            // #604: a batch that is nothing but bare pointer motion is not a
+            // keystroke.  It produces no echo to chase, and when no pane is
+            // tracking motion it changes no server state at all, so neither the
+            // typing fast-poll nor an immediate dump-state is warranted.
+            // Treating every pointer sample as a keystroke pulled a full state
+            // frame (~12 KB) and repainted the whole screen at pointer-motion
+            // rate, which is what the reporter saw as the cursor flickering
+            // while the mouse merely moved.  If the motion DOES reach an app,
+            // the server pushes the resulting output frame on its own (see the
+            // "Server auto-pushes frames when state changes" note below).
+            let only_bare_motion = cmd_batch.iter().all(|c| is_bare_motion_cmd(c));
+            if !only_bare_motion {
+                last_key_send_time = Some(Instant::now());
+                key_send_instant = Some(Instant::now());
+                // Force immediate dump-state so we start the echo-detection
+                // polling chain right away (eliminates 0-10ms initial wait).
+                force_dump = true;
+            }
         }
 
         // ── STEP 2b: Request screen update (non-blocking) ────────────────
         // Rate-limit dump-state requests to avoid flooding the server.
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
-        let overlays_active = command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
-        let should_dump = if force_dump || size_changed {
-            true
-        } else if typing_active {
-            since_dump >= 10  // ~100fps cap when typing (matches poll_ms)
-        } else {
-            // Server auto-pushes frames when state changes (PTY output,
-            // new window, etc.) — no idle dump-state polling needed.
-            // This saves CPU + bandwidth: no 50-100KB JSON roundtrips
-            // when the client is just sitting idle.
-            false
-        };
-        if should_dump && !dump_in_flight {
-            if writer.write_all(b"dump-state\n").is_err() { break; }
-            if writer.flush().is_err() { break; }
+        let overlays_active = command_input || renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
+        // An overlay that closes without the server changing anything (n at
+        // `kill-pane? (y/n)`, Escape out of a prompt) leaves no new frame to
+        // draw, and the skip checks below used to `continue` on exactly that
+        // pass, so the closed box stayed painted on screen and read as a
+        // question still waiting for an answer (#767). The pass that sees the
+        // overlay go away renders once more to wipe it.
+        let overlay_closed = prev_overlays_active && !overlays_active;
+        prev_overlays_active = overlays_active;
+        let should_dump = should_request_dump(force_dump, size_changed, typing_active, since_dump);
+        // A failed request here is NOT the end of the client (issue #675).
+        // The reader thread may have just noticed the same drop and started a
+        // reconnect; breaking out returned Ok from run_remote and the process
+        // exited 0 with that reconnect still in flight. The stale socket is
+        // handed to the same handler and the loop keeps going until the
+        // reconnect is applied or gives up.
+        let dump_request_ok = should_dump && !dump_in_flight
+            && !(writer.write_all(b"dump-state\n").is_err() || writer.flush().is_err());
+        if should_dump && !dump_in_flight && !dump_request_ok {
+            on_connection_lost(&mut reconnect_pending, &mut quit, &path, &addr, &session_key, "dump-state write failed");
+        }
+        if dump_request_ok {
             dump_in_flight = true;
             dump_flight_start = Instant::now();
+            // The force is SPENT here, on the request it asked for, not at the
+            // bottom of the loop. Every early `continue` below (no frame this
+            // iteration, a frame identical to the last one, a frame that failed
+            // to parse) skips that bottom, so a latched `force_dump` made this
+            // block fire again on the very next iteration, and again, at socket
+            // round trip rate. The server answers "NC" in 2 bytes, which is why
+            // it never showed up as traffic, but it is a request/reply spin
+            // across two processes: measured at an idle pwsh prompt with a
+            // settled screen, 187 dump-state/NC pairs per second for a screen
+            // that had not changed in eight seconds, and it drags the server's
+            // process table walk along behind it because every dump-state runs
+            // the automatic-rename check. Clearing the flag on the request keeps
+            // its meaning ("send one dump-state now") and makes idle silent:
+            // tests/test_idle_socket_traffic.ps1 cell 2 pins it.
+            force_dump = false;
         }
 
         // ── STEP 3: Render if we have a frame ────────────────────────────
         // Also render if selection changed (for highlight overlay) even without new frame
         // Always render when overlays are active (command prompt, rename, choosers)
-        if !got_frame && !selection_changed && !overlays_active {
+        if !got_frame && !selection_changed && !overlays_active && !overlay_closed {
             continue;
         }
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
-        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active {
+        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active && !overlay_closed {
             last_dump_time = Instant::now();
             continue;
         }
@@ -4440,6 +8618,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
         };
         let _parse_us = _t_parse.elapsed().as_micros();
+        crate::pty_trace::mark_plain("q", frame_to_parse.len());
         if client_log_enabled() {
             client_log("parse", &format!("OK in {}us, {} windows", _parse_us, state.windows.len()));
         }
@@ -4450,12 +8629,38 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         if let Some(aw) = windows.iter().find(|w| w.active) {
             active_window_name = aw.name.clone();
         }
+        // Same reason as the window name above: the rename overlay and `#S`
+        // open on it, so it has to be the name the session has now.
+        if let Some(sn) = state.session_name {
+            // The base follows the name here and nowhere earlier. The server
+            // writes the new .port before it changes the name it sends, so a
+            // frame with the new name never arrives before the file moved,
+            // and a rename it refuses (`duplicate session`) never changes the
+            // name it sends at all.
+            let base = session_base_after_rename(own_namespace.as_deref(), &current_session, &sn);
+            if base != current_session {
+                current_session = base;
+                activity_name = if crate::session::is_warm_session(&current_session) {
+                    None
+                } else {
+                    Some(current_session.clone())
+                };
+                // The switch loop in main.rs reads this as the session being
+                // left, for `switch-client -l` (issue #566).
+                env::set_var("PSMUX_SESSION_NAME", &current_session);
+            }
+            session_label = sn;
+        }
         last_tree = state.tree;
         let base_index = state.base_index;
-        client_base_index = base_index;
         client_copy_mode = active_pane_in_copy_mode(&root);
+        if !client_copy_mode {
+            // The painted selection went away with copy mode.
+            client_drawn_sel = None;
+        }
         client_pwsh_selection = state.pwsh_mouse_selection;
         client_mouse_selection = state.mouse_selection;
+        client_mouse_selection_force = state.mouse_selection_force;
         #[cfg(windows)]
         { paste_detection_enabled = state.paste_detection; }
         choose_tree_preview_default = state.choose_tree_preview;
@@ -4464,9 +8669,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         clock_active = state.clock_mode;
         clock_colour_str = state.clock_colour;
         let state_cursor_style_code = state.cursor_style_code;
+        let state_cursor_blink_mode = state.cursor_blink_mode;
         // Server-side overlay state (update persistent variables)
+        srv_floats = state.floats;
         srv_popup_active = state.popup_active;
-        srv_popup_command = state.popup_command.unwrap_or_default();
+        srv_popup_frame = crate::popup::PopupFrame::new(
+            &state.popup_title,
+            state.popup_border_lines.as_deref().unwrap_or("single"),
+            state.popup_border_style.as_deref().unwrap_or(crate::popup::DEFAULT_POPUP_BORDER_STYLE),
+            &state.popup_style,
+        );
         srv_popup_width = state.popup_width.unwrap_or(80);
         srv_popup_height = state.popup_height.unwrap_or(24);
         srv_popup_lines = state.popup_lines;
@@ -4477,8 +8689,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             srv_popup_scroll = 0;
         }
         srv_popup_has_pty = new_popup_has_pty;
+        // A PTY popup owns the cursor while it is up; a static popup has no
+        // editable cursor and must not steal it from the pane underneath.
+        srv_popup_cursor = match (srv_popup_active && new_popup_has_pty && !state.popup_hide_cursor,
+                                  state.popup_cursor_col, state.popup_cursor_row) {
+            (true, Some(cc), Some(cr)) => Some((cc, cr)),
+            _ => None,
+        };
         srv_confirm_active = state.confirm_active;
         srv_confirm_prompt = state.confirm_prompt.unwrap_or_default();
+        // A prompt the server asked THIS client to open (by process id; 0 is
+        // any client). Each id opens once, though it rides in every frame
+        // until the prompt closes. A client that already has a prompt or an
+        // overlay up drops it, as tmux drops a prompt for a client that has
+        // one (cmd-command-prompt.c:93), and says so at once so a waiting
+        // command line is not left hanging.
+        srv_prompt_open = state.status_cursor.is_some();
+        if let Some(req) = state.prompt_request {
+            if req.id > last_prompt_request_id && (req.pid == 0 || req.pid == std::process::id()) {
+                last_prompt_request_id = req.id;
+                let busy = command_input || renaming
+                    || tree_chooser || buffer_chooser || session_chooser || keys_viewer
+                    || confirm_cmd.is_some();
+                if busy {
+                    prompt_done_pending.push(req.id);
+                } else {
+                    open_command_prompt!(req.prompts, req.template, req.key, req.single, req.numeric, req.search);
+                    command_request_id = Some(req.id);
+                }
+            }
+        }
         srv_menu_active = state.menu_active;
         srv_menu_title = state.menu_title.unwrap_or_default();
         srv_menu_selected = state.menu_selected;
@@ -4511,6 +8751,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // which causes rapid cursor flicker during high-frequency
         // output (e.g. opencode streaming).
         let mut post_draw_cursor: Option<(u16, u16)> = None; // pane-local (col, row)
+        let mut post_draw_park: Option<(u16, u16)> = None; // hidden cursor, pane-local (col, row)
         {
             fn active_cursor_info(node: &LayoutJson) -> Option<(bool, u16, u16, bool)> {
                 match node {
@@ -4525,27 +8766,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             if let Some((hide, cr, cc, copy)) = active_cursor_info(&root) {
                 if !hide && !clock_active && !copy {
                     post_draw_cursor = Some((cc, cr));
+                } else if hide && !clock_active && !copy {
+                    post_draw_park = Some((cc, cr));
                 }
             }
         }
 
-        // ── OSC 52: propagate server-side clipboard to local terminal ────
-        // When the server copies text (yank_selection / copy mode),
-        // it includes a one-shot clipboard_osc52 field in the dump.
-        // Buffer for emission after terminal.draw() to avoid corrupting
-        // ratatui's output.
-        if let Some(ref clip_b64) = state.clipboard_osc52 {
-            if let Some(clip_text) = crate::util::base64_decode(clip_b64) {
-                // Also set the local Win32 clipboard for non-SSH scenarios
-                copy_to_system_clipboard(&clip_text);
-                pending_osc52 = Some(clip_text);
-            }
-        }
-
-        // ── Audible bell: forward BEL to host terminal ──────────────
-        if state.bell {
-            pending_bell = true;
-        }
+        // The server's one-shot clipboard_osc52 and bell were taken off the
+        // frame and written when it arrived (see the drain above), so
+        // `state` never carries them.
 
         // ── set-titles: capture host title for post-draw OSC 0 emit ──
         // The server has already expanded set-titles-string, so we
@@ -4558,9 +8787,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
-            if let Some((kc, km)) = parse_key_string(prefix_str) {
-                if (kc, km) != prefix_key {
-                    prefix_key = (kc, km);
+            if prefix_str.eq_ignore_ascii_case("none") {
+                prefix_key = None;
+                prefix_raw_char = None;
+            } else if let Some((kc, km)) = parse_key_string(prefix_str) {
+                if Some((kc, km)) != prefix_key {
+                    prefix_key = Some((kc, km));
                     // Compute raw control character for Ctrl+<letter> prefix
                     prefix_raw_char = if km.contains(KeyModifiers::CONTROL) {
                         if let KeyCode::Char(c) = kc {
@@ -4606,9 +8838,26 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             synced_bindings = state.bindings;
         }
         defaults_suppressed = state.defaults_suppressed;
+        // A table the server set without this client (CLI, command prompt,
+        // run-shell, hook) becomes the client's latch for the next key.
+        key_table_sync.set_default(state.default_key_table.as_deref());
+        if let Some(adopt) = key_table_sync.on_server_table(state.key_table.as_deref()) {
+            key_table_latch = adopt;
+        }
         scroll_enter_copy_mode = state.scroll_enter_copy_mode;
+        mouse_drag_enter_copy_mode = state.mouse_drag_enter_copy_mode;
+        ctrl_wheel_zoom = state.ctrl_wheel_zoom;
+        drag_end_default = state.drag_end_default;
+        if mouse_overrides != state.mouse_overrides { mouse_overrides.clone_from(&state.mouse_overrides); }
+        client_copy_ln = (
+            crate::copy_line_numbers::CopyLnMode::parse(
+                state.copy_mode_line_numbers.as_deref()
+                    .unwrap_or(crate::copy_line_numbers::DEFAULT)),
+            state.copy_hsize,
+        );
         // Sync repeat-time from server
         repeat_time_ms = state.repeat_time;
+        crate::ssh_input::set_escape_time(state.escape_time);
         // Sync bold-is-bright (issue #425) into the console writer's atomic.
         // The writer lives in this client process, so the server-side option
         // value must be pushed here for the rewrite toggle to take effect.
@@ -4637,6 +8886,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         }
         // `image_blob_cache` and `sixel_enabled` are consumed by the post-draw
         // sixel emit block (M6) below.
+        // Sync codepoint-widths into this process's width table, for the same
+        // reason as bold-is-bright above: the status line, tab bar, pane
+        // labels and float titles are measured and drawn HERE, so the client
+        // has to resolve character widths exactly as the server's emulator
+        // does or the two disagree and cells strand. Rebuilding the table is
+        // O(entries), so only do it when the value actually changed rather
+        // than on every render frame.
+        let codepoint_widths = state
+            .client_render_options
+            .codepoint_widths
+            .as_deref()
+            .unwrap_or(&[]);
+        if codepoint_widths != last_codepoint_widths.as_slice() {
+            vt100::set_codepoint_widths(codepoint_widths);
+            last_codepoint_widths = codepoint_widths.to_vec();
+        }
+        // Issue #700: the first frame decides the host screen. The server's
+        // `terminal-overrides` ride on it, and `smcup@` for this client's TERM
+        // keeps the host terminal on its main screen. A no-op after the first.
+        crate::terminal_overrides::client_screen_start(
+            terminal.backend_mut(),
+            state.client_render_options.terminal_overrides.as_deref().unwrap_or(&[]),
+        );
+        if let Some(seps) = state.client_render_options.word_separators.as_ref() {
+            word_separators.clone_from(seps);
+        }
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             // Pass full string — visual truncation is handled by ratatui
@@ -4654,32 +8929,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // If server's status_lines changed, re-send client-size with the
         // correct content-area height so the server's pane rects match the
         // client's render area exactly.
-        let new_sl = (status_lines as u16).max(1);
+        let new_sl = status_rows_reserved(state.status_visible, state.status_lines);
         if new_sl != last_status_lines {
             last_status_lines = new_sl;
             // Force a client-size re-send on the next iteration
-            last_sent_size = (0, 0);
+            last_sent_size = SIZE_NOT_REPORTED;
         }
         let status_format = state.status_format;
-        // Update pane border styles
-        if let Some(ref pbs) = state.pane_border_style {
-            if !pbs.is_empty() {
-                let (fg, _bg, _bold) = parse_tmux_style_components(pbs);
-                if let Some(c) = fg { pane_border_fg = c; }
-            }
-        }
-        if let Some(ref pabs) = state.pane_active_border_style {
-            if !pabs.is_empty() {
-                let (fg, _bg, _bold) = parse_tmux_style_components(pabs);
-                if let Some(c) = fg { pane_active_border_fg = c; }
-            }
-        }
-        if let Some(ref pbhs) = state.pane_border_hover_style {
-            if !pbhs.is_empty() {
-                let (fg, _bg, _bold) = parse_tmux_style_components(pbhs);
-                if let Some(c) = fg { pane_border_hover_fg = c; }
-            }
-        }
+        let pane_border_style = parse_pane_border_colors(
+            state.pane_border_style.as_deref(),
+            pane_border_default_style(false),
+        );
+        let pane_active_border_style = parse_pane_border_colors(
+            state.pane_active_border_style.as_deref(),
+            pane_border_default_style(true),
+        );
+        let pane_border_hover_style =
+            parse_pane_border_hover_style(state.pane_border_hover_style.as_deref());
         // Update window-status-format strings
         if let Some(ref f) = state.wsf { if !f.is_empty() { win_status_fmt = f.clone(); } }
         if let Some(ref f) = state.wscf { if !f.is_empty() { win_status_current_fmt = f.clone(); } }
@@ -4721,7 +8987,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         frame_hyperlinks_clear();
         // Reset sixel image emits collected during this frame's render (#431).
         frame_sixels_clear();
+        // What this draw is about to put on screen.  No input is handled until
+        // this closure returns, so once it has run this is exactly what the
+        // user saw — the value a release must re-report.
+        let drawn_copy_sel = active_copy_sel_end(&root);
+        crate::startup_trace::mark("cli.draw");
+        // Hold the frame's output until the cursor is settled (#697).
+        terminal.backend_mut().begin_frame();
+        // Where an open prompt put its cursor during the draw (#741), so the
+        // post draw settle and the Win32 caret can follow it.
+        let mut prompt_cursor_pos: Option<(u16, u16)> = None;
+        // Whether that prompt was a copy-mode one on the status line, which
+        // the cursor settle has to treat like the client's own prompts.
+        let mut status_prompt_open = false;
         terminal.draw(|f| {
+            client_drawn_sel = drawn_copy_sel;
             let area = f.area();
             let constraints = if status_at_top {
                 vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
@@ -4739,6 +9019,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             client_content_area = content_chunk;
             client_pane_rects.clear();
             collect_pane_rects(&root, content_chunk, &mut client_pane_rects);
+            client_pane_view_offsets.clear();
+            collect_view_offsets(&root, &mut client_pane_view_offsets);
             client_borders.clear();
             let mut border_path = Vec::new();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
@@ -4751,47 +9033,107 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             // when unset/empty (else the label gate skips and the border is blank) (#414).
             let border_format = match state.pane_border_format.as_deref() {
                 Some(s) if !s.is_empty() => s,
-                _ => "#{pane_index} \"#{pane_title}\"",
+                _ => DEFAULT_PANE_BORDER_FORMAT,
             };
+            // Publish for the post-draw cursor and next frame's mouse handlers.
+            client_border_status = border_status.to_string();
+            client_border_format = border_format.to_string();
             // O(N) per frame but pane counts are small in practice (typically < 20).
             let total_panes = if state.zoomed { 1 } else { root.count_leaves() };
-            render_layout_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed, border_status, border_format, total_panes);
-            fix_border_intersections(f.buffer_mut());
-            // render_json and fix_border_intersections can leave inconsistent styles
-            // at intersections and along edges shared by nested splits.
-            if let Some(ar) = active_rect {
-                let buf = f.buffer_mut();
-                let w = buf.area.width as usize;
-                let h = buf.area.height as usize;
-                let border_style = Style::default().fg(pane_border_fg);
-                let active_style = Style::default().fg(pane_active_border_fg);
-                for row in 0..h {
-                    for col in 0..w {
-                        let idx = row * w + col;
-                        if idx >= buf.content.len() { continue; }
-                        let ch = buf.content[idx].symbol().chars().next().unwrap_or(' ');
-                        // Only re-color junction characters. The straight │ and ─ separators
-                        // are now already colored correctly per-cell by render_layout_json based
-                        // on adjacency, so re-coloring them here would clobber that work for
-                        // 3+ pane layouts where a separator borders both active and inactive panes.
-                        if !matches!(ch, '┼' | '├' | '┤' | '┬' | '┴') { continue; }
-                        let x = buf.area.x + col as u16;
-                        let y = buf.area.y + row as u16;
-                        let adj = (x + 1 == ar.x && y >= ar.y && y < ar.y + ar.height)
-                            || (x == ar.x + ar.width && y >= ar.y && y < ar.y + ar.height)
-                            || (y + 1 == ar.y && x >= ar.x && x < ar.x + ar.width)
-                            || (y == ar.y + ar.height && x >= ar.x && x < ar.x + ar.width)
-                            || ((x + 1 == ar.x || x == ar.x + ar.width) && (y + 1 == ar.y || y == ar.y + ar.height));
-                        buf.content[idx].set_style(if adj { active_style } else { border_style });
-                    }
-                }
-            }
+            let bchars = crate::border_lines::border_chars(
+                state.pane_border_lines.as_deref().unwrap_or(crate::border_lines::DEFAULT));
+            // copy-mode-line-numbers: build the gutter render config from the
+            // option value + active pane scrollback size shipped in state.
+            // Built even with the option off: the copy mode position
+            // indicator reads the mode and the scrollback size from it too
+            // (#702). An `Off` mode keeps the gutter at width 0.
+            let copy_ln = {
+                let mode = crate::copy_line_numbers::CopyLnMode::parse(
+                    state.copy_mode_line_numbers.as_deref().unwrap_or(crate::copy_line_numbers::DEFAULT));
+                let (num_style, cur_style) = if mode.is_active() {
+                    (state.copy_mode_line_number_style.as_deref()
+                        .map(crate::style::parse_tmux_style).unwrap_or_else(|| Style::default().fg(Color::DarkGray)),
+                     state.copy_mode_current_line_number_style.as_deref()
+                        .map(crate::style::parse_tmux_style).unwrap_or_else(|| Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+                } else { (Style::default(), Style::default()) };
+                let mut hl = CopyHighlightStyles::default();
+                if let Some(s) = state.copy_mode_match_style.as_deref() { hl.match_style = crate::style::parse_tmux_style(s); }
+                if let Some(s) = state.copy_mode_current_match_style.as_deref() { hl.current_match_style = crate::style::parse_tmux_style(s); }
+                if let Some(s) = state.copy_mode_mark_style.as_deref() { hl.mark_style = crate::style::parse_tmux_style(s); }
+                Some(CopyLnRender {
+                    mode,
+                    hsize: state.copy_hsize,
+                    hide_position: state.copy_hide_position,
+                    num_style,
+                    cur_style,
+                    hl,
+                })
+            };
+            let window_styles = WindowContentStyles {
+                inactive: state.client_render_options.window_style.as_deref()
+                    .filter(|style| !style.is_empty())
+                    .map(crate::style::parse_tmux_style),
+                active: state.client_render_options.window_active_style.as_deref()
+                    .filter(|style| !style.is_empty())
+                    .map(crate::style::parse_tmux_style),
+                // tmux `style.c` reads a `dim=N` percentage out of both window
+                // styles and `tty.c` applies it via `colour_dim` (#619 item 4).
+                inactive_dim: state.client_render_options.window_style.as_deref()
+                    .map(crate::style::parse_style_dim).unwrap_or(0),
+                active_dim: state.client_render_options.window_active_style.as_deref()
+                    .map(crate::style::parse_style_dim).unwrap_or(0),
+            };
+            let floating_pane_focused =
+                srv_floats.iter().any(|float| float.focused);
+            let border_indicators = state
+                .client_render_options
+                .pane_border_indicators
+                .unwrap_or_default();
+            let (tiled_active_rect, tiled_active_border_style) =
+                tiled_border_focus(
+                    active_rect,
+                    pane_border_style,
+                    pane_active_border_style,
+                    floating_pane_focused,
+                );
+            render_layout_json(
+                f, &root, content_chunk, dim_preds, pane_border_style,
+                tiled_active_border_style, clock_active, clock_col, tiled_active_rect,
+                &mode_style_str, state.zoomed, border_status, border_format,
+                total_panes, bchars, copy_ln,
+                window_styles.for_tiled_panes(floating_pane_focused),
+                border_indicators,
+            );
+            let borders = border_geometry_from_layout(
+                &root,
+                content_chunk,
+                f.buffer_mut().area,
+                state.zoomed,
+            );
+            let junctions =
+                fix_border_intersections(f.buffer_mut(), bchars, &borders);
+            recolor_border_junctions(
+                f.buffer_mut(),
+                &junctions,
+                border_indicators
+                    .highlights_active()
+                    .then_some(tiled_active_rect)
+                    .flatten(),
+                pane_border_style,
+                tiled_active_border_style,
+            );
+            draw_pane_border_arrows(
+                f.buffer_mut(),
+                &borders,
+                bchars,
+                tiled_active_rect,
+                border_indicators,
+            );
 
             // Highlight the border under the cursor to preview what a drag would move.
             if let Some((hpos, ref hkind, harea)) = hovered_border {
                 let buf = f.buffer_mut();
                 let w = buf.area.width as usize;
-                let hover_style = Style::default().fg(pane_border_hover_fg);
                 if hkind == "Horizontal" {
                     // Vertical separator line at column hpos, spanning harea's height
                     let col = hpos as usize;
@@ -4799,7 +9141,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         for y in harea.y..harea.y + harea.height {
                             let idx = (y - buf.area.y) as usize * w + (col - buf.area.x as usize);
                             if idx < buf.content.len() {
-                                buf.content[idx].set_style(hover_style);
+                                buf.content[idx].set_style(pane_border_hover_style);
                             }
                         }
                     }
@@ -4810,7 +9152,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         for x in harea.x..harea.x + harea.width {
                             let idx = (row - buf.area.y as usize) * w + (x - buf.area.x) as usize;
                             if idx < buf.content.len() {
-                                buf.content[idx].set_style(hover_style);
+                                buf.content[idx].set_style(pane_border_hover_style);
                             }
                         }
                     }
@@ -4864,12 +9206,34 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             } // !active_pane_in_copy_mode
             } // if let sel_s, sel_e
 
+            // Floating panes (tmux new-pane) are part of the window: they draw
+            // above the tiled layout and BELOW every chooser, prompt and
+            // overlay. They used to be drawn after the client's own overlays
+            // (choose-tree, rename, command prompt, confirm), so a float
+            // covering the middle of the window painted over the centred
+            // `kill-pane? (y/n)` box: prefix x drew nothing while the question
+            // still waited for the next key (#767). tmux draws its prompts and
+            // overlays on top of panes, floating ones included.
+            if !srv_floats.is_empty() {
+                render_float_overlays(
+                    f,
+                    content_chunk,
+                    &srv_floats,
+                    window_styles,
+                    pane_border_style,
+                    pane_active_border_style,
+                    border_indicators,
+                );
+            }
             if session_chooser {
-                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let sel_style = crate::style::parse_tmux_style(&mode_style_str);
+                let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
                 // Popup size: when preview is OFF use the original
                 // pre-#257 dynamic sizing (compact, list-only). When preview
                 // is ON expand to 85x75% so the right-side preview has room.
-                let buffer_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
+                let jump_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
+                let filter_rows: u16 = if session_filter_active { 2 } else { 0 };
+                let buffer_rows = jump_rows.saturating_add(filter_rows);
                 let avail_w = content_chunk.width;
                 let avail_h = content_chunk.height;
                 let (popup_w, popup_h) = if preview_enabled {
@@ -4877,7 +9241,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     let want_h = ((avail_h as u32 * 75) / 100) as u16;
                     (want_w.max(40).min(avail_w), want_h.max(10).min(avail_h))
                 } else {
-                    let sess_h = (session_entries.len() as u16)
+                    let sess_h = (filtered_indices.len() as u16)
                         .saturating_add(2)
                         .saturating_add(buffer_rows)
                         .max(5)
@@ -4899,9 +9263,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-session (digits+enter=jump, enter=switch, x=kill, p=preview, esc=close, drag border to move) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close, drag border to move) "
                 } else {
-                    " choose-session (digits+enter=jump, enter=switch, x=kill, p=preview, esc=close) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -4928,31 +9292,43 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     })
                 } else { None };
 
-                // Reserve the last two inner rows for the jump-buffer indicator
+                // Reserve rows for the active jump and filter indicators.
                 let reserved = buffer_rows as usize;
                 let visible_h = (list_area.height as usize).saturating_sub(reserved);
+                session_page_h = visible_h;
                 if visible_h > 0 && session_selected >= session_scroll + visible_h {
                     session_scroll = session_selected.saturating_sub(visible_h - 1);
                 }
                 if session_selected < session_scroll {
                     session_scroll = session_selected;
                 }
-                let num_width = session_entries.len().to_string().len();
+                let num_width = filtered_indices.len().max(1).to_string().len();
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (sname, info)) in session_entries.iter().enumerate().skip(session_scroll).take(visible_h) {
+                for (visible_idx, entry_idx) in filtered_indices.iter().copied().enumerate().skip(session_scroll).take(visible_h) {
+                    let (sname, info) = &session_entries[entry_idx];
                     let marker = if sname == &current_session { "*" } else { " " };
-                    let row = format!("{:>w$}. {} {}", i + 1, marker, info, w = num_width);
-                    let line = if i == session_selected {
+                    let row = format!("{:>w$}. {} {}", visible_idx + 1, marker, info, w = num_width);
+                    let line = if visible_idx == session_selected {
                         Line::from(Span::styled(row, sel_style))
                     } else {
                         Line::from(row)
                     };
                     lines.push(line);
                 }
+                if filtered_indices.is_empty() && visible_h > 0 {
+                    lines.push(Line::from("(no matching sessions)"));
+                }
                 if !session_num_buffer.is_empty() {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         format!("go to {}", session_num_buffer),
+                        sel_style,
+                    )));
+                }
+                if session_filter_active {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("Filter: {}", session_filter),
                         sel_style,
                     )));
                 }
@@ -4968,7 +9344,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     // Issue #257 follow-up: render the first window of the
                     // highlighted session with its full split layout.
                     let mut rendered = false;
-                    if let Some((sname, _info)) = session_entries.get(session_selected) {
+                    if let Some((sname, _info)) = filtered_indices
+                        .get(session_selected)
+                        .and_then(|idx| session_entries.get(*idx))
+                    {
                         // Resolve first window id via cached list-tree fetch.
                         let lt_key = format!("__lt__\t{}", sname);
                         let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
@@ -4977,7 +9356,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             } else { None }
                         } else { None };
                         let win_id = win_id.or_else(|| {
-                            let port_path = format!("{}\\.psmux\\{}.port", home, sname);
+                            let port_path = crate::paths::port_file(sname);
                             let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
                             let key = crate::session::read_session_key(sname).ok()?;
                             let resp = crate::session::fetch_authed_response_multi(
@@ -4994,16 +9373,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         });
 
                         if let Some(wid) = win_id {
-                            if let Some(layout) = crate::preview::get_or_fetch_dump(
-                                &mut dump_cache, &home, sname, wid,
+                            if let Some(preview_state) = crate::preview::get_or_fetch_preview_window_state(
+                                &mut preview_state_cache, sname, wid,
                             ) {
-                                crate::preview::render_dump_tree(
+                                let (preview_border_style, preview_active_border_style) =
+                                    preview_state.pane_border_styles(
+                                        pane_border_style,
+                                        pane_active_border_style,
+                                    );
+                                crate::preview::render_preview_layout(
                                     f,
-                                    &layout,
+                                    &preview_state.layout,
                                     parea,
-                                    pane_border_fg,
-                                    pane_active_border_fg,
-                                    None,
+                                    preview_border_style,
+                                    preview_active_border_style,
+                                    crate::border_lines::border_chars(&preview_state.border_lines),
+                                    preview_state.border_indicators,
+                                    preview_state.floating_pane_focused,
                                 );
                                 rendered = true;
                             }
@@ -5013,7 +9399,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     if !rendered {
                         // Fallback to single-pane preview if the layout
                         // endpoint is unavailable.
-                        let preview_text: Option<String> = session_entries.get(session_selected)
+                        let preview_text: Option<String> = filtered_indices
+                            .get(session_selected)
+                            .and_then(|idx| session_entries.get(*idx))
                             .and_then(|(sname, _info)| {
                                 let lt_key = format!("__lt__\t{}", sname);
                                 let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
@@ -5022,7 +9410,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     } else { None }
                                 } else { None };
                                 let wid = win_id?;
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, sname, wid, usize::MAX)
+                                crate::preview::get_or_fetch(&mut preview_cache, sname, wid, usize::MAX)
                             });
                         let pv: Vec<Line> = match preview_text {
                             Some(t) => crate::preview::parse_ansi_lines(&t, parea.width, parea.height),
@@ -5033,8 +9421,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     }
                 }
                 // Scroll position indicator (when content overflows)
-                if session_entries.len() > visible_h {
-                    let max_scroll = session_entries.len().saturating_sub(visible_h);
+                if filtered_indices.len() > visible_h {
+                    let max_scroll = filtered_indices.len().saturating_sub(visible_h);
                     let pct = if max_scroll > 0 { session_scroll * 100 / max_scroll } else { 0 };
                     let indicator = if session_scroll == 0 {
                         "Top".to_string()
@@ -5054,11 +9442,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
             if tree_chooser {
-                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let sel_style = crate::style::parse_tmux_style(&mode_style_str);
                 // Popup size: when preview is OFF use the original
                 // pre-#257 dynamic sizing (compact, list-only). When preview
                 // is ON expand to 85x75% so the right-side preview has room.
-                let buffer_rows: u16 = if tree_num_buffer.is_empty() { 0 } else { 2 };
+                // No digit accumulator any more: a jump key acts on the keystroke,
+                // so the chooser never reserves rows for a pending "go to N".
+                let buffer_rows: u16 = 0;
                 let avail_w = content_chunk.width;
                 let avail_h = content_chunk.height;
                 let (popup_w, popup_h) = if preview_enabled {
@@ -5087,9 +9477,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-tree (digits+enter=jump  Enter=switch  p=preview  Esc=close  drag border to move) "
+                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  p=preview  Esc=close  drag border to move) "
                 } else {
-                    " choose-tree (digits+enter=jump  Enter=switch  p=preview  Esc=close) "
+                    " choose-tree (0-9=jump  Enter=switch  Left/Right=collapse/expand  p=preview  Esc=close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -5116,34 +9506,44 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 } else { None };
 
                 let visible_h = (list_area.height as usize).saturating_sub(buffer_rows as usize);
+                tree_page_h = visible_h;
                 if visible_h > 0 && tree_selected >= tree_scroll + visible_h {
                     tree_scroll = tree_selected.saturating_sub(visible_h - 1);
                 }
                 if tree_selected < tree_scroll {
                     tree_scroll = tree_selected;
                 }
-                let num_width = tree_entries.len().to_string().len();
+                // tmux prints the line's jump key beside the row through
+                // `#{mode_tree_key}`; the key is a zero based VISIBLE line index,
+                // so the label is "0".."9" then "M-a".."M-z" and finally blank.
+                let key_width = tree_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| crate::choose_tree::line_key_label(i).len())
+                    .max()
+                    .unwrap_or(0);
+                let tree_kinds_now = tree_row_kinds(&tree_all);
                 let mut lines: Vec<Line> = Vec::new();
                 for (i, (is_win, wid, _pid, label, _sess)) in tree_entries.iter().enumerate().skip(tree_scroll).take(visible_h) {
-                    // Right-aligned 1-based row number so the digit-jump
-                    // mapping is visible without trial and error.
-                    let row = format!("{:>w$}. {}", i + 1, label, w = num_width);
+                    let key_label = crate::choose_tree::line_key_label(i);
+                    // tmux marks an expandable row with + when collapsed and -
+                    // when expanded (MODE_TREE_PREFIX_STYLE in mode-tree.c).
+                    let marker = match tree_vis_map.get(i) {
+                        Some(&m) if crate::choose_tree::has_children(&tree_kinds_now, m) => {
+                            if tree_collapsed.contains(&m) { "+" } else { "-" }
+                        }
+                        _ => " ",
+                    };
+                    let row = format!("{:>w$} {}{}", key_label, marker, label, w = key_width);
                     let line = if i == tree_selected {
                         Line::from(Span::styled(row, sel_style))
                     } else if *is_win && *wid == usize::MAX {
-                        // Session header — bold
+                        // Session header: bold
                         Line::from(Span::styled(row, Style::default().add_modifier(Modifier::BOLD)))
                     } else {
                         Line::from(row)
                     };
                     lines.push(line);
-                }
-                if !tree_num_buffer.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        format!("go to {}", tree_num_buffer),
-                        sel_style,
-                    )));
                 }
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, list_area);
@@ -5179,20 +9579,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         };
 
                         if let Some(twid) = target_win {
-                            if let Some(layout) = crate::preview::get_or_fetch_dump(
-                                &mut dump_cache, &home, &sess, twid,
+                            if let Some(preview_state) = crate::preview::get_or_fetch_preview_window_state(
+                                &mut preview_state_cache, &sess, twid,
                             ) {
-                                // Highlight which pane the user is hovering on
-                                // (for pane-level entries). Active pane gets a
-                                // brighter separator anyway.
-                                let highlight_pid = if !is_win { Some(pid) } else { None };
-                                crate::preview::render_dump_tree(
+                                let (preview_border_style, preview_active_border_style) =
+                                    preview_state.pane_border_styles(
+                                        pane_border_style,
+                                        pane_active_border_style,
+                                    );
+                                crate::preview::render_preview_layout(
                                     f,
-                                    &layout,
+                                    &preview_state.layout,
                                     parea,
-                                    pane_border_fg,
-                                    pane_active_border_fg,
-                                    highlight_pid,
+                                    preview_border_style,
+                                    preview_active_border_style,
+                                    crate::border_lines::border_chars(&preview_state.border_lines),
+                                    preview_state.border_indicators,
+                                    preview_state.floating_pane_focused,
                                 );
                                 rendered = true;
                             }
@@ -5204,11 +9607,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             let preview_text: Option<String> = if is_win && wid == usize::MAX {
                                 tree_entries.iter()
                                     .find(|(iw, w, _p, _l, s)| *iw && *w != usize::MAX && s == &sess)
-                                    .and_then(|(_, w, _p, _l, s)| crate::preview::get_or_fetch(&mut preview_cache, &home, s, *w, usize::MAX))
+                                    .and_then(|(_, w, _p, _l, s)| crate::preview::get_or_fetch(&mut preview_cache, s, *w, usize::MAX))
                             } else if is_win {
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, &sess, wid, usize::MAX)
+                                crate::preview::get_or_fetch(&mut preview_cache, &sess, wid, usize::MAX)
                             } else {
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, &sess, wid, pid)
+                                crate::preview::get_or_fetch(&mut preview_cache, &sess, wid, pid)
                             };
                             let pv: Vec<Line> = match preview_text {
                                 Some(t) => crate::preview::parse_ansi_lines(&t, parea.width, parea.height),
@@ -5241,7 +9644,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
             if buffer_chooser {
-                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let sel_style = crate::style::parse_tmux_style(&mode_style_str);
                 let overlay = Block::default().borders(Borders::ALL)
                     .title(" choose-buffer (digits+enter=jump, Enter=paste, d=delete, q/Esc=close) ")
                     .border_style(sel_style);
@@ -5254,6 +9657,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
                 let visible_h = (inner.height as usize).saturating_sub(buffer_rows as usize);
+                buffer_page_h = visible_h;
                 if visible_h > 0 && buffer_selected >= buffer_scroll + visible_h {
                     buffer_scroll = buffer_selected.saturating_sub(visible_h - 1);
                 }
@@ -5262,11 +9666,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
                 let num_width = buffer_entries.len().to_string().len();
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (idx, byte_len, preview)) in buffer_entries.iter().enumerate().skip(buffer_scroll).take(visible_h) {
+                for (i, (name, byte_len, preview)) in buffer_entries.iter().enumerate().skip(buffer_scroll).take(visible_h) {
                     // 1-based jump-row number on the left, then the existing
-                    // tmux-style "bufferN: M bytes: ..." label.
-                    let label = format!("{:>w$}. buffer{}: {} bytes: \"{}\"",
-                        i + 1, idx, byte_len, preview, w = num_width);
+                    // tmux-style "name: M bytes: ..." label, the name list-buffers shows.
+                    let label = format!("{:>w$}. {}: {} bytes: \"{}\"",
+                        i + 1, name, byte_len, preview, w = num_width);
                     let line = if i == buffer_selected {
                         Line::from(Span::styled(label, sel_style))
                     } else {
@@ -5363,19 +9767,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 Style::default().fg(sb_fg).bg(sb_bg)
             };
             // ── Build three separate span groups: left, tabs, right ──
-            use unicode_width::UnicodeWidthStr;
             // If status_format[0] is set, use it for line 0 instead of the default 3-part layout
             let use_status_format_0 = status_format.len() > 0 && !status_format[0].is_empty();
             // Left portion: custom status_left or default [session] prefix
             let left_prefix = match custom_status_left {
                 Some(ref sl) => sl.clone(),
-                None => format!("[{}] ", name),
+                None => format!("[{}] ", session_label),
             };
             if client_log_enabled() {
                 client_log("status", &format!("parsing left_prefix ({} chars): [{}]",
                     left_prefix.len(), left_prefix.chars().take(100).collect::<String>()));
             }
-            let mut left_spans: Vec<Span> = crate::rendering::parse_inline_styles(&left_prefix, sb_base);
+            // #451: status-left-style is layered over the base status style so
+            // inline #[...] overrides in status-left still win. Dropped in the
+            // app.rs->client.rs modularization; restored here.
+            let left_base = match state.client_render_options.status_left_style.as_deref() {
+                Some(s) if !s.is_empty() => sb_base.patch(crate::style::parse_tmux_style(s)),
+                _ => sb_base,
+            };
+            let mut left_spans: Vec<Span> = crate::style::parse_inline_styles(&left_prefix, left_base);
 
             // Window tabs (the window list)
             let mut tab_spans_all: Vec<Span> = Vec::new();
@@ -5393,28 +9803,51 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 };
                 if i > 0 {
                     // Parse inline styles in separator (e.g. "#[fg=#44475a]|")
-                    let sep_spans = crate::rendering::parse_inline_styles(&win_status_sep, sb_base);
-                    let sep_w: u16 = sep_spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16).sum();
+                    let sep_spans = crate::style::parse_inline_styles(&win_status_sep, sb_base);
+                    let sep_w: u16 = sep_spans.iter().map(|s| vt100::str_width(s.content.as_ref()) as u16).sum();
                     tab_spans_all.extend(sep_spans);
                     tab_cursor += sep_w;
                 }
-                let fallback_style = if w.active {
-                    if let Some((fg, bg, bold)) = win_status_current_style {
-                        let mut s = Style::default();
-                        if let Some(c) = fg { s = s.fg(c); }
-                        if let Some(c) = bg { s = s.bg(c); }
-                        if bold { s = s.add_modifier(Modifier::BOLD); }
-                        s
-                    } else {
-                        sb_base
-                    }
-                } else if w.activity {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                // Normal (non-current) window-status-style, used as the base for
+                // flagged windows and the fallback for plain ones.
+                // #648: a window that set `window-status-style` on itself wins
+                // over the server wide one; the parsed server wide style is
+                // still the base so an override that only names a foreground
+                // keeps the rest.
+                let server_normal_style = if let Some((fg, bg, bold)) = win_status_style {
+                    let mut s = Style::default();
+                    if let Some(c) = fg { s = s.fg(c); }
+                    if let Some(c) = bg { s = s.bg(c); }
+                    if bold { s = s.add_modifier(Modifier::BOLD); }
+                    s
                 } else {
-                    if let Some((fg, bg, bold)) = win_status_style {
+                    sb_base
+                };
+                let normal_style = match w.ws_style.as_deref() {
+                    Some(style) if !style.is_empty() => {
+                        server_normal_style.patch(crate::style::parse_tmux_style(style))
+                    }
+                    _ => server_normal_style,
+                };
+                // #451: restore the tmux flag-style priority that the monolithic
+                // app.rs renderer had (current > bell > activity > last > normal).
+                // The modularization dropped bell/last entirely and hard-coded the
+                // activity colour, so window-status-{activity,bell,last}-style had
+                // no effect. Each flagged style is layered over the normal style so
+                // an option that only sets fg keeps the normal bg, and full
+                // attributes like `reverse` (the activity/bell default) work.
+                // #648: the window's own flag style outranks the server wide
+                // one, so `set -w -t <window> window-status-bell-style ...`
+                // colours only that window's alert.
+                let flag_style = |local: &Option<String>, server: &Option<String>| -> Option<Style> {
+                    let raw = local
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| server.as_deref().filter(|s| !s.is_empty()))?;
+                    Some(normal_style.patch(crate::style::parse_tmux_style(raw)))
+                };
+                let fallback_style = if w.active {
+                    let server_current = if let Some((fg, bg, bold)) = win_status_current_style {
                         let mut s = Style::default();
                         if let Some(c) = fg { s = s.fg(c); }
                         if let Some(c) = bg { s = s.bg(c); }
@@ -5422,13 +9855,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         s
                     } else {
                         sb_base
+                    };
+                    match w.wsc_style.as_deref() {
+                        Some(style) if !style.is_empty() => {
+                            server_current.patch(crate::style::parse_tmux_style(style))
+                        }
+                        _ => server_current,
                     }
+                } else if w.bell {
+                    flag_style(&w.wsb_style, &state.client_render_options.window_status_bell_style)
+                        .unwrap_or(normal_style)
+                } else if w.activity {
+                    flag_style(&w.wsa_style, &state.client_render_options.window_status_activity_style)
+                        .unwrap_or(normal_style)
+                } else if w.last {
+                    flag_style(&w.wsl_style, &state.client_render_options.window_status_last_style)
+                        .unwrap_or(normal_style)
+                } else {
+                    normal_style
                 };
-                let parsed = crate::rendering::parse_inline_styles(&tab_text, fallback_style);
+                let parsed = crate::style::parse_inline_styles(&tab_text, fallback_style);
                 let tab_start = tab_cursor;
-                let tab_w: u16 = parsed.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16).sum();
+                let tab_w: u16 = parsed.iter().map(|s| vt100::str_width(s.content.as_ref()) as u16).sum();
                 tab_cursor += tab_w;
-                tab_rel_positions.push((i, tab_start, tab_cursor));
+                tab_rel_positions.push((w.idx, tab_start, tab_cursor));
                 tab_spans_all.extend(parsed);
             }
 
@@ -5438,16 +9888,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 client_log("status", &format!("parsing right_text ({} chars): [{}]",
                     right_text.len(), right_text.chars().take(100).collect::<String>()));
             }
-            let mut right_spans = crate::rendering::parse_inline_styles(&right_text, sb_base);
+            // #451: status-right-style, layered like status-left-style above.
+            let right_base = match state.client_render_options.status_right_style.as_deref() {
+                Some(s) if !s.is_empty() => sb_base.patch(crate::style::parse_tmux_style(s)),
+                _ => sb_base,
+            };
+            let mut right_spans = crate::style::parse_inline_styles(&right_text, right_base);
 
             // Enforce status-left-length / status-right-length truncation (tmux parity)
             crate::style::truncate_spans_to_width(&mut left_spans, state.status_left_length);
             crate::style::truncate_spans_to_width(&mut right_spans, state.status_right_length);
 
             // Measure widths using Unicode display width
-            let left_w: usize = left_spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
-            let tabs_w: usize = tab_spans_all.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
-            let right_w: usize = right_spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+            let left_w: usize = left_spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
+            let tabs_w: usize = tab_spans_all.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
+            let right_w: usize = right_spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum();
             let total_width = status_chunk.width as usize;
 
             // Assemble final spans based on status-justify
@@ -5514,8 +9969,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
                 _ => left_w as u16, // "left" default
             };
-            client_tab_positions = tab_rel_positions.iter().map(|&(idx, s, e)| (idx, s + tabs_x_offset, e + tabs_x_offset)).collect();
+            client_tab_positions = tab_rel_positions.iter()
+                .map(|&(idx, s, e)| (status_chunk.y, idx, s + tabs_x_offset, e + tabs_x_offset))
+                .collect();
             client_status_row = status_chunk.y;
+            client_status_rows = status_chunk.height;
+            client_window_indices = windows.iter().map(|w| w.idx).collect();
             // Truncate overall status line to fit the available width
             crate::style::truncate_spans_to_width(&mut status_spans, total_width);
             // If a display-message is active, show it on the status bar
@@ -5525,17 +9984,69 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 // #372: honor the configured message-style (sent expanded by the
                 // server) instead of a hard-coded colour. Falls back to tmux's
                 // default bg=yellow,fg=black when unset/empty.
-                let msg_style = crate::rendering::parse_tmux_style(
+                let msg_style = crate::style::parse_tmux_style(
                     match state.message_style.as_deref() {
                         Some(s) if !s.is_empty() => s,
                         _ => "bg=yellow,fg=black",
                     }
                 );
-                let padded = if msg.len() < status_chunk.width as usize {
-                    format!("{}{}", msg, " ".repeat(status_chunk.width as usize - msg.len()))
-                } else {
-                    msg.chars().take(status_chunk.width as usize).collect()
+                // The line is measured in display columns. The padding used
+                // msg.len(), a BYTE count, so a message holding any multi
+                // byte character was never padded and message-style stopped
+                // where the text did instead of filling the line; the
+                // truncation took `width` CHARACTERS, which is twice that
+                // many columns when they are wide. Same class as #741.
+                let cols = status_chunk.width as usize;
+                // An open copy-mode prompt sends where its cursor sits, and
+                // the input scrolls with it so a long search term keeps what
+                // is being typed on screen. The label does not scroll: tmux
+                // draws it at `ax` and then the input from `ax + start` with
+                // its own offset (status.c:922 to :948), so which prompt is
+                // open stays readable however long the term gets.
+                let (padded, prompt_col) = match (state.status_cursor, state.status_label) {
+                    (Some(at), Some(label_len)) if label_len <= msg.len() => {
+                        let (label, input) = msg.split_at(label_len.min(msg.len()));
+                        let label_cols = unicode_width::UnicodeWidthStr::width(label);
+                        let avail = cols.saturating_sub(label_cols);
+                        let (shown, cur_col) = crate::util::prompt_window(
+                            input,
+                            at.saturating_sub(label_len),
+                            avail,
+                        );
+                        let used =
+                            label_cols + unicode_width::UnicodeWidthStr::width(shown);
+                        (
+                            format!("{}{}{}", label, shown, " ".repeat(cols.saturating_sub(used))),
+                            Some(label_cols + cur_col),
+                        )
+                    }
+                    _ => {
+                        // A display-message has no cursor: it starts at the
+                        // left and is cut on the right, which is what a
+                        // cursor of 0 gives.
+                        let (shown, _) = crate::util::prompt_window(msg, 0, cols);
+                        let used = unicode_width::UnicodeWidthStr::width(shown);
+                        (
+                            format!("{}{}", shown, " ".repeat(cols.saturating_sub(used))),
+                            None,
+                        )
+                    }
                 };
+                // `status off` leaves the status chunk no rows, so the
+                // prompt is not on screen and there is nowhere to put its
+                // cursor. tmux is the same: with no status line there is no
+                // prompt area to draw into.
+                if let (Some(col), true) = (prompt_col, status_chunk.height > 0) {
+                    // The prompt owns the cursor while it is open, the way
+                    // tmux settles c->prompt_cursor before the pane's
+                    // position (server-client.c:1797 to :1808). Without this
+                    // the cursor stayed in the pane, so the line editor the
+                    // prompt gained moved something invisible.
+                    let cx = status_chunk.x + col as u16;
+                    f.set_cursor_position((cx, status_chunk.y));
+                    prompt_cursor_pos = Some((cx, status_chunk.y));
+                    status_prompt_open = true;
+                }
                 Paragraph::new(Line::from(Span::styled(padded, msg_style))).style(msg_style)
             } else {
                 Paragraph::new(Line::from(status_spans)).style(sb_base)
@@ -5550,11 +10061,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     &status_format[0], total_width, sb_base,
                 );
                 // Update tab positions from range info so mouse clicks work
-                // with custom status-format layouts.
+                // with custom status-format layouts. tmux parity (#593): the
+                // range argument IS the window index — tmux passes it raw to
+                // winlink_find_by_index (style.c strtonum, server-client.c
+                // STYLE_RANGE_WINDOW) with no base-index arithmetic, so
+                // `#[range=window|#{window_index}]` works at any base-index.
                 client_tab_positions = layout.ranges.iter().filter_map(|(rt, s, e)| {
                     match rt {
                         crate::style::StatusRangeType::Window(idx) => {
-                            Some((*idx, *s + status_chunk.x, *e + status_chunk.x))
+                            Some((status_chunk.y, *idx, *s + status_chunk.x, *e + status_chunk.x))
                         }
                     }
                 }).collect();
@@ -5575,6 +10090,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 };
                 // Use the layout engine for #[align], #[fill], #[list], #[range] support
                 let layout = crate::style::layout_format_line(&text, line_area.width as usize, sb_base);
+                // Harvest this line's clickable ranges too (#593): tmux keeps
+                // one style_range list per status line (status.c status_redraw
+                // fills sle->ranges for every i in 0..lines) so a window list
+                // on status-format[1] is just as clickable as on line 0.
+                for (rt, s, e) in &layout.ranges {
+                    match rt {
+                        crate::style::StatusRangeType::Window(idx) => {
+                            client_tab_positions.push((line_y, *idx, *s + line_area.x, *e + line_area.x));
+                        }
+                    }
+                }
                 let line_widget = Paragraph::new(Line::from(layout.spans)).style(sb_base);
                 f.render_widget(line_widget, line_area);
             }
@@ -5584,16 +10110,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
-                let para = Paragraph::new(format!("name: {}", rename_buf));
-                f.render_widget(para, overlay.inner(oa));
-            }
-            if pane_renaming {
-                let overlay = Block::default().borders(Borders::ALL).title("set pane title");
-                let oa = centered_rect(60, 3, content_chunk);
-                f.render_widget(Clear, oa);
-                f.render_widget(&overlay, oa);
-                let para = Paragraph::new(format!("title: {}", pane_title_buf));
-                f.render_widget(para, overlay.inner(oa));
+                let inner = overlay.inner(oa);
+                // `rename_back` counts characters from the end; the window
+                // needs the byte offset, and the same walk the copy-mode
+                // prompts do turns one into the other.
+                let mut at = rename_buf.len();
+                for ch in rename_buf.chars().rev().take(rename_back.min(rename_buf.chars().count())) {
+                    at -= ch.len_utf8();
+                }
+                let avail = inner.width.saturating_sub(6) as usize; // after "name: "
+                let (shown, cur_col) = crate::util::prompt_window(&rename_buf, at, avail);
+                let para = Paragraph::new(format!("name: {}", shown));
+                f.render_widget(para, inner);
+                // An open prompt owns the cursor, as the command prompt has
+                // since #741 and #746. Without it the
+                // overlay gave no sign of where the next character would land.
+                let cx = inner.x + 6 + cur_col as u16;
+                f.set_cursor_position((cx, inner.y));
+                prompt_cursor_pos = Some((cx, inner.y));
             }
             if command_input {
                 let title = command_prompt_label.as_deref().unwrap_or("command");
@@ -5602,24 +10136,38 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
-                let para = Paragraph::new(format!(": {}", command_buf));
+                // `command_back` counts characters from the end, the way the
+                // shared prompt editor does; the window wants a byte offset, and
+                // the same walk the rename overlay does turns one into the other.
+                let mut at = command_buf.len();
+                for ch in command_buf.chars().rev().take(command_back.min(command_buf.chars().count())) {
+                    at -= ch.len_utf8();
+                }
+                // The cursor column is the display WIDTH of the text before
+                // it, not its byte offset: eight box drawing characters are
+                // 24 bytes over 8 columns, so adding the offset to a column
+                // drew the cursor 16 past the text and eventually outside the
+                // border (#741). The window scrolls with the cursor as tmux's
+                // does (status.c:937 to :944), so a long input keeps what is
+                // being typed on screen instead of clipping it.
+                let avail = inner.width.saturating_sub(2) as usize; // after ": "
+                let (shown, cur_col) =
+                    crate::util::prompt_window(&command_buf, at, avail);
+                let para = Paragraph::new(format!(": {}", shown));
                 f.render_widget(para, inner);
-                // Show cursor at the correct position within the prompt
-                let cx = inner.x + 2 + command_cursor as u16; // +2 for ": "
+                let cx = inner.x + 2 + cur_col as u16;
                 f.set_cursor_position((cx, inner.y));
+                prompt_cursor_pos = Some((cx, inner.y));
             }
-            if window_idx_input {
-                let overlay = Block::default().borders(Borders::ALL).title("select window");
-                let oa = centered_rect(50, 3, content_chunk);
-                f.render_widget(Clear, oa);
-                f.render_widget(&overlay, oa);
-                let inner = overlay.inner(oa);
-                let para = Paragraph::new(format!("index: {}", window_idx_buf));
-                f.render_widget(para, inner);
-                let cx = inner.x + 7 + window_idx_buf.len() as u16;
-                f.set_cursor_position((cx, inner.y));
-            }
-            if let Some(ref cmd) = confirm_cmd {
+            // `confirm_cmd` is the prompt a binding put up, `chooser_kill` the
+            // one a chooser's `x` put up over its own list. They share the
+            // box so the question reads the same wherever it came from, and
+            // only one of the two can be up: the prefix table is out of reach
+            // while a chooser is open.
+            if let Some(cmd) = confirm_cmd
+                .as_deref()
+                .or(chooser_kill.as_ref().map(|k| k.prompt.as_str()))
+            {
                 let overlay = Block::default().borders(Borders::ALL).title("confirm");
                 let oa = centered_rect(50, 3, content_chunk);
                 f.render_widget(Clear, oa);
@@ -5630,60 +10178,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
             // ── Server-side overlay rendering ────────────────────────
             if srv_popup_active {
-                let w = srv_popup_width.min(content_chunk.width.saturating_sub(2));
-                let h = srv_popup_height.min(content_chunk.height.saturating_sub(2));
-                let popup_area = Rect {
-                    x: content_chunk.x + (content_chunk.width.saturating_sub(w)) / 2,
-                    y: content_chunk.y + (content_chunk.height.saturating_sub(h)) / 2,
-                    width: w,
-                    height: h,
-                };
-                let title = if srv_popup_command.is_empty() { "Popup".to_string() } else { let max_title = (w as usize).saturating_sub(4); if srv_popup_command.len() > max_title { format!("{}...", &srv_popup_command[..max_title.saturating_sub(3)]) } else { srv_popup_command.clone() } };
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(title);
-                let inner_w = w.saturating_sub(2);
+                // One frame implementation for every renderer (#792): the
+                // server resolved title, border lines and styles; draw_popup
+                // draws them exactly as render_popup_overlay does.
+                let popup_area = popup_overlay_rect(content_chunk, srv_popup_width, srv_popup_height);
+                let inner_w = crate::popup::popup_inner_rect(popup_area, srv_popup_frame.has_border()).width;
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 if !srv_popup_rows.is_empty() {
                     // Render with full color/style data from popup_rows (#154)
                     for row_data in &srv_popup_rows {
-                        let mut spans: Vec<Span<'static>> = Vec::new();
-                        let mut col: u16 = 0;
-                        for run in &row_data.runs {
-                            if col >= inner_w { break; }
-                            let fg = crate::style::map_color(&run.fg);
-                            let bg = crate::style::map_color(&run.bg);
-                            let mut style = Style::default().fg(fg).bg(bg);
-                            if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
-                            if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
-                            if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                            if run.flags & 8  != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
-                            if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
-                            if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
-                            if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                            // ratatui-crossterm omits SGR 8 (HIDDEN), render as spaces
-                            let text: &str = if run.flags & 64 != 0 {
-                                " "
-                            } else if run.text.is_empty() {
-                                " "
-                            } else {
-                                &run.text
-                            };
-                            let run_w = run.width.max(1);
-                            if col + run_w > inner_w {
-                                let avail = (inner_w - col) as usize;
-                                let truncated: String = text.chars().take(avail).collect();
-                                if !truncated.is_empty() {
-                                    spans.push(Span::styled(truncated, style));
-                                }
-                                col = inner_w;
-                            } else {
-                                spans.push(Span::styled(text.to_string(), style));
-                                col += run_w;
-                            }
-                        }
-                        lines.push(Line::from(spans));
+                        lines.push(render_popup_runs_line(&row_data.runs, inner_w));
                     }
                 } else {
                     // Fallback: plain text lines for non-PTY popups
@@ -5691,9 +10195,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         lines.push(Line::from(line_str.clone()));
                     }
                 }
-                let para = Paragraph::new(Text::from(lines)).block(block).scroll((srv_popup_scroll, 0));
-                f.render_widget(Clear, popup_area);
-                f.render_widget(para, popup_area);
+                crate::popup::draw_popup(f.buffer_mut(), popup_area, &srv_popup_frame, Text::from(lines), srv_popup_scroll);
             }
             if srv_confirm_active {
                 let overlay = Block::default().borders(Borders::ALL).title("confirm");
@@ -5704,7 +10206,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 f.render_widget(para, overlay.inner(oa));
             }
             if srv_menu_active {
-                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let sel_style = crate::style::parse_tmux_style(&mode_style_str);
                 let title_str = if srv_menu_title.is_empty() { "Menu".to_string() } else { srv_menu_title.clone() };
                 let overlay = Block::default().borders(Borders::ALL).title(title_str).border_style(sel_style);
                 let item_count = srv_menu_items.len();
@@ -5880,6 +10382,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
 
+            crate::rendering::style_wide_trailing_cells(f.buffer_mut());
+            redraw_hyperlink_rows(f.buffer_mut(), &previous_hyperlink_rows_get());
         })?;
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
@@ -5895,11 +10399,150 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // for the common case (no links), so it does not touch the hot path.
         {
             let runs = frame_hyperlinks_take();
+            previous_hyperlink_rows_set(hyperlink_rows(&runs));
             if !runs.is_empty() {
+                // Part of the frame (#697): queued behind the cells, with the
+                // cursor hidden, and written in the frame's single write.
                 let overlay = build_osc8_overlay(&runs);
-                let mut out = std::io::stdout().lock();
-                let _ = std::io::Write::write_all(&mut out, overlay.as_bytes());
-                let _ = std::io::Write::flush(&mut out);
+                let _ = terminal.backend_mut().queue_drawing(overlay.as_bytes());
+            }
+        }
+
+        // ── Post-draw: atomic cursor write ──────────────────────────
+        // The frame's cells, the OSC 8 overlay, the cursor visibility,
+        // position and style all leave in ONE write (end_frame below).
+        // Separate console writes create intermediate states visible to WT
+        // between vsync frames, causing rapid cursor flicker (#697: the
+        // cells used to go out with the cursor still visible).
+        {
+            fn find_active_cursor_shape(node: &LayoutJson) -> Option<u8> {
+                match node {
+                    LayoutJson::Leaf { active, cursor_shape, .. } => {
+                        if *active && *cursor_shape >= 1 && *cursor_shape <= 6 { Some(*cursor_shape) } else { None }
+                    }
+                    LayoutJson::Split { children, .. } => {
+                        children.iter().find_map(find_active_cursor_shape)
+                    }
+                }
+            }
+            let effective = find_active_cursor_shape(&root)
+                .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
+            let content_chunk = {
+                let sz = terminal.size().unwrap_or_default();
+                let constraints = if status_at_top {
+                    vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
+                } else {
+                    vec![Constraint::Min(1), Constraint::Length(status_lines as u16)]
+                };
+                let chunks = Layout::default().direction(Direction::Vertical)
+                    .constraints(constraints).split(sz.into());
+                if status_at_top { chunks[1] } else { chunks[0] }
+            };
+            let active_pane_area: Option<Rect> =
+                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed);
+            // Compute screen-global cursor position from pane-local coords.
+            //
+            // A PTY popup is modal and takes the keystrokes, so while it is up
+            // the cursor belongs to the process inside it, not to the pane
+            // underneath (tmux does the same in server_client_reset_state by
+            // taking both the cursor and the cursor mode from the overlay).
+            // Leaving it on the pane underneath is what made the popup look
+            // like it had no cursor at all (#507).
+            let cursor_visible = if srv_popup_active && srv_popup_has_pty {
+                srv_popup_cursor.and_then(|c| {
+                    popup_cursor_screen_pos_framed(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c, srv_popup_frame.has_border())
+                })
+            } else if command_input || status_prompt_open || renaming {
+                // An open prompt owns the cursor, and the pane only gets it
+                // when no prompt is up: tmux settles the cursor on
+                // `c->prompt_cursor` first and takes the pane in the else
+                // branch (`server_client_reset_state`, server-client.c:1797
+                // to :1808). The position is the one the overlay asked for
+                // during the draw, passed explicitly so the Win32 caret
+                // follows the prompt as well. The pane's position used
+                // to win instead, so in a pane that was not in copy mode the
+                // prompt had no cursor at all and there was no way to see
+                // where typing would land (#741). A pane IN copy mode sets
+                // neither of the post draw positions, which is why the prompt
+                // had a cursor there and not here.
+                //
+                // A copy-mode prompt on the status line (search, goto line,
+                // or a command prompt opened from the copy-mode table) is the
+                // same case: it lives in the server, so it reaches the client
+                // as the status message plus the offset of its cursor, and
+                // the draw above turned that into a position.
+                prompt_cursor_pos
+            } else if tree_chooser || session_chooser || buffer_chooser {
+                // A chooser is a mode over the pane, and tmux turns the
+                // cursor off for every mode tree mode when it starts
+                // (`(*s)->mode &= ~MODE_CURSOR;`, mode-tree.c:536 in 3.7b).
+                // The pane's cursor used to stay lit under the list
+                // (discussion #776).
+                None
+            } else if let Some(float_cursor) = focused_float_cursor(content_chunk, &srv_floats) {
+                // A focused floating pane is the active pane, so the cursor
+                // goes inside it (#767). It used to fall through to the tiled
+                // pane's cursor, leaving it blinking at the prompt behind the
+                // float while every keystroke went into the float.
+                float_cursor
+            } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
+                // Content lives inside the border-label reservation; use the render's inner rect.
+                let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
+                let cy = inner.y + cr.min(inner.height.saturating_sub(1));
+                let cx = inner.x + cc.min(inner.width.saturating_sub(1));
+                Some((cx, cy))
+            } else {
+                None
+            };
+            // The backend settles the cursor for this frame (#697): the cells
+            // were drawn with the cursor hidden, and the cursor is shown only
+            // once it is back where it belongs.  An unchanged frame writes
+            // nothing, so the host never sees a ?25l/?25h pair it did not need.
+            terminal.backend_mut().request_cursor(cursor_visible);
+            // Parking is for a cursor the pane has hidden. With a prompt up the
+            // cursor is shown, in the prompt, so there is nothing to park.
+            if cursor_visible.is_none()
+                && !(srv_popup_active && srv_popup_has_pty)
+                && !command_input
+                && !status_prompt_open
+                && !renaming
+                && !srv_floats.iter().any(|fl| fl.focused)
+            {
+                if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
+                    let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
+                    let cy = inner.y + cr.min(inner.height.saturating_sub(1));
+                    let cx = inner.x + cc.min(inner.width.saturating_sub(1));
+                    terminal.backend_mut().park_cursor((cx, cy));
+                }
+            }
+            // DECSCUSR only when style actually changes (avoids blink
+            // timer resets in WT).
+            if effective != last_cursor_style {
+                last_cursor_style = effective;
+                crate::rendering::note_cursor_code(effective);
+                let _ = terminal.backend_mut().queue_raw(format!("\x1b[{} q", effective).as_bytes());
+            }
+            // A shape carries its own blink, so mode 12 is only for the blink
+            // on its own: `cursor-blink` set while `cursor-style` names no
+            // shape. Written when it changes, so `set -g cursor-blink` takes
+            // effect in a running session, and never written for a blink
+            // nobody asked for.
+            let want_blink = if effective == 0 { state_cursor_blink_mode } else { None };
+            if want_blink.is_some() && want_blink != last_blink_mode {
+                last_blink_mode = want_blink;
+                crate::rendering::note_blink_asserted(want_blink == Some(true));
+                let _ = terminal.backend_mut().queue_raw(
+                    if want_blink == Some(true) { b"\x1b[?12h" } else { b"\x1b[?12l" });
+            }
+            let _ = terminal.backend_mut().end_frame();
+
+            // Update Win32 system caret for accessibility / speech-to-text
+            // tools (e.g. Wispr Flow).  Skip for SSH sessions — no local
+            // console window.
+            if !is_ssh_mode {
+                if let Some((cx, cy)) = cursor_visible {
+                    crate::platform::caret::update(cx, cy);
+                }
             }
         }
 
@@ -5927,13 +10570,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // ratatui's VT output buffer.
         if let Some(clip_text) = pending_osc52.take() {
             crate::copy_mode::emit_osc52(&mut std::io::stdout(), &clip_text);
-        }
-
-        // ── Post-draw: emit audible bell ─────────────────────────────
-        if pending_bell {
-            pending_bell = false;
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
 
         // ── Post-draw: forward host terminal title (set-titles) ──────
@@ -5981,88 +10617,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             last_emitted_host_progress = host_progress_this_frame;
         }
 
-        // ── SSH: periodic mouse-enable refresh ───────────────────────
-        // ConPTY or terminal resize can silently disable mouse reporting.
-        // Re-send every 30 seconds to keep mouse working reliably.
-        if is_ssh_mode && last_mouse_enable.elapsed().as_secs() >= 30 {
-            crate::ssh_input::send_mouse_enable();
+        // ── Periodic mouse-enable refresh (ALL input modes) ──────────
+        // ConPTY or terminal resize can silently disable mouse reporting,
+        // and Windows Terminal additionally drops a LOCAL client's mouse
+        // registration outright (mouse dead, keys fine) until the DECSET
+        // bytes are re-sent.  This used to run only in SSH mode, leaving
+        // local sessions mouse-dead until detach/reattach; the keepalive
+        // routes per input mode so it is safe everywhere.
+        if last_mouse_enable.elapsed().as_secs() >= 30 {
+            crate::ssh_input::send_mouse_keepalive();
             last_mouse_enable = Instant::now();
         }
 
-        // ── Post-draw: atomic cursor write ──────────────────────────
-        // Write cursor visibility + position + style as ONE batch to
-        // avoid the separate execute!() flushes that ratatui's normal
-        // show_cursor()/set_cursor_position() would produce.  Multiple
-        // separate console writes create intermediate states visible
-        // to WT between vsync frames, causing rapid cursor flicker.
+        // ── Raw VT pipe: periodic terminal-size poll ───────────────
+        // A pipe carries no resize notifications, so ask the terminal for
+        // its text-area size (XTWINOPS). The reply flows through the VT
+        // reader, which updates the backend size override; an unchanged
+        // size is a no-op for terminal.autoresize().
+        if crate::ssh_input::pipe_mode_active()
+            && last_pipe_size_query.elapsed().as_millis() >= 1000
         {
-            use std::io::Write;
-            fn find_active_cursor_shape(node: &LayoutJson) -> Option<u8> {
-                match node {
-                    LayoutJson::Leaf { active, cursor_shape, .. } => {
-                        if *active && *cursor_shape >= 1 && *cursor_shape <= 6 { Some(*cursor_shape) } else { None }
-                    }
-                    LayoutJson::Split { children, .. } => {
-                        children.iter().find_map(find_active_cursor_shape)
-                    }
-                }
-            }
-            let effective = find_active_cursor_shape(&root)
-                .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
-            let active_pane_area: Option<Rect> = {
-                let sz = terminal.size().unwrap_or_default();
-                let constraints = if status_at_top {
-                    vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
-                } else {
-                    vec![Constraint::Min(1), Constraint::Length(status_lines as u16)]
-                };
-                let chunks = Layout::default().direction(Direction::Vertical)
-                    .constraints(constraints).split(sz.into());
-                let content_chunk = if status_at_top { chunks[1] } else { chunks[0] };
-                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed)
-            };
-            // Compute screen-global cursor position from pane-local coords.
-            let cursor_visible = if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
-                let cy = inner.y + cr.min(inner.height.saturating_sub(1));
-                let cx = inner.x + cc.min(inner.width.saturating_sub(1));
-                Some((cx, cy))
-            } else {
-                None
-            };
-            // Build a single VT string with: ?25h + CUP + DECSCUSR
-            // ratatui's draw() always emits ?25l (since we never call
-            // f.set_cursor_position), so we must re-emit ?25h + CUP
-            // every frame when the cursor should be visible.
-            let mut buf = String::with_capacity(32);
-            if let Some((cx, cy)) = cursor_visible {
-                buf.push_str("\x1b[?25h");
-                use std::fmt::Write as FmtWrite;
-                let _ = write!(buf, "\x1b[{};{}H", cy + 1, cx + 1);
-            }
-            // DECSCUSR only when style actually changes (avoids blink
-            // timer resets in WT).
-            if effective != last_cursor_style {
-                last_cursor_style = effective;
-                use std::fmt::Write as FmtWrite;
-                let _ = write!(buf, "\x1b[{} q", effective);
-            }
-            if !buf.is_empty() {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(buf.as_bytes());
-                let _ = out.flush();
-            }
-
-            // Update Win32 system caret for accessibility / speech-to-text
-            // tools (e.g. Wispr Flow).  Skip for SSH sessions — no local
-            // console window.
-            if !is_ssh_mode {
-                if let Some((cx, cy)) = cursor_visible {
-                    crate::platform::caret::update(cx, cy);
-                }
-            }
+            crate::ssh_input::request_pipe_terminal_size();
+            last_pipe_size_query = Instant::now();
         }
 
         let _render_us = _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128);
+        crate::pty_trace::mark_plain("v", dump_buf.len());
         last_dump_time = Instant::now();
         // Latency log: measure full cycle from key-send to render-complete
         if let (Some(ref mut log), Some(ks)) = (&mut latency_log, key_send_instant) {
@@ -6087,10 +10667,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // DON'T clear last_key_send_time — keep fast-dumping for 100ms
         // after last keystroke so we catch the ConPTY echo promptly.
         // The timer expires naturally in the poll_ms calculation above.
-        // Clear key_send_instant once echo arrives (frame differs).
-        if got_frame && dump_buf != prev_dump_buf {
-            key_send_instant = None;
-        }
+        // key_send_instant is NOT cleared here. A frame arriving is not proof
+        // that the echo arrived, and on the shell people actually type into it
+        // usually is not: PSReadLine answers one keystroke with TWO writes,
+        // a bare cursor-hide first and the character itself ~15ms later
+        // (tests/conpty_echolat.cs shows the split at the pseudoconsole, with
+        // the character in the first chunk 0 times out of 40). The cursor-hide
+        // renders as a changed frame, so clearing on it shut the fast-poll
+        // window right before the character landed, and the frame carrying it
+        // then sat unread on the socket for a 5ms or 10ms console poll. That
+        // was ~5ms of the median and most of the spread between runs.
+        // The time-based expiry above closes the window instead.
         force_dump = false;
     }
 
@@ -6108,6 +10695,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     Ok(())
 }
 
+fn session_filtered_indices(entries: &[(String, String)], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..entries.len()).collect();
+    }
+
+    let filter = filter.to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (name, _))| name.to_lowercase().contains(&filter).then_some(idx))
+        .collect()
+}
+
+fn session_filter_escape_selection(
+    entries: &[(String, String)],
+    filter: &str,
+    selected: usize,
+) -> Option<usize> {
+    if filter.is_empty() {
+        return None;
+    }
+
+    Some(
+        session_filtered_indices(entries, filter)
+            .get(selected)
+            .copied()
+            .unwrap_or(0),
+    )
+}
+
 /// Flush the paste-pending buffer as individual send-text / send-key commands.
 /// Called when a non-bufferable key (Backspace, Delete, Esc, BackTab) interrupts
 /// a potential paste burst, so we emit whatever we had as normal keystrokes.
@@ -6117,6 +10734,7 @@ fn flush_paste_pend_as_text(
     paste_pend_start: &mut Option<Instant>,
     paste_stage2: &mut bool,
     cmd_batch: &mut Vec<String>,
+    gesture: &mut PasteGesture,
 ) {
     if paste_pend.is_empty() {
         return;
@@ -6126,6 +10744,7 @@ fn flush_paste_pend_as_text(
     // wraps it in bracketed paste sequences (fixes nvim autoindent).
     // Non-ASCII buffers (IME input) are always flushed as normal text to
     // avoid the 300ms delay (fixes #91).
+    gesture.record(paste_pend);
     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
     if (*paste_stage2 || paste_pend.len() >= 3) && !has_non_ascii {
         let encoded = crate::util::base64_encode(paste_pend);
@@ -6171,23 +10790,548 @@ fn should_buffer_leading_paste_control(
     true
 }
 
+/// The two pieces of evidence that the character in hand is the HEAD of a
+/// paste rather than a keystroke, checked before it is committed as typing.
+///
+/// The zero latency flush exists because a typed character must not wait out
+/// the 20 ms detection window, and its original comment assumed the console
+/// host hands the whole clipboard to the input buffer in one write, so a paste
+/// would always have three or more characters pending by the time the client
+/// drained the batch.  gabri-ns measured a host where that is not true
+/// (Windows 10 19045, #684 follow up): the first batch held ONE character, it
+/// went out as `send-text`, and the child saw `M` `ESC[200~` `icrosoft...`,
+/// with the head of the paste on the wrong side of the marker.  A 490 byte
+/// clipboard leaked 32 characters the same way.  Emulated here with a 2 ms
+/// drip (tests/paste_host_injector.cs `drip`), all 43 characters escaped.
+///
+/// tmux never faces this: its host brackets the paste in the byte stream and
+/// `tty_keys_paste` (tty-keys.c:838) returns 1 for "partial" while the closing
+/// `ESC[201~` has not arrived, so the whole thing is held in the input buffer
+/// and nothing is dispatched as keys.  The console input buffer carries no such
+/// marker, so psmux has to recognise the head some other way.
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+struct PasteHeadEvidence<'a> {
+    /// A Ctrl+V press is still in flight: whatever arrives now belongs to it.
+    /// Absent on hosts that bind Ctrl+V themselves and swallow the press.
+    gesture_open: bool,
+    /// The beginning of the system clipboard, cached by sequence number.
+    /// A paste IS the clipboard, whichever gesture started it (Ctrl+V,
+    /// Shift+Insert, the right click menu), so a pending buffer that is a
+    /// prefix of it is the strongest evidence available at the first
+    /// character.
+    clip_head: Option<&'a str>,
+    /// How long the pending buffer has been held so far.
+    held_for: Duration,
+    /// The first pending character came with Shift and nothing else.
+    ///
+    /// The console host turns VT text written to its input into key records,
+    /// and a character that needs Shift (a capital, `(`, `"`) is handed over
+    /// as Shift down, key, Shift up in a write of its own, ahead of the rest
+    /// of the text. When that character opens a paste the client drains it
+    /// alone, and the rest arrives about a millisecond later (issue #766:
+    /// `Y` reached the pane in front of `ESC[200~`, 6 of 6 runs for a shifted
+    /// first character, 0 of 6 for an unshifted one).
+    shifted_head: bool,
+    /// The release of the lone pending character was read in the same drain
+    /// as its press.
+    ///
+    /// A host that writes text into the console input buffer (a paste on every
+    /// host measured, the 19045 drip, tests/paste_host_injector.cs) writes each
+    /// character as a press and release pair in one write, so the pair is read
+    /// together. A key typed on a keyboard arrives as a press alone and its
+    /// release follows when the finger lifts, tens of milliseconds later. So a
+    /// lone character whose release has not been read is a keystroke, and the
+    /// short holds below (clipboard prefix, shifted head) only cost it latency:
+    /// before this, typing the clipboard's first character waited out
+    /// PASTE_HEAD_PREFIX_HOLD on top of the 1 ms poll that ends it, 3.4 to
+    /// 12 ms in the keystroke gate, and was its whole p99 tail.
+    head_released: bool,
+}
+
+/// How long a lone character that matches the clipboard's first character is
+/// held before it is committed as typing.
+///
+/// The clipboard prefix is evidence at the FIRST character, and it needs only
+/// as long as the second character of a real paste takes to arrive. On the
+/// host that drips (Windows 10 19045, #684 follow up) that is under a
+/// millisecond: 70 characters in 20 ms measured by the reporter, 2 ms in the
+/// drip harness. A typed character never has a follow up inside 3 ms, so the
+/// hold ends there and the keystroke goes out as typing 3 ms late instead of
+/// 20. The keystroke gate measured the 20 ms version as one sample in forty
+/// waiting out the whole window (p99 23 ms against an 8 ms bar, and 32 ms
+/// against the 25 ms absolute bar in test_perf_vs_terminals) whenever the
+/// clipboard happened to start with a character the bench typed, which is
+/// exactly the shape a user hits after copying a command and typing its first
+/// letter. 3 ms is ten times the measured gap and still inside the 6 ms
+/// "over the ConPTY floor" p99 budget. Once a second character has arrived
+/// the ordinary 20 ms window applies, since that is a burst and no longer a
+/// keystroke.
+#[cfg(windows)]
+const PASTE_HEAD_PREFIX_HOLD: Duration = Duration::from_millis(3);
+
+/// How long a held paste must go without a new character, counted from its
+/// LAST character, before stage 2 sends it.
+///
+/// The old rule extended the 300 ms hold by 20 ms whenever the buffer had
+/// grown since the previous loop pass, so whether a gap ended the paste
+/// depended on where the client's wake ups happened to fall, not on the gap.
+/// sshd's ConPTY hands a fragmented paste over in pieces 20 to 60 ms apart
+/// (measured with tests/test_issue598_ssh_paste_unix_client.ps1), so once a
+/// paste outlasted 300 ms the first wake inside such a gap cut it in two: two
+/// bracketed pastes, the second starting mid word.
+/// 100 ms is above every inter fragment gap measured there and is paid once,
+/// at the end of a paste that has already been held for 300 ms.
+#[cfg(windows)]
+const PASTE_STAGE2_QUIET: Duration = Duration::from_millis(100);
+
+/// Stage 2 is over once the paste has been held past the 300 ms window AND
+/// nothing has arrived for [`PASTE_STAGE2_QUIET`].
+#[cfg(windows)]
+fn stage2_paste_is_over(held_for: Duration, since_last_char: Duration) -> bool {
+    held_for > Duration::from_millis(300) && since_last_char >= PASTE_STAGE2_QUIET
+}
+
+/// A key arriving while stage 2 holds a paste ends that paste when the paste
+/// had already gone quiet for [`PASTE_STAGE2_QUIET`] (issue #766).
+///
+/// The quiet rule is the one [`stage2_paste_is_over`] uses, applied when the
+/// next key arrives instead of only when the 300 ms window runs out: a gap
+/// that long means the paste was complete, so the key is new input and goes
+/// to the pane AFTER the paste's closing `ESC[201~`. tmux gets this for free,
+/// because its host brackets the paste in the byte stream and the key after
+/// `ESC[201~` is parsed as a key (tty-keys.c `tty_keys_paste`). Fragments
+/// of one paste that sshd's ConPTY hands over 20 to 60 ms apart (#598) stay
+/// below the threshold and keep accumulating as before.
+#[cfg(windows)]
+fn stage2_paste_ended_by_new_key(paste_stage2: bool, pend_non_empty: bool, since_last_char: Duration) -> bool {
+    paste_stage2 && pend_non_empty && since_last_char >= PASTE_STAGE2_QUIET
+}
+
+#[cfg(windows)]
+impl<'a> PasteHeadEvidence<'a> {
+    /// True when `pend` could be the start of the clipboard's text.
+    ///
+    /// The clipboard must have at least 3 characters: at or below 2 the paste
+    /// and the typing paths are the same code (both flush as `send-text`), so
+    /// holding would cost latency and change nothing.
+    fn clipboard_starts_with(&self, pend: &str) -> bool {
+        match self.clip_head {
+            Some(head) => head.chars().count() >= 3 && head.starts_with(pend),
+            None => false,
+        }
+    }
+
+    fn head_of_paste(&self, pend: &str) -> bool {
+        if self.gesture_open {
+            return true;
+        }
+        // A lone shifted character is held for the same short window as a
+        // clipboard prefix: the rest of a paste follows it inside a
+        // millisecond, a typed character has no follow up that fast.
+        let lone = pend.chars().count() == 1;
+        // A lone character still waiting for its release was typed, not
+        // written by a host (see head_released).
+        if lone && !self.head_released {
+            return false;
+        }
+        if self.shifted_head && lone && self.held_for < PASTE_HEAD_PREFIX_HOLD {
+            return true;
+        }
+        if !self.clipboard_starts_with(pend) {
+            return false;
+        }
+        // One character on prefix evidence alone: hold it for
+        // PASTE_HEAD_PREFIX_HOLD and no longer. Two characters is a burst
+        // shape and keeps the full window.
+        !lone || self.held_for < PASTE_HEAD_PREFIX_HOLD
+    }
+}
+
 #[cfg(windows)]
 fn should_zero_latency_flush_paste_pend(
     paste_pend: &str,
     paste_detection_enabled: bool,
     paste_confirmed: bool,
     paste_stage2: bool,
+    evidence: PasteHeadEvidence<'_>,
 ) -> bool {
     if paste_confirmed || paste_stage2 || paste_pend.is_empty() {
         return false;
     }
     if !paste_detection_enabled {
+        // The user asked for no paste detection at all: never hold.
         return true;
     }
     if paste_pend.starts_with('\n') || paste_pend.starts_with('\t') {
         return false;
     }
-    paste_pend.len() <= 2
+    if paste_pend.len() > 2 {
+        return false;
+    }
+    // Hold the head of a paste for the ordinary 20 ms window, which is what
+    // decides whether this becomes a bracketed `send-paste`.  Typing is
+    // unaffected unless the character typed is the clipboard's first
+    // character, and that case simply takes the path every character took
+    // before the zero latency flush existed.
+    !evidence.head_of_paste(paste_pend)
+}
+
+/// The clipboard's first characters, re-read only when the system's clipboard
+/// sequence number moves.
+///
+/// 64 characters is far more than the check needs (the pending buffer is at
+/// most 2 characters when the flush decision is made) and keeps the cache
+/// cheap for a multi megabyte clipboard.
+#[cfg(windows)]
+#[derive(Default)]
+struct ClipboardHeadCache {
+    seq: Option<u32>,
+    head: Option<String>,
+}
+
+#[cfg(windows)]
+impl ClipboardHeadCache {
+    const HEAD_CHARS: usize = 64;
+
+    fn get(&mut self) -> Option<&str> {
+        self.get_with(
+            crate::clipboard::clipboard_sequence_number(),
+            crate::clipboard::try_read_from_system_clipboard,
+        )
+    }
+
+    /// A read that could not open the clipboard is not cached: another
+    /// window (a clipboard history listener, a paste in flight) holding it
+    /// open for a moment would otherwise blank the head until the clipboard
+    /// next changed, and every later paste of the same text would be flushed
+    /// as typing, one character at a time (issue #684).
+    fn get_with(
+        &mut self,
+        seq: u32,
+        read: impl FnOnce() -> Result<Option<String>, crate::clipboard::ClipboardBusy>,
+    ) -> Option<&str> {
+        if self.seq != Some(seq) {
+            match read() {
+                Ok(text) => {
+                    self.seq = Some(seq);
+                    self.head = text.map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+                }
+                Err(_) => {
+                    if input_log_enabled() {
+                        input_log("paste", &format!(
+                            "clipboard busy (seq {}), head not cached", seq));
+                    }
+                    self.seq = None;
+                    self.head = None;
+                }
+            }
+        }
+        self.head.as_deref()
+    }
+}
+
+/// What the client has already forwarded for the paste gesture in flight.
+///
+/// The console host injects a clipboard paste as character events, and crossterm
+/// can additionally emit `Event::Paste` for the very same keystroke, so a
+/// read-back of the clipboard at the end of the gesture would deliver the text a
+/// second time.  Recording it per gesture, rather than only comparing the text,
+/// is what covers a paste the host splits into several bursts: `C2单元格应显示`
+/// can arrive as `C2` (flushed immediately as typing) and then the CJK part, so
+/// what was forwarded no longer equals the clipboard text even though it is the
+/// whole paste.
+#[derive(Default)]
+struct PasteGesture {
+    /// Text of the bursts forwarded so far, with the time the last one went out.
+    delivered: Option<(String, Instant)>,
+    /// Every character forwarded in the current run of bursts, a run being
+    /// bursts that follow each other within [`PASTE_GESTURE_WINDOW`].  This is
+    /// what a bracketed paste event is compared against (issue #598): the
+    /// event repeats the characters only when its whole text is what just
+    /// went out, never merely because some key was typed a moment earlier.
+    forwarded: String,
+    /// True once any of this gesture's characters have been forwarded.
+    injected: bool,
+    /// When the Ctrl+V press that opened this gesture was seen.  The host's
+    /// characters follow it within a few milliseconds, so a burst arriving
+    /// inside [`PASTE_GESTURE_WINDOW`] of it is that paste and must not be
+    /// committed as typing (issue #684 follow up).
+    opened_at: Option<Instant>,
+}
+
+/// How long after a Ctrl+V press an arriving character still counts as part of
+/// that paste.  The host injects within a few milliseconds of the press; this
+/// is generous enough for a slow one and short enough that a key held down and
+/// released has no lasting effect on typing.
+const PASTE_GESTURE_WINDOW: Duration = Duration::from_millis(300);
+
+/// The decision the `Event::Paste` arm makes: drop a bracketed paste event only
+/// when it repeats characters this client has just forwarded for the same
+/// paste.  Before issue #598 this asked [`PasteGesture::blocks`], whose
+/// "already forwarded" latch was set by the paste event's own `send-paste` and
+/// by every typed key, and only a Ctrl+V press or release cleared it.  A client
+/// behind ssh never sees that keystroke, so after its first paste every later
+/// one was dropped as "a duplicate of N char(s) already sent as characters".
+fn paste_event_is_duplicate(gesture: &PasteGesture, text: &str) -> bool {
+    gesture.repeats_forwarded(text)
+}
+
+/// Upper bound on [`PasteGesture::forwarded`], so a long run of fast typing
+/// cannot grow it without limit.  Far above any paste the host splits.
+const PASTE_FORWARDED_MAX: usize = 1 << 20;
+
+impl PasteGesture {
+    /// A new Ctrl+V started: nothing of this gesture has been forwarded yet.
+    fn start(&mut self) {
+        self.delivered = None;
+        self.forwarded.clear();
+        self.injected = false;
+        self.opened_at = Some(Instant::now());
+    }
+
+    /// The gesture is over, however it ended.
+    fn finish(&mut self) {
+        self.delivered = None;
+        self.forwarded.clear();
+        self.injected = false;
+        self.opened_at = None;
+    }
+
+    /// True while a Ctrl+V press is recent enough that the characters arriving
+    /// now are its paste.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn is_open(&self) -> bool {
+        self.opened_at
+            .map_or(false, |at| at.elapsed() < PASTE_GESTURE_WINDOW)
+    }
+
+    /// Remember `text` as forwarded on behalf of this gesture.
+    fn record(&mut self, text: &str) {
+        if !text.is_empty() {
+            let same_run = self
+                .recent()
+                .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+            if !same_run {
+                self.forwarded.clear();
+            }
+            self.forwarded.push_str(text);
+            if self.forwarded.len() > PASTE_FORWARDED_MAX {
+                let mut cut = self.forwarded.len() - PASTE_FORWARDED_MAX;
+                while !self.forwarded.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                self.forwarded.drain(..cut);
+            }
+            self.injected = true;
+            self.delivered = Some((text.to_string(), Instant::now()));
+        }
+    }
+
+    /// Remember one character handed to a client overlay (the command prompt,
+    /// the rename prompts).
+    ///
+    /// The pane path records whole bursts, because that is how it forwards
+    /// them. An overlay consumes the characters one at a time, so nothing was
+    /// recorded for it at all, and the clipboard read-back of the same Ctrl+V
+    /// did not recognise the text as already delivered: it read the clipboard
+    /// and sent it to the pane, which is #744. Recording them here is what
+    /// lets `blocks` answer the same question for an overlay that it already
+    /// answered for a pane.
+    fn record_char(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        self.record(c.encode_utf8(&mut buf));
+    }
+
+    /// True when a bracketed paste event carrying `text` repeats characters
+    /// this client has just forwarded: the host delivered the same paste as
+    /// key events first, so sending the event too would paste it twice.
+    ///
+    /// Unlike [`PasteGesture::blocks`], which guards the clipboard read-back of
+    /// a Ctrl+V the client saw, this looks at the content.  A terminal that
+    /// pastes without a Ctrl+V keystroke (iTerm2 over ssh, issue #598) sends
+    /// ordinary typing right before its pastes, and a key typed a moment
+    /// earlier must never swallow the paste that follows it.  Line endings are
+    /// ignored because a forwarded CR or LF and the event's CRLF are the same
+    /// paste.
+    fn repeats_forwarded(&self, text: &str) -> bool {
+        let recent = self
+            .recent()
+            .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+        if !recent {
+            return false;
+        }
+        let strip = |s: &str| s.chars().filter(|c| *c != '\r' && *c != '\n').collect::<String>();
+        let pasted = strip(text);
+        !pasted.is_empty() && strip(&self.forwarded).ends_with(&pasted)
+    }
+
+    /// The last forwarded burst and how long ago it went out.
+    fn recent(&self) -> Option<(&str, Duration)> {
+        self.delivered
+            .as_ref()
+            .map(|(text, at)| (text.as_str(), at.elapsed()))
+    }
+
+    /// True when delivering `text` now would repeat this gesture: either its
+    /// characters were already forwarded (whatever they were split into), or
+    /// the same text went out a moment ago.
+    fn blocks(&self, text: &str) -> bool {
+        // "Already forwarded" covers the read-back of a paste whose characters
+        // went out as typing in pieces (`C2` then the CJK part), where the text
+        // no longer compares equal even though it is the whole paste: whatever
+        // comes back right after a burst of this gesture's characters is that
+        // paste, not typing the user did.
+        //
+        // The window runs from that burst, not from the Ctrl+V press, and it
+        // expires.  A client that pastes without a Ctrl+V keystroke (a mobile
+        // terminal, a paste button) sets `injected` too, and the old unbounded
+        // latch -- cleared only by `start()` / `finish()`, a press and its
+        // release -- made it drop every paste after the first as a duplicate of
+        // it, whatever the content.
+        let injected_recently = self.injected
+            && self
+                .recent()
+                .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+        injected_recently
+            || (self.is_open() && self.injected)
+            || duplicates_recent_paste(text, self.recent())
+    }
+}
+
+/// A Ctrl+V PRESS that reached the client, and what came after it (issue #858).
+///
+/// Windows Terminal's own Ctrl+V paste binding swallows the press, so a press
+/// that does reach the client means one of two things: the host pastes by
+/// delivering the clipboard as key records right behind it (the shape
+/// [`PASTE_GESTURE_WINDOW`] exists for), or the host does not paste on Ctrl+V
+/// at all, in which case the key is the user's and belongs to a binding or to
+/// the pane as C-v (0x16), exactly as tmux has it.  Before #858 the release of
+/// that press read the clipboard and pasted it, so `bind -n C-v split-window`
+/// split AND pasted, and nvim never got its visual block key.
+///
+/// The rule: when the press reached the client and nothing paste shaped
+/// followed it before the release, the terminal did not paste, so the release
+/// reads nothing.  An unbound press is held back (`deferred`) instead of being
+/// sent at once, because a pasting host's characters are still on their way;
+/// it goes to the pane as C-v when the release comes with nothing in between,
+/// when the window runs out, or right before an unrelated key.  A release with
+/// no press before it (the route Windows Terminal's binding leaves) is not
+/// this struct's business and keeps reading the clipboard.
+#[derive(Default)]
+struct CtrlVPress {
+    /// When the press arrived; `None` once it was released.
+    at: Option<Instant>,
+    /// Paste shaped input (characters, a paste event) came after the press.
+    followed: bool,
+    /// An unbound C-v still owed to the pane.
+    deferred: bool,
+}
+
+/// What the release of a Ctrl+V press means.
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlVRelease {
+    /// The host pasted after the press: confirm the paste as before.
+    Pasted,
+    /// Nothing followed the press, so the terminal did not paste.  `send_cv`
+    /// is true when the press was held back and is now owed to the pane.
+    NoPaste { send_cv: bool },
+}
+
+/// A press older than this is forgotten: a host that forwards presses but not
+/// releases must not leave one behind that blocks a later release-only paste.
+const CTRLV_PRESS_STALE: Duration = Duration::from_secs(5);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl CtrlVPress {
+    /// A Ctrl+V press arrived.  Returns true when an earlier held back C-v
+    /// (key repeat, or a second tap) must go out first.
+    fn press(&mut self) -> bool {
+        let owed = self.deferred && !self.followed;
+        self.at = Some(Instant::now());
+        self.followed = false;
+        self.deferred = false;
+        owed
+    }
+
+    /// Nothing is bound to the press just seen, so it is the pane's C-v once
+    /// it is clear that no paste follows it.
+    fn defer(&mut self) {
+        if self.pending() {
+            self.deferred = true;
+        }
+    }
+
+    /// True while a press is waiting for its release.
+    fn pending(&self) -> bool {
+        self.at.map_or(false, |t| t.elapsed() < CTRLV_PRESS_STALE)
+    }
+
+    /// Paste shaped input arrived: if a press is pending, the host is pasting,
+    /// and the held back C-v was the paste gesture, not a key for the pane.
+    fn note_paste_input(&mut self) {
+        if self.pending() {
+            self.followed = true;
+            self.deferred = false;
+        }
+    }
+
+    /// A key that is not part of a paste arrived: the held back C-v goes out
+    /// before it, in the order the two were typed.
+    fn take_before_key(&mut self) -> bool {
+        let owed = self.deferred && !self.followed;
+        self.deferred = false;
+        owed
+    }
+
+    /// The held back C-v has waited `window` with nothing behind it: no paste
+    /// is coming, so it is the pane's now, whether or not the key is still down.
+    fn take_due(&mut self, window: Duration) -> bool {
+        let due = self.deferred
+            && !self.followed
+            && self.at.map_or(false, |t| t.elapsed() >= window);
+        if due {
+            self.deferred = false;
+        }
+        due
+    }
+
+    /// The V key came up.  `None` when no press is pending (release only, the
+    /// Windows Terminal binding's route), which keeps the clipboard read.
+    fn release(&mut self) -> Option<CtrlVRelease> {
+        if !self.pending() {
+            *self = CtrlVPress::default();
+            return None;
+        }
+        let verdict = if self.followed {
+            CtrlVRelease::Pasted
+        } else {
+            CtrlVRelease::NoPaste { send_cv: self.deferred }
+        };
+        *self = CtrlVPress::default();
+        Some(verdict)
+    }
+}
+
+/// How long after a burst was forwarded a clipboard read-back of the same text
+/// is treated as a duplicate of it.  The read-back fires from the Ctrl+V Release
+/// of the same gesture, so a few hundred milliseconds is generous, and keeping
+/// it short leaves deliberate repeat pastes alone.
+const PASTE_DUPLICATE_WINDOW: Duration = Duration::from_millis(300);
+
+/// True when `text` is the string a paste-shaped burst just delivered, so
+/// reading the clipboard now would paste it twice.
+///
+/// The content is compared, not just the timing: a *different* clipboard
+/// payload is never dropped, and a deliberate repeat paste still reaches the
+/// pane through its own burst of characters.
+fn duplicates_recent_paste(text: &str, recent: Option<(&str, Duration)>) -> bool {
+    match recent {
+        Some((delivered, age)) => {
+            !text.is_empty() && delivered == text && age < PASTE_DUPLICATE_WINDOW
+        }
+        None => false,
+    }
 }
 
 /// Returns true if the buffer contains any non-ASCII characters (IME / CJK input).
@@ -6197,8 +11341,169 @@ fn paste_buffer_has_non_ascii(buf: &str) -> bool {
     buf.chars().any(|c| !c.is_ascii())
 }
 
+/// True for a character AltGr produced. Windows reports AltGr as Ctrl+Alt, so
+/// `@ { } [ ] \ | ~` on German, Czech and similar layouts arrive as Char with
+/// CONTROL and ALT both set; a genuine Ctrl+Alt chord carries a lowercase
+/// letter instead. Same rule as `normalize_key_for_binding` and the pane arms.
+pub(crate) fn is_altgr_char(c: char, mods: KeyModifiers) -> bool {
+    mods.contains(KeyModifiers::CONTROL)
+        && mods.contains(KeyModifiers::ALT)
+        && !c.is_ascii_lowercase()
+}
+
+/// What a key typed at the client's command prompt asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptKeyAction {
+    /// C-c, C-g or C-[: cancel the prompt, as Escape does.
+    Close,
+    /// Up or C-p: the caller recalls an older entry from the history.
+    HistoryUp,
+    /// Down or C-n: a newer one.
+    HistoryDown,
+    /// The editor took the key, or had no use for it. Either way it stops at
+    /// the prompt.
+    Edited,
+}
+
+/// One key at the client's command prompt, other than text, Enter and Escape.
+///
+/// The editing itself is `copy_mode::prompt_edit`, the editor the copy mode
+/// prompts and the rename overlay already share, reached by the tmux name of
+/// the key. C-c and C-g cancel tmux's prompt the way Escape does
+/// (`status.c:1671` to `:1674`) and C-[ IS Escape.
+pub(crate) fn command_prompt_key(
+    buf: &mut String,
+    back: &mut usize,
+    saved: &mut Option<String>,
+    separators: &str,
+    code: KeyCode,
+    mods: KeyModifiers,
+    top_buffer: impl FnOnce() -> Option<String>,
+) -> PromptKeyAction {
+    if let KeyCode::Char(c) = code {
+        if mods.contains(KeyModifiers::CONTROL)
+            && matches!(c.to_ascii_lowercase(), 'c' | 'g' | '[')
+        {
+            return PromptKeyAction::Close;
+        }
+    }
+    let name = crate::config::format_key_binding(&(code, mods));
+    match crate::copy_mode::prompt_edit(buf, back, saved, separators, &name, top_buffer) {
+        crate::copy_mode::PromptEdit::HistoryUp => PromptKeyAction::HistoryUp,
+        crate::copy_mode::PromptEdit::HistoryDown => PromptKeyAction::HistoryDown,
+        _ => PromptKeyAction::Edited,
+    }
+}
+
+/// A Ctrl+letter typed into the rename overlay. Returns true when the key
+/// closes the overlay: C-c and C-g cancel tmux's prompt (prompt.c, beside
+/// Escape) and C-[ is Escape itself. Anything else goes to the copy-mode prompt
+/// editor, which ignores what it has no meaning for; none of them may reach
+/// the pane behind the overlay.
+pub(crate) fn rename_overlay_ctrl_key(
+    buf: &mut String,
+    back: &mut usize,
+    saved: &mut Option<String>,
+    separators: &str,
+    c: char,
+    top_buffer: impl FnOnce() -> Option<String>,
+) -> bool {
+    match c.to_ascii_lowercase() {
+        'c' | 'g' | '[' => true,
+        lc => {
+            let _ = crate::copy_mode::prompt_edit(buf, back, saved, separators, &format!("c-{}", lc), top_buffer);
+            false
+        }
+    }
+}
+
+/// The top paste buffer, for C-y at a prompt the client draws. The buffers
+/// live in the server, so the client asks with `show-buffer`, over a
+/// connection of its own with the port and key it attached with, the way the
+/// rename overlay asks for the name it opens on. Only the first line is used
+/// (`copy_mode::prompt_paste_line`), so only the first line is read, and it is
+/// read as sent: the usual reply helpers trim it, and a buffer can start or
+/// end with spaces. None when the server does not answer in time.
+/// One line of the server's `choose-buffer` reply, `name: size bytes:
+/// "sample"`, as (name, size, sample). The chooser acts on a buffer by its
+/// name, which stays the same while other buffers come and go (#818).
+pub(crate) fn parse_buffer_line(line: &str) -> Option<(String, usize, String)> {
+    let line = line.trim();
+    let at = line.find(" bytes: ")?;
+    let head = &line[..at];
+    let colon = head.rfind(": ")?;
+    let name = head[..colon].to_string();
+    let size = head[colon + 2..].trim().parse::<usize>().ok()?;
+    let rest = &line[at + " bytes: ".len()..];
+    let sample = rest.strip_prefix('"').unwrap_or(rest);
+    let sample = sample.strip_suffix('"').unwrap_or(sample).to_string();
+    if name.is_empty() { return None; }
+    Some((name, size, sample))
+}
+
+/// The buffer chooser's rows, asked of the server this client is attached to.
+/// Like top_paste_buffer and overlay_initial_name it goes to the port and key
+/// the client attached with: a lookup by the session's name went to the
+/// pre-rename base after a rename-session, found no .port file and left the
+/// chooser closed although the session had buffers. Empty when the server has
+/// no buffers or does not answer in time.
+fn fetch_buffer_entries(port: u16, session_key: &str) -> Vec<(String, usize, String)> {
+    crate::session::fetch_authed_response_multi(
+        &format!("127.0.0.1:{}", port),
+        session_key,
+        b"choose-buffer\n",
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+    // One "name: 17 bytes: "content"" per buffer.
+    .map(|reply| reply.trim().split('\n').filter_map(parse_buffer_line).collect())
+    .unwrap_or_default()
+}
+
+fn top_paste_buffer(port: u16, session_key: &str) -> Option<String> {
+    crate::session::fetch_authed_first_line_raw(
+        &format!("127.0.0.1:{}", port),
+        session_key,
+        b"show-buffer\n",
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+}
+
+/// The name a rename overlay opens on, asked for as it opens.
+///
+/// `session_label` and `active_window_name` are what the last parsed frame
+/// said. That is fine for the status line, which re-reads them on every
+/// repaint and so catches up on its own, and wrong for an overlay, which keeps
+/// whatever it copied: a name typed over a stale value renames the wrong thing
+/// back. The overlay therefore asks, the way `choose-tree`, `choose-session`
+/// and `choose-buffer` ask for their lists.
+///
+/// The port and the key are the ones this client attached with, not a fresh
+/// lookup. A `rename-session` moves the `.port` file and writes the same port
+/// number into the new one, so these survive the very rename this exists for,
+/// while a lookup by the client's own session name would go to the pre rename
+/// base and find nothing.
+///
+/// Falls back to the frame's value when the server does not answer inside the
+/// budget, the same one the choosers use, so the overlay is never worse off
+/// than before. `fetch_authed_response` trims the reply and treats an empty
+/// one, an "OK" and an "ERROR:" as no answer, so each of those falls back too.
+fn overlay_initial_name(port: u16, session_key: &str, fmt: &str, fallback: &str) -> String {
+    let addr = format!("127.0.0.1:{}", port);
+    let cmd = format!("display-message -p {}\n", fmt);
+    crate::session::fetch_authed_response(
+        &addr,
+        session_key,
+        cmd.as_bytes(),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+    .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Route a clipboard paste into the active client-side text overlay
-/// (command prompt, rename prompt, pane title, window-index prompt).
+/// (command prompt, rename prompt).
 /// Returns `true` when an overlay consumed the paste — callers must skip
 /// the `send-paste` forwarding in that case so the text does not also leak
 /// into the underlying pane (fixes issue #290).
@@ -6206,28 +11511,15 @@ fn route_paste_to_overlay(
     data: &str,
     command_input: bool,
     command_buf: &mut String,
-    command_cursor: &mut usize,
+    command_back: usize,
     renaming: bool,
     rename_buf: &mut String,
-    pane_renaming: bool,
-    pane_title_buf: &mut String,
-    window_idx_input: bool,
-    window_idx_buf: &mut String,
 ) -> bool {
     if command_input {
-        command_buf.insert_str(*command_cursor, data);
-        *command_cursor += data.len();
+        crate::copy_mode::prompt_insert(command_buf, command_back, data);
         true
     } else if renaming {
         rename_buf.push_str(data);
-        true
-    } else if pane_renaming {
-        pane_title_buf.push_str(data);
-        true
-    } else if window_idx_input {
-        for c in data.chars() {
-            if c.is_ascii_digit() { window_idx_buf.push(c); }
-        }
         true
     } else {
         false
@@ -6243,8 +11535,158 @@ mod tests;
 mod test_zoom_bleed;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_chooser_kill_confirm.rs"]
+mod test_chooser_kill_confirm;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue744_paste_overlay_routing.rs"]
+mod test_issue744_paste_overlay_routing;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue684_clipboard_head_cache.rs"]
+mod test_issue684_clipboard_head_cache;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue766_paste_then_key.rs"]
+mod test_issue766_paste_then_key;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue858_ctrlv_press.rs"]
+mod test_issue858_ctrlv_press;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue888_send_key_wire_quoting.rs"]
+mod test_issue888_send_key_wire_quoting;
+
+/// How long the client keeps polling console input at 1ms after sending a key,
+/// waiting for that key's echo to come back and be drawn.
+///
+/// It has to outlast the slowest echo psmux is expected to render, or the
+/// window shuts while the character is still in flight and the frame carrying
+/// it waits on a coarser poll instead. A pwsh pane needs about 15ms just to get
+/// the echoed character out of its ConPTY before psmux sees a byte of it: that
+/// is PSReadLine, measured against a raw pseudoconsole with no psmux in the
+/// picture by tests/conpty_echolat.cs. psmux then has to render and deliver it.
+pub(crate) const KEY_ECHO_WINDOW_MS: u128 = 60;
+
+/// Whether the fast-poll window opened by a keystroke has expired.
+///
+/// Time is the ONLY thing that closes it. A frame arriving is not evidence
+/// that the echo arrived, and at a pwsh prompt it usually is not: PSReadLine
+/// answers one keystroke with TWO writes, a bare cursor-hide immediately and
+/// the character itself about 15ms later (conpty_echolat puts the character in
+/// the first chunk 0 times out of 40). The cursor-hide renders as a perfectly
+/// good changed frame, so closing the window on it shut the fast poll right
+/// before the character landed.
+pub(crate) fn key_echo_window_expired(elapsed_ms: u128) -> bool {
+    elapsed_ms > KEY_ECHO_WINDOW_MS
+}
+
+/// How long an idle attached client may go without asking the server for a
+/// screen (#658).
+///
+/// Not a refresh cadence. The server pushes a frame whenever pane or metadata
+/// state changes, and that push is what an idle client renders. This is the
+/// floor UNDER the push: the longest the display may stay wrong if one push
+/// does not land.
+///
+/// One second was chosen against the two numbers either side of it. Below, an
+/// idle client at this floor reads 1.0 socket lines per second, which is a
+/// fifth of the 5/sec quiet gate that `tests/test_idle_socket_traffic.ps1`
+/// asserts idle means, and two orders of magnitude under the 187/sec
+/// request/reply spin that commit 9093e03 removed. Above, a stale screen the
+/// user is looking at is a bug whether it lasts one second or thirty minutes,
+/// and only the first second of it is worth paying for. 2000 would halve an
+/// already immeasurable cost: the idle CPU of both processes is the same with
+/// the floor as without it (measured in
+/// `tests/test_issue658_stale_frame_recovery.ps1`), so there is nothing left
+/// to save by waiting longer.
+pub(crate) const IDLE_FLOOR_MS: u64 = 1000;
+
+/// Whether this iteration of the client loop should put a `dump-state` on the
+/// wire.
+///
+/// Pure so the FLOOR can be tested. `force_dump` and a resize are immediate;
+/// while typing the request is capped at ~100fps to match `input_poll_ms`; and
+/// an idle client asks once per [`IDLE_FLOOR_MS`].
+///
+/// The idle arm used to be a hard `false`, on the premise that a server push is
+/// a reliable notification. It is not guaranteed: everything that has to go
+/// right for one to arrive is on the far side of a socket, the client has no
+/// way to check that it did, and with `force_dump` spent on the request rather
+/// than latched there was no retry path left. One push that did not land left
+/// the client painted with a stale screen for ever - tabs stopped switching,
+/// keys stopped echoing - until the user detached and attached again. Asking
+/// once a second cannot spin, because the server answers "NC" in two bytes and
+/// the client stamps `last_dump_time` when it reads one, which puts the next
+/// request another whole second away.
+pub(crate) fn should_request_dump(
+    force_dump: bool,
+    size_changed: bool,
+    typing_active: bool,
+    since_dump: u64,
+) -> bool {
+    if force_dump || size_changed {
+        true
+    } else if typing_active {
+        // ~100fps cap when typing (matches poll_ms)
+        since_dump >= 10
+    } else {
+        since_dump >= IDLE_FLOOR_MS
+    }
+}
+
+/// The console-input poll interval, in milliseconds, for one iteration of the
+/// client loop.
+///
+/// Pure so the ORDERING can be tested. The `key_echo_pending_ms` arm must sit
+/// above `dump_in_flight`: sending a key sets `force_dump`, which puts a
+/// dump-state on the wire immediately and therefore makes `dump_in_flight` true
+/// for exactly the window in which the echo is expected. With the arms the
+/// other way round the loop sleeps 5ms per iteration while the frame carrying
+/// the echo sits unread on the socket.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn input_poll_ms(
+    paste_pend_active: bool,
+    got_frame: bool,
+    key_echo_pending_ms: Option<u128>,
+    dump_in_flight: bool,
+    force_dump: bool,
+    typing_active: bool,
+    since_dump: u64,
+) -> u64 {
+    if paste_pend_active {
+        1
+    } else if got_frame {
+        0
+    } else if key_echo_pending_ms.is_some_and(|e| !key_echo_window_expired(e)) {
+        1
+    } else if dump_in_flight {
+        5
+    } else if force_dump {
+        0
+    } else if typing_active {
+        // Rate-limit to ~100fps when typing. 10ms is notably shorter than
+        // ConPTY's ~16ms render interval, avoiding systematic alignment delays.
+        10u64.saturating_sub(since_dump)
+    } else {
+        // The server pushes frames proactively, so 16ms (~60fps) still renders
+        // a pushed frame within one vsync, at negligible CPU.
+        16
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_keystroke_echo_window.rs"]
+mod test_keystroke_echo_window;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_zoom_cursor_rect.rs"]
 mod test_zoom_cursor_rect;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_border_status_cursor.rs"]
+mod test_pane_border_status_cursor;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue345_command_prompt_utf8.rs"]
@@ -6257,3 +11699,87 @@ mod test_issue361_osc8_overlay;
 #[cfg(test)]
 #[path = "../tests-rs/test_sixel_client_model.rs"]
 mod test_sixel_client_model;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_osc8_stale_link.rs"]
+mod test_osc8_stale_link;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_wants_mouse_selection.rs"]
+mod test_pane_wants_mouse_selection;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue507_popup_cursor.rs"]
+mod test_issue507_popup_cursor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue605_stale_port_attach.rs"]
+mod test_issue605_stale_port_attach;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue763_client_report.rs"]
+mod tests_issue763_client_report;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_window_content_styles.rs"]
+mod test_window_content_styles;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue619_window_style_fallback.rs"]
+mod test_issue619_window_style_fallback;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_border_backgrounds.rs"]
+mod test_pane_border_backgrounds;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue626_border_attrs_default.rs"]
+mod test_issue626_border_attrs_default;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_border_indicators.rs"]
+mod test_pane_border_indicators;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue640_switch_client_table.rs"]
+mod test_issue640_switch_client_table;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue640_sticky_key_table.rs"]
+mod test_issue640_sticky_key_table;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_switch_client_target_routing.rs"]
+mod test_switch_client_target_routing;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_prefix_dot_move_window.rs"]
+mod test_prefix_dot_move_window;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue821_window_index_prompt.rs"]
+mod test_issue821_window_index_prompt;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue789_followup_client_prompt.rs"]
+mod test_issue789_followup_client_prompt;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue658_idle_dump_floor.rs"]
+mod test_issue658_idle_dump_floor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue675_stale_writer.rs"]
+mod test_issue675_stale_writer;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_keytable_switch_client.rs"]
+mod test_keytable_switch_client;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue783_prompt_edit_unify.rs"]
+mod test_issue783_prompt_edit_unify;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue839_rename_session_identity.rs"]
+mod test_issue839_rename_session_identity;

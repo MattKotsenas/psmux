@@ -106,7 +106,7 @@ fn malformed_numeric_keeps_prior_value() {
     let mut a = app();
     crate::config::parse_config_content(&mut a, "set -g escape-time 77\nset -g escape-time notanumber\n");
     assert_eq!(a.escape_time_ms, 77, "bad value must not overwrite the good one");
-    assert!(warns_contain(&a, "invalid value 'notanumber'"));
+    assert!(warns_contain(&a, "expected a number"));
 }
 
 #[test]

@@ -7,6 +7,15 @@ $PSMUX = "tmux"
 $SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
 $SshHost = "$SshUser@localhost"
 
+# Fail-fast SSH availability probe: without it, the first bare `ssh` call
+# blocks forever on auth when no sshd/key-auth is set up, and the suite burns
+# its entire harness timeout producing zero output (BatchMode forbids prompts).
+$sshProbe = ssh -o ConnectTimeout=5 -o BatchMode=yes $SshHost "echo psmux_ssh_ok" 2>$null
+if ("$sshProbe" -notmatch 'psmux_ssh_ok') {
+    Write-Host "[SKIP] SSH to localhost unavailable (sshd not running or key auth not configured)" -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host "=== VT Parser Paste Path Test (SSH) ===" -ForegroundColor Cyan
 
 # Step 1: Clean up
@@ -16,7 +25,7 @@ Start-Sleep -Seconds 2
 
 # Step 2: Clear debug log
 Write-Host "[STEP 2] Clearing debug log..." -ForegroundColor Yellow
-ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
+ssh $SshHost 'cmd /c "echo. > %USERPROFILE%\.psmux\ssh_input.log"' 2>$null
 Start-Sleep -Milliseconds 500
 
 # Step 3: Start detached session
@@ -27,7 +36,8 @@ Start-Sleep -Seconds 3
 # Verify
 $sessions = ssh $SshHost "$PSMUX list-sessions"
 Write-Host "  Sessions: $sessions"
-if ($sessions -notmatch "vt_paste") {
+$sessionsStr = ($sessions | Out-String)
+if ($sessionsStr -notmatch "vt_paste") {
     Write-Host "[FATAL] Session not created" -ForegroundColor Red
     exit 1
 }
@@ -98,7 +108,7 @@ Write-Host "--- END ---" -ForegroundColor Cyan
 
 # Step 10: Read debug log
 Write-Host "[STEP 10] Reading SSH debug log..." -ForegroundColor Yellow
-$debugLog = ssh $SshHost "type %USERPROFILE%\.psmux\ssh_input.log"
+$debugLog = ssh $SshHost 'cmd /c "type %USERPROFILE%\.psmux\ssh_input.log"'
 Write-Host "--- DEBUG LOG (last 30 lines) ---" -ForegroundColor DarkGray
 $debugLog | Select-Object -Last 30 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 Write-Host "--- END ---" -ForegroundColor DarkGray

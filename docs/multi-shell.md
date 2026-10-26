@@ -218,6 +218,84 @@ Here are common shells and how to configure them:
 | Python REPL | `python` | Not a shell, but works great in a pane |
 | Node.js REPL | `node` | Same, useful for quick JS testing |
 
+## WSL Panes
+
+A pane running `wsl` is a Windows process (`wsl.exe`, plus `wslhost.exe`) bridging to a Linux
+shell inside the WSL VM. Three things follow from that, and psmux handles each of them.
+
+### `#{pane_current_path}` inside WSL needs shell integration
+
+psmux answers `#{pane_current_path}` the way tmux does, by asking the operating system for the
+working directory of the pane's foreground process. That works for PowerShell, `cmd`, Cygwin bash
+and Git Bash, whose `cd` also moves the Win32 working directory. It cannot work for WSL: the shell
+you type at is a Linux process, and the only Windows processes in the pane keep the directory they
+were started in forever. Nothing on the Windows side can see where the Linux shell went, so without
+help `split-window -c "#{pane_current_path}"` opens where you were *before* you typed `wsl`
+([#615](https://github.com/psmux/psmux/issues/615)).
+
+The fix is the same one tmux and Windows Terminal rely on: let the shell announce its own
+directory with OSC 7. Add this to `~/.bashrc` inside the distro:
+
+```bash
+PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'
+```
+
+For zsh use `precmd() { printf "\033]7;file://%s%s\033\\" "$HOST" "$PWD"; }`. When a bridge such
+as `wsl.exe` or `ssh.exe` is in the pane's process tree, the announced path outranks what Windows
+reports, and psmux translates it into a path Windows can open: `/mnt/c/Users` becomes `C:\Users`,
+and a Linux only directory such as `/home/you` becomes `\\wsl.localhost\<distro>\home\you`. ConEmu's
+`OSC 9;9` form (`printf "\033]9;9;%s\033\\" "$PWD"`) is accepted too. Without the announcement
+nothing breaks, the variable simply keeps the last directory psmux could observe.
+
+The same mechanism works for an `ssh` pane: a remote shell that emits OSC 7 gives
+`#{pane_current_path}` a real answer where the local process walk cannot.
+
+### Ctrl+C right after launching `wsl`
+
+Pressing Ctrl+C inside a WSL pane sends the interrupt to the Linux foreground program, as it does
+in tmux. Earlier psmux builds had a window of about 1.5 seconds after typing `wsl` (while the VM
+was still booting) in which a Ctrl+C aborted the whole WSL launch and dropped you back at the
+PowerShell prompt. That window is closed ([#579](https://github.com/psmux/psmux/issues/579)):
+while a bridge process is starting, psmux never broadcasts a console Ctrl+C event into the pane,
+and it strips `ENABLE_PROCESSED_INPUT` before writing the raw `0x03` byte so conhost cannot turn
+it into one either.
+
+### Mouse in WSL programs
+
+Clicks, drags and the wheel reach a mouse aware program inside WSL (for example `nvim` with
+`set mouse=a`) the same way they reach a native one. A pointer merely moving over the pane is not
+reported unless the program asked for motion tracking (DECSET 1003), so hovering costs nothing
+([#604](https://github.com/psmux/psmux/issues/604)). The wheel is forwarded only to a program that
+has enabled a mouse mode; over a program that never asked, the notch is a no-op rather than a burst
+of literal keystrokes. See [faq.md](faq.md) and [mouse-ssh.md](mouse-ssh.md).
+
+## Start Directories and Warm Panes
+
+`new-window -c <dir>` and `split-window -c <dir>` normally hand the directory to the new process at
+creation time. When the new pane is served from the warm pool (a pre-spawned copy of your
+`default-shell`, see [warm-sessions.md](warm-sessions.md)), that shell is already running, so psmux
+instead types a `cd` line into it and clears the screen. The line is written in the syntax of the
+shell that is actually running, chosen from the effective `default-shell`
+([#600](https://github.com/psmux/psmux/issues/600)). The choice is made on the **basename** of that
+setting, so every spelling of one shell behaves the same: a bare name or a full path, forward or
+backslashes, with or without `.exe`, in any letter case, quoted, and with arguments after it
+([#672](https://github.com/psmux/psmux/issues/672)):
+
+| `default-shell` | Injected line |
+|---|---|
+| `pwsh`, `powershell` | `cd '<dir>'; [System.IO.Directory]::SetCurrentDirectory(...); cls` (the second call keeps the Win32 working directory in step so `#{pane_current_path}` follows) |
+| `cmd` | `cd /d "<dir>" & cls` |
+| `bash`, `zsh`, `sh`, `fish`, `dash`, `ksh`, `tcsh`, `csh`, `ash`, `busybox` | `cd '<dir>'; clear` with the path written with forward slashes |
+| `nu`, `nushell` | `cd '<dir>'; clear` with the path as given (a backslash is an ordinary character in nu single quotes); a path containing an apostrophe switches to double quotes (`cd "<dir>"`, every backslash doubled) because a nushell single-quoted string has no quote escape at all |
+| anything else | the PowerShell form |
+
+`git-bash.exe` (Git Bash's GUI launcher, which psmux runs as the console `bash.exe` beside it)
+counts as bash. `wsl` falls into the last row; a `default-shell` of
+`C:\Windows\System32\bash.exe` is WSL's bash and gets the bash row, because the shell on the other
+side of it is a POSIX shell. If your `default-shell` falls into the last row and the injected line
+errors, turn warm panes off with `set -g warm off` so every pane starts cold in the requested
+directory instead.
+
 ## Tips
 
 - **Paths with spaces** must be wrapped in double quotes: `"C:/Program Files/..."`

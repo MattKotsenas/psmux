@@ -41,8 +41,10 @@ function Write-Info {
 # Run a psmux command in this namespace, returning a hashtable with
 # Out (stdout text), Err (stderr text) and Code (exit code).
 function Invoke-Psmux {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    $allArgs = @("-L", $Socket) + $Args
+    # Simple function on purpose (no param block): an advanced function's
+    # binder eats -d as the common -Debug switch, so `new-session -d` would
+    # attach and hang. Automatic $args passes all tokens through verbatim.
+    $allArgs = @("-L", $Socket) + $args
     $out = & psmux @allArgs 2>&1
     $code = $LASTEXITCODE
     $text = ($out | Out-String).Trim()
@@ -98,8 +100,8 @@ function Get-ListPanesCount {
 
 # Fire-and-forget a psmux command (overlapping, not awaited) as a background process.
 function Start-PsmuxAsync {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    $allArgs = @("-L", $Socket) + $Args
+    # Simple function on purpose: see Invoke-Psmux (binder eats -d as -Debug).
+    $allArgs = @("-L", $Socket) + $args
     return Start-Process -FilePath "psmux" -ArgumentList $allArgs -NoNewWindow -PassThru
 }
 

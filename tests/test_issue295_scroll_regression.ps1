@@ -1,17 +1,13 @@
-# Issue #295: opencode scroll regression (forward_mouse_to_pane_ex discarding wheel flags)
-# =========================================================================================
-# Root cause: commit 1b62ff8 (fix #285) refactored scroll handling in input.rs to use
-# pane_wants_mouse() but the forward_mouse_to_pane_ex() function was passing (0, 0) for
-# button_state and event_flags instead of the actual values. This meant inject_mouse_combined()
-# never saw MOUSE_WHEELED in event_flags, so the Win32 MOUSE_EVENT injection (the #277 fix
-# for Bubble Tea/Go apps like opencode) was dead code in the local TUI path.
-#
-# Fix: pass actual button_state and event_flags through to inject_mouse_combined().
+# Issue #295: fallback scroll requests preserve scroll-mode behavior
+# =================================================================
+# This script exercises coordinate-based scroll-up/scroll-down requests and
+# scroll-enter-copy-mode. It does not exercise the client's semantic
+# pane-scroll request or child mouse metadata.
 #
 # This test proves:
-# 1. Mouse scroll events are forwarded to TUI apps in alt-screen
-# 2. The Win32 MOUSE_EVENT injection path is reached for wheel events
-# 3. scroll-enter-copy-mode=off still allows direct scrollback in normal panes
+# 1. Mouse options round-trip through the server
+# 2. Fallback scroll requests are accepted
+# 3. scroll-enter-copy-mode controls copy-mode entry
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
@@ -88,7 +84,7 @@ function Get-Dump {
 }
 
 # === SETUP ===
-Write-Host "`n=== Issue #295: opencode Scroll Regression Test ===" -ForegroundColor Cyan
+Write-Host "`n=== Issue #295: fallback scroll request regression ===" -ForegroundColor Cyan
 Cleanup
 
 & $PSMUX new-session -d -s $SESSION
@@ -166,8 +162,8 @@ if ($state) {
     Write-Fail "Could not get dump-state"
 }
 
-# === TEST 4: Scroll in TUI app (alt-screen detection) ===
-Write-Host "`n[Test 4] Scroll forwarding to alt-screen TUI app" -ForegroundColor Yellow
+# === TEST 4: Fallback scroll requests while a paging app runs ===
+Write-Host "`n[Test 4] Fallback scroll requests with paging app" -ForegroundColor Yellow
 # Launch a command that uses alt-screen (more/less equivalent on Windows)
 & $PSMUX send-keys -t $SESSION "powershell -NoProfile -Command `"1..200 | Out-Host -Paging`"" Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 3
@@ -183,41 +179,32 @@ else { Write-Fail "Scroll-up with TUI: $resp" }
 
 # Exit the paging command
 & $PSMUX send-keys -t $SESSION "q" 2>&1 | Out-Null
-Start-Sleep -Seconds 1
+& $PSMUX send-keys -t $SESSION C-c 2>&1 | Out-Null
+Start-Sleep -Seconds 2
 
 # === TEST 5: Verify scroll-enter-copy-mode=on enters copy mode on scroll-up ===
 Write-Host "`n[Test 5] scroll-enter-copy-mode=on enters copy mode" -ForegroundColor Yellow
 & $PSMUX set-option -g scroll-enter-copy-mode on -t $SESSION 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 
-$resp = Send-TcpCommand -Session $SESSION -Command "mouse-scroll-up 10 10"
+$alternateOn = (& $PSMUX display-message -p -t $SESSION '#{alternate_on}' 2>&1 | Out-String).Trim()
+$inModeBefore = (& $PSMUX display-message -p -t $SESSION '#{pane_in_mode}' 2>&1 | Out-String).Trim()
+if ($alternateOn -ne "0") { Write-Fail "Precondition failed: alternate_on=$alternateOn" }
+if ($inModeBefore -ne "0") { Write-Fail "Precondition failed: pane_in_mode=$inModeBefore" }
+
+$resp = Send-TcpCommand -Session $SESSION -Command "scroll-up 10 10"
 Start-Sleep -Seconds 1
 
-$conn = Connect-Persistent -Session $SESSION
-$state = Get-Dump $conn
-$conn.tcp.Close()
-
-if ($state) {
-    $json = $state | ConvertFrom-Json
-    $mode = $json.mode
-    if ($mode -eq "CopyMode" -or $mode -match "Copy") {
-        Write-Pass "scroll-enter-copy-mode=on correctly enters copy mode"
-    } else {
-        Write-Info "Mode: $mode (may need alt-screen check)"
-        # If the pane is detected as alt-screen due to heuristic, scroll forwards instead
-        # This is still correct behavior - just means heuristic fired
-        Write-Pass "Scroll processed (mode=$mode, heuristic may have forwarded)"
-    }
-} else {
-    Write-Fail "Could not get dump-state"
-}
+$inModeAfter = (& $PSMUX display-message -p -t $SESSION '#{pane_in_mode}' 2>&1 | Out-String).Trim()
+if ($inModeAfter -eq "1") { Write-Pass "scroll-enter-copy-mode=on correctly enters copy mode" }
+else { Write-Fail "Expected pane_in_mode=1 after scroll-up, got: $inModeAfter" }
 
 # Reset: exit copy mode if entered
 & $PSMUX send-keys -t $SESSION "q" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 
-# === TEST 6: Win32 TUI Visual Verification ===
-Write-Host "`n[Test 6] Win32 TUI Visual Verification" -ForegroundColor Yellow
+# === TEST 6: Attached-client fallback request smoke test ===
+Write-Host "`n[Test 6] Attached-client fallback request smoke test" -ForegroundColor Yellow
 $SESSION_TUI = "test295_tui_proof"
 & $PSMUX kill-session -t $SESSION_TUI 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
@@ -228,9 +215,9 @@ Start-Sleep -Seconds 4
 
 & $PSMUX has-session -t $SESSION_TUI 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Fail "TUI session creation failed"
+    Write-Fail "Attached client session creation failed"
 } else {
-    Write-Pass "TUI session created (visible window)"
+    Write-Pass "Attached client session created"
 
     # Configure mouse
     & $PSMUX set-option -g mouse on -t $SESSION_TUI 2>&1 | Out-Null
@@ -242,12 +229,12 @@ if ($LASTEXITCODE -ne 0) {
 
     # Send scroll via TCP (fire-and-forget)
     $resp = Send-TcpCommand -Session $SESSION_TUI -Command "scroll-up 10 10"
-    if ($null -eq $resp -or $resp -eq "" -or $resp -eq "OK" -or $resp -eq "TIMEOUT") { Write-Pass "TUI: scroll-up via TCP accepted" }
-    else { Write-Fail "TUI: scroll-up response: $resp" }
+    if ($null -eq $resp -or $resp -eq "" -or $resp -eq "OK" -or $resp -eq "TIMEOUT") { Write-Pass "Attached client: scroll-up via TCP accepted" }
+    else { Write-Fail "Attached client: scroll-up response: $resp" }
 
     $resp = Send-TcpCommand -Session $SESSION_TUI -Command "scroll-down 10 10"
-    if ($null -eq $resp -or $resp -eq "" -or $resp -eq "OK" -or $resp -eq "TIMEOUT") { Write-Pass "TUI: scroll-down via TCP accepted" }
-    else { Write-Fail "TUI: scroll-down response: $resp" }
+    if ($null -eq $resp -or $resp -eq "" -or $resp -eq "OK" -or $resp -eq "TIMEOUT") { Write-Pass "Attached client: scroll-down via TCP accepted" }
+    else { Write-Fail "Attached client: scroll-down response: $resp" }
 }
 
 # Cleanup TUI
@@ -260,14 +247,5 @@ Cleanup
 Write-Host "`n=== Results ===" -ForegroundColor Cyan
 Write-Host "  Passed: $($script:TestsPassed)" -ForegroundColor Green
 Write-Host "  Failed: $($script:TestsFailed)" -ForegroundColor $(if ($script:TestsFailed -gt 0) { "Red" } else { "Green" })
-
-Write-Host "`n=== Root Cause Analysis ===" -ForegroundColor Cyan
-Write-Host "  Commit 1b62ff8 (fix #285) refactored scroll handling in input.rs" -ForegroundColor White
-Write-Host "  to use pane_wants_mouse() instead of alternate_screen() checks." -ForegroundColor White
-Write-Host "  However, forward_mouse_to_pane_ex() was passing (0, 0) for" -ForegroundColor White
-Write-Host "  button_state and event_flags instead of the actual values." -ForegroundColor White
-Write-Host "  This meant the MOUSE_WHEELED check in inject_mouse_combined()" -ForegroundColor White
-Write-Host "  (the #277 fix for Bubble Tea/Go apps) never triggered." -ForegroundColor White
-Write-Host "  Fix: pass actual button_state/event_flags through." -ForegroundColor White
 
 exit $script:TestsFailed

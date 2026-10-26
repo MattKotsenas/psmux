@@ -17,19 +17,12 @@ use crate::types::{AppState, LayoutKind, Node};
 use ratatui::layout::Rect;
 
 fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
-    let pty = portable_pty::native_pty_system();
-    let pair = pty
-        .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .expect("openpty");
-    let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
-    cmd.arg("/c");
-    cmd.arg("exit");
-    let child = pair.slave.spawn_command(cmd).expect("spawn dummy");
-    let writer = pair.master.take_writer().expect("writer");
+    let (master, writer) = crate::util::stub_pane_pty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+    let child = crate::util::StubChild::exited();
     let term = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
     let epoch = Instant::now() - Duration::from_secs(2);
     crate::types::Pane {
-        master: pair.master,
+        master,
         writer,
         child,
         term,
@@ -47,14 +40,19 @@ fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
+        scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: Arc::new(AtomicU8::new(0)),
         bell_pending: Arc::new(AtomicBool::new(false)),
         cpr_pending: Arc::new(AtomicBool::new(false)),
-        copy_state: None,
-        pane_style: None,
+        color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        copy_state: None, live_term: None,
+        pane_style: None, pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        spawned_at: None,
+        start_command: String::new(),
+        cwd_hint: None,
     }
 }
 
@@ -64,6 +62,9 @@ fn make_window(id: usize) -> crate::types::Window {
         active_path: vec![],
         name: "w".to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -74,6 +75,8 @@ fn make_window(id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 

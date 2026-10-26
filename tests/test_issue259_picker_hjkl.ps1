@@ -55,7 +55,9 @@ $sc_k = $src -match "KeyCode::Char\('k'\)\s+if\s+session_chooser\s*=>\s*\{\s*if\
 Add-Result "session_chooser k -> up" $sc_k ""
 
 Write-Test "session_chooser: KeyCode::Char('j') increments session_selected"
-$sc_j = $src -match "KeyCode::Char\('j'\)\s+if\s+session_chooser\s*=>\s*\{\s*if\s+session_selected\s*\+\s*1\s*<\s*session_entries\.len\(\)\s*\{\s*session_selected\s*\+=\s*1"
+# Post-ea71e75 down-navigation is bounded by the filtered list length
+# (session_filtered_indices), not raw session_entries.
+$sc_j = $src -match "KeyCode::Char\('j'\)\s+if\s+session_chooser\s*=>\s*\{\s*let\s+visible_len\s*=\s*session_filtered_indices\(&session_entries,\s*&session_filter\)\.len\(\);\s*if\s+session_selected\s*\+\s*1\s*<\s*visible_len\s*\{\s*session_selected\s*\+=\s*1"
 Add-Result "session_chooser j -> down" $sc_j ""
 
 Write-Test "session_chooser: KeyCode::Char('h') navigates up (tmux mode-tree parity)"
@@ -63,14 +65,18 @@ $sc_h = $src -match "KeyCode::Char\('h'\)\s+if\s+session_chooser\s*=>\s*\{\s*if\
 Add-Result "session_chooser h -> up" $sc_h ""
 
 Write-Test "session_chooser: KeyCode::Char('l') navigates down (tmux mode-tree parity)"
-$sc_l = $src -match "KeyCode::Char\('l'\)\s+if\s+session_chooser\s*=>\s*\{\s*if\s+session_selected\s*\+\s*1\s*<\s*session_entries\.len"
+$sc_l = $src -match "KeyCode::Char\('l'\)\s+if\s+session_chooser\s*=>\s*\{\s*let\s+visible_len\s*=\s*session_filtered_indices\(&session_entries,\s*&session_filter\)\.len\(\);\s*if\s+session_selected\s*\+\s*1\s*<\s*visible_len\s*\{\s*session_selected\s*\+=\s*1"
 Add-Result "session_chooser l -> down" $sc_l ""
 
 Write-Test "session_chooser: g/G map to Home/End"
-$sc_g = $src -match "KeyCode::Char\('g'\)\s+if\s+session_chooser\s*=>\s*\{\s*session_selected\s*=\s*0"
-$sc_G = $src -match "KeyCode::Char\('G'\)\s+if\s+session_chooser\s*=>\s*\{\s*session_selected\s*=\s*session_entries\.len\(\)\.saturating_sub\(1\)"
-Add-Result "session_chooser g -> top" $sc_g ""
-Add-Result "session_chooser G -> bottom" $sc_G ""
+# NOTE: PowerShell variable names are case-insensitive, so $sc_g and $sc_G
+# were the SAME variable and the "g -> top" check silently reported the G
+# result. Distinct names keep both checks real. G is bounded by the filtered
+# list (session_filtered_indices) post-ea71e75.
+$sc_g_top = $src -match "KeyCode::Char\('g'\)\s+if\s+session_chooser\s*=>\s*\{\s*session_selected\s*=\s*0"
+$sc_G_bottom = $src -match "KeyCode::Char\('G'\)\s+if\s+session_chooser\s*=>\s*\{\s*session_selected\s*=\s*session_filtered_indices\(&session_entries,\s*&session_filter\)\.len\(\)\.saturating_sub\(1\)"
+Add-Result "session_chooser g -> top" $sc_g_top ""
+Add-Result "session_chooser G -> bottom" $sc_G_bottom ""
 
 # --- tree_chooser ---
 Write-Test "tree_chooser: KeyCode::Char('k') decrements tree_selected"
@@ -81,19 +87,26 @@ Write-Test "tree_chooser: KeyCode::Char('j') increments tree_selected"
 $tc_j = $src -match "KeyCode::Char\('j'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*\+\s*1\s*<\s*tree_entries\.len"
 Add-Result "tree_chooser j -> down" $tc_j ""
 
-Write-Test "tree_chooser: KeyCode::Char('h') navigates up"
-$tc_h = $src -match "KeyCode::Char\('h'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*>\s*0"
-Add-Result "tree_chooser h -> up" $tc_h ""
+# The tree's rows have depth, so tmux's mode_tree_key gives h/- the Left arm
+# (collapse, or go to the parent) and l/+ the Right arm (expand, or move down
+# once expanded), mode-tree.c `case KEYC_LEFT: case 'h': case '-':`. Since
+# discussion 776 psmux routes them through choose_tree::mode_tree_alias; the
+# behaviour itself is driven key by key in tests/test_disc776_chooser_parity.ps1.
+$treeSrc = Get-Content (Join-Path (Split-Path $srcFile) "choose_tree.rs") -Raw
+Write-Test "tree_chooser: h and - collapse like tmux's KEYC_LEFT arm"
+$tc_h = $treeSrc -match "KeyCode::Char\('h'\)\s*\|\s*KeyCode::Char\('-'\)\s+if\s+plain\s*&&\s*tree\s*=>\s*Some\(ModeKey::Collapse\)"
+Add-Result "tree_chooser h -> collapse (tmux)" $tc_h ""
 
-Write-Test "tree_chooser: KeyCode::Char('l') navigates down"
-$tc_l = $src -match "KeyCode::Char\('l'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*\+\s*1\s*<\s*tree_entries\.len"
-Add-Result "tree_chooser l -> down" $tc_l ""
+Write-Test "tree_chooser: l and + expand like tmux's KEYC_RIGHT arm"
+$tc_l = $treeSrc -match "KeyCode::Char\('l'\)\s*\|\s*KeyCode::Char\('\+'\)\s+if\s+plain\s*&&\s*tree\s*=>\s*Some\(ModeKey::Expand\)"
+Add-Result "tree_chooser l -> expand (tmux)" $tc_l ""
 
 Write-Test "tree_chooser: g/G map to Home/End"
-$tc_g = $src -match "KeyCode::Char\('g'\)\s+if\s+tree_chooser\s*=>\s*\{\s*tree_selected\s*=\s*0"
-$tc_G = $src -match "KeyCode::Char\('G'\)\s+if\s+tree_chooser\s*=>\s*\{\s*tree_selected\s*=\s*tree_entries\.len\(\)\.saturating_sub\(1\)"
-Add-Result "tree_chooser g -> top" $tc_g ""
-Add-Result "tree_chooser G -> bottom" $tc_G ""
+# Distinct names: $tc_g/$tc_G collide (PS vars are case-insensitive).
+$tc_g_top = $src -match "KeyCode::Char\('g'\)\s+if\s+tree_chooser\s*=>\s*\{\s*tree_selected\s*=\s*0"
+$tc_G_bottom = $src -match "KeyCode::Char\('G'\)\s+if\s+tree_chooser\s*=>\s*\{\s*tree_selected\s*=\s*tree_entries\.len\(\)\.saturating_sub\(1\)"
+Add-Result "tree_chooser g -> top" $tc_g_top ""
+Add-Result "tree_chooser G -> bottom" $tc_G_bottom ""
 
 # --- buffer_chooser ---
 Write-Test "buffer_chooser: existing j/k still wired"
@@ -110,10 +123,11 @@ $bc_l = $src -match "KeyCode::Char\('l'\)\s+if\s+buffer_chooser\s*=>\s*\{\s*if\s
 Add-Result "buffer_chooser l -> down" $bc_l ""
 
 Write-Test "buffer_chooser: g/G map to Home/End"
-$bc_g = $src -match "KeyCode::Char\('g'\)\s+if\s+buffer_chooser\s*=>\s*\{\s*buffer_selected\s*=\s*0"
-$bc_G = $src -match "KeyCode::Char\('G'\)\s+if\s+buffer_chooser"
-Add-Result "buffer_chooser g -> top" $bc_g ""
-Add-Result "buffer_chooser G -> bottom" $bc_G ""
+# Distinct names: $bc_g/$bc_G collide (PS vars are case-insensitive).
+$bc_g_top = $src -match "KeyCode::Char\('g'\)\s+if\s+buffer_chooser\s*=>\s*\{\s*buffer_selected\s*=\s*0"
+$bc_G_bottom = $src -match "KeyCode::Char\('G'\)\s+if\s+buffer_chooser\s*=>\s*\{\s*buffer_selected\s*=\s*buffer_entries\.len\(\)\.saturating_sub\(1\)"
+Add-Result "buffer_chooser g -> top" $bc_g_top ""
+Add-Result "buffer_chooser G -> bottom" $bc_G_bottom ""
 
 # --- keys_viewer ---
 Write-Test "keys_viewer: hjkl all wired"
@@ -217,12 +231,23 @@ function Test-NavViaInjection {
     # Inject:  Ctrl+B  pause  s  pause  <NavKey>  pause  Enter
     & $injectorExe $proc.Id "^b{SLEEP:400}s{SLEEP:600}$NavKey{SLEEP:300}{ENTER}" | Out-Null
 
-    # The PSMUX_SWITCH_TO handshake needs a moment to detach + reconnect.
-    Start-Sleep -Seconds 4
-
-    $infoExpect = Query-Attached $ExpectSession
-    $infoStartAfter = Query-Attached $StartSession
-    $switched = ($infoExpect -match "\(attached\)") -and -not ($infoStartAfter -match "\(attached\)")
+    # The PSMUX_SWITCH_TO handshake needs a moment to detach + reconnect
+    # (client-detach on the old server, then run_remote re-attaches to the
+    # new one). A single point-in-time check after a fixed sleep is flaky
+    # under system load (observed: both origin and target briefly showing
+    # detached mid-handshake) -- poll for up to 8s instead of a one-shot
+    # check at 4s, matching the Wait-Session retry pattern used elsewhere
+    # in this file for the same class of async-completion race.
+    $infoExpect = $null
+    $infoStartAfter = $null
+    $switched = $false
+    for ($i = 0; $i -lt 16; $i++) {
+        Start-Sleep -Milliseconds 500
+        $infoExpect = Query-Attached $ExpectSession
+        $infoStartAfter = Query-Attached $StartSession
+        $switched = ($infoExpect -match "\(attached\)") -and -not ($infoStartAfter -match "\(attached\)")
+        if ($switched) { break }
+    }
 
     Add-Result "$NavKey live: client moved $StartSession -> $ExpectSession" $switched ("after: target=`"$infoExpect`" origin=`"$infoStartAfter`"")
 

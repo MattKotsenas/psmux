@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.16.11] - 2026-08-25
+
+### Added
+
+* Styled underscores: `Cell::underline_style` returns `UnderlineStyle::None`,
+  `Single`, `Double`, `Curly`, `Dotted` or `Dashed`, driven by SGR 4 with a
+  subparameter (`4:0` through `4:5`) and by the legacy SGR 21.
+* Underline colour: `Cell::underline_color` returns the colour set by SGR 58,
+  accepted in the semicolon form (`58;2;r;g;b`, `58;5;n`) and in both colon
+  forms (`58:2::r:g:b`, `58:2:r:g:b`, `58:5:n`), and cleared by SGR 59.
+* `38` and `48` now also accept the six token colon form with an empty colour
+  space id (`38:2::r:g:b`).
+* `contents_formatted` and `contents_diff` re-emit both, so a screen dump
+  replays the styled underscore and its colour.
+
+### Changed
+
+* `Cell` grew from 40 to 44 bytes to carry the underline style and colour.
+  `Cell::underline()` still reports "underlined at all" for every style.
+
 ## [0.16.2] - 2025-07-11
 
 ### Fixed

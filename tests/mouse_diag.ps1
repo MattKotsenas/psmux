@@ -1,14 +1,14 @@
 #!/usr/bin/env pwsh
 # mouse_diag.ps1 — Comprehensive mouse hover diagnostic
 #
-# Tests every link in the chain:
-#   1. Client receives MouseEventKind::Moved
-#   2. Client checks alternate_screen from layout JSON
-#   3. Client sends mouse-move to server
-#   4. Server receives mouse-move, calls remote_mouse_motion
-#   5. Server checks screen_has_tui_content
-#   6. Server injects SGR mouse via write_mouse_to_pty
-#   7. Child reads SGR mouse from stdin
+# Diagnoses the server fallback route:
+#   1. The script sends mouse-move over TCP
+#   2. The server calls remote_mouse_motion
+#   3. The server checks pane_wants_hover
+#   4. The server injects SGR mouse via inject_mouse_combined
+#   5. The child reads SGR mouse from stdin
+#
+# test_mouse_hover.ps1 covers the attached-client pane-mouse route.
 #
 # Usage: pwsh tests/mouse_diag.ps1
 #
@@ -16,7 +16,7 @@
 
 $ErrorActionPreference = "Continue"
 $psmux = "psmux"
-$session = "mouse_diag_$$"
+$session = "mouse_diag_$PID"
 $logDir = "$env:USERPROFILE\.psmux"
 $mouseLog = "$logDir\mouse_debug.log"
 

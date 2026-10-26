@@ -3,7 +3,7 @@
 # to Neovim running inside psmux via the pane-mouse TCP command.
 #
 # This test proves:
-# 1. psmux detects Neovim as a TUI app (pane_wants_mouse heuristic)
+# 1. The live click and wheel gates recognize Neovim's terminal state
 # 2. Mouse clicks move cursor in Neovim (via pane-mouse TCP command)
 # 3. Mouse scroll works in Neovim (via pane-scroll TCP command)
 # 4. Mouse works with user config: mouse on, mouse-selection off, scroll-enter-copy-mode off

@@ -33,8 +33,12 @@ try {
     $before = psmux list-panes -F "#{pane_width}"
     Log "Before resize: $($before -join ', ')"
 
-    # Resize first pane to 30 columns
-    psmux resize-pane -t %0 -x 30
+    # Resize first pane to 30 columns. Pane ids start at %1, so resolve the
+    # real id instead of the historical %0 — the old hardcoded `-t %0` never
+    # resolved and only "worked" because unresolvable targets silently acted
+    # on the ACTIVE pane (the #545 misroute); it is now correctly rejected.
+    $firstPane = (psmux list-panes -F "#{pane_id}" | Select-Object -First 1).Trim()
+    psmux resize-pane -t $firstPane -x 30
     Start-Sleep -Milliseconds 300
 
     $after = psmux list-panes -F "#{pane_width}"

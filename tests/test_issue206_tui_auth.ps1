@@ -13,7 +13,7 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
-$psmuxDir = "$env:USERPROFILE\.psmux"
+$psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -54,6 +54,32 @@ function Send-AuthenticatedTcp {
         try { $resp = $r.ReadLine() } catch { $resp = $null }
         $t.Close()
         return $resp
+    } catch {
+        return "CONNECTION_FAILED"
+    }
+}
+
+# Like Send-AuthenticatedTcp, but returns EVERY reply line, not just the first,
+# so a listing with a second window in it is actually seen.
+function Send-AuthenticatedTcpAll {
+    param([int]$Port, [string]$Key, [string]$Command, [int]$TimeoutMs = 1500)
+    try {
+        $t = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $Port)
+        $t.NoDelay = $true
+        $s = $t.GetStream()
+        $w = [System.IO.StreamWriter]::new($s)
+        $r = [System.IO.StreamReader]::new($s)
+        $s.ReadTimeout = $TimeoutMs
+        $w.Write("AUTH $Key`n"); $w.Flush()
+        try { $authResp = $r.ReadLine() } catch { $authResp = $null }
+        if ($authResp -ne "OK") { $t.Close(); return "AUTH_FAILED: $authResp" }
+        $w.Write("$Command`n"); $w.Flush()
+        $lines = @()
+        try {
+            while ($null -ne ($line = $r.ReadLine())) { $lines += $line }
+        } catch {}
+        $t.Close()
+        return ($lines -join "`n")
     } catch {
         return "CONNECTION_FAILED"
     }
@@ -132,13 +158,38 @@ if ($resp -match "ERROR.*[Aa]uthentication") {
 }
 
 # Test A3: Unauthenticated new-window (exact PoC from issue)
+#
+# The .port file appears as soon as the server listens, which is BEFORE the
+# TUI client has attached.  Until it attaches the window has the detached
+# default size (120x30); the attach then sizes it to the client's console
+# minus the status line (120x29).  With a cold spawn that attach lands about
+# 130 ms after the port answers, so a snapshot taken right away and one taken
+# 2 s later differ in the size field on every run, even with NO unauthenticated
+# connection in between (measured: the same flow with the new-window line
+# removed still printed [120x30] then [120x29]).  So this test (a) waits for
+# the client to attach before the first snapshot and (b) compares what the PoC
+# could actually create: the window count and names.  Whether an
+# unauthenticated connection can change the SIZE is proven separately in B4,
+# on a detached server where no client can resize anything.
+function Get-WindowShape($listing) {
+    @("$listing" -split "`n" | Where-Object { $_ -match '^\d+:' } |
+        ForEach-Object { ($_ -replace '\s*\[\d+x\d+\].*$', '').Trim() }) -join ' | '
+}
+$attachSw = [System.Diagnostics.Stopwatch]::StartNew()
+while ($attachSw.ElapsedMilliseconds -lt 10000) {
+    $cl = Send-AuthenticatedTcp -Port $tuiPort -Key $key -Command "list-clients"
+    if ("$cl" -match [regex]::Escape($TUI_SESSION)) { break }
+    Start-Sleep -Milliseconds 100
+}
 Write-Host "`n[A3] Unauthenticated new-window (exact PoC)" -ForegroundColor Yellow
-$beforeWindows = Send-AuthenticatedTcp -Port $tuiPort -Key $key -Command "list-windows"
+$beforeWindows = Send-AuthenticatedTcpAll -Port $tuiPort -Key $key -Command "list-windows"
 $resp = Send-RawTcp -Port $tuiPort -Command 'new-window "cmd /c echo PWNED"'
 Start-Sleep -Seconds 2
-$afterWindows = Send-AuthenticatedTcp -Port $tuiPort -Key $key -Command "list-windows"
-if ($beforeWindows -eq $afterWindows) {
-    Write-Pass "Window count unchanged (no-auth new-window rejected)"
+$afterWindows = Send-AuthenticatedTcpAll -Port $tuiPort -Key $key -Command "list-windows"
+$beforeShape = Get-WindowShape $beforeWindows
+$afterShape = Get-WindowShape $afterWindows
+if ($beforeShape -ne '' -and $beforeShape -eq $afterShape) {
+    Write-Pass "Window count and names unchanged (no-auth new-window rejected): $afterShape"
 } else {
     Write-Fail "VULNERABILITY: Window created without auth! Before=$beforeWindows After=$afterWindows"
 }
@@ -238,6 +289,26 @@ if (-not $srvPort) {
         Write-Fail "Server authenticated command failed: $resp"
     }
 
+    # Test B4: an unauthenticated connection cannot change the window SIZE.
+    # A detached server has no client to resize it, so its size only moves
+    # when a command that got past AUTH moves it.  The same resize sent WITH
+    # the key must work, which proves the probe could have seen a change.
+    Write-Host "`n[B4] Unauthenticated resize cannot change the size" -ForegroundColor Yellow
+    $szBefore = Send-AuthenticatedTcpAll -Port $srvPort -Key $srvKey -Command "list-windows"
+    foreach ($c in @('resize-window -x 50 -y 12', 'refresh-client -C 50x12', 'resize-pane -x 50 -y 12', 'new-window')) {
+        $null = Send-RawTcp -Port $srvPort -Command $c
+    }
+    Start-Sleep -Milliseconds 800
+    $szAfter = Send-AuthenticatedTcpAll -Port $srvPort -Key $srvKey -Command "list-windows"
+    $null = Send-AuthenticatedTcpAll -Port $srvPort -Key $srvKey -Command "resize-window -x 50 -y 12"
+    Start-Sleep -Milliseconds 800
+    $szAuthed = Send-AuthenticatedTcpAll -Port $srvPort -Key $srvKey -Command "list-windows"
+    if ($szBefore -match '\[\d+x\d+\]' -and $szBefore -eq $szAfter -and $szAuthed -match '\[50x12\]') {
+        Write-Pass "Size untouched by unauthenticated resize ($szAfter); the same resize with the key gives $szAuthed"
+    } else {
+        Write-Fail "Unauthenticated size probe: before=[$szBefore] after=[$szAfter] authed=[$szAuthed]"
+    }
+
     Cleanup-Session $SRV_SESSION
 }
 
@@ -279,7 +350,7 @@ if ($rapidPort) {
 
     # Test D2: Verify no windows were created
     Write-Host "`n[D2] No windows created by unauthenticated flood" -ForegroundColor Yellow
-    $wl = Send-AuthenticatedTcp -Port $rapidPort -Key $rapidKey -Command "list-windows"
+    $wl = Send-AuthenticatedTcpAll -Port $rapidPort -Key $rapidKey -Command "list-windows"
     $windowCount = ($wl -split "`n" | Where-Object { $_ -match "^\d+:" }).Count
     if ($windowCount -le 1) {
         Write-Pass "Only 1 window exists (no unauthorized creation)"

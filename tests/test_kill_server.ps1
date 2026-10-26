@@ -1,9 +1,16 @@
 # test_kill_server.ps1 — kill-server reliability tests
 # Verifies:
-#   1. kill-server kills ALL sessions and their child processes
-#   2. kill-server with -L only kills namespaced sessions
+#   1. kill-server kills every session on ITS OWN socket, and their child
+#      processes (the default namespace when no -L was given)
+#   2. kill-server with -L only kills that namespace's sessions
 #   3. All aliases (psmux, pmux, tmux) are handled correctly
 #   4. Port files are cleaned up
+#   5. Nothing to kill in scope exits 1 with tmux's `no server running`
+#
+# Scope changed in #649: a bare kill-server used to sweep every namespace in the
+# data dir. It is socket scoped now, like tmux, and `-a`/`--all` is the opt-in
+# everything sweep. The groups below use default-namespace sessions for the
+# "kills all" assertions and reach for -L explicitly when they mean a namespace.
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -ErrorAction SilentlyContinue).Source
@@ -198,17 +205,27 @@ if ($TMUX) {
 }
 
 # ═════════════════════════════════════════════
-# Group 5: Repeated kill-server is idempotent
+# Group 5: Nothing to kill is tmux's exit 1 (#649)
 # ═════════════════════════════════════════════
 Write-Host ""
-Write-Host "[Test Group 5] kill-server idempotent (no error on empty)"
+Write-Host "[Test Group 5] kill-server with nothing in scope"
 
 & $PSMUX kill-server 2>&1 | Out-Null
 Start-Sleep -Seconds 1
 
-Test "kill-server with no sessions doesn't error"
+# tmux's client cannot connect and prints `no server running on <socket>` at
+# exit 1. Scripts written against tmux (`tmux kill-server || start`) read that
+# code, so psmux used to lie to them by returning 0 for a kill that never
+# happened. Changed with the namespace scoping in #649.
+Test "kill-server with no sessions reports it, tmux style"
 $output = & $PSMUX kill-server 2>&1
-if ($LASTEXITCODE -eq 0) { Pass "kill-server returns 0 with no sessions" } else { Fail "kill-server errored ($LASTEXITCODE)" }
+$rc = $LASTEXITCODE
+if ($rc -eq 1) { Pass "kill-server returns 1 with no sessions" } else { Fail "expected exit 1 with no sessions, got $rc" }
+if ("$output" -match 'no server running') { Pass "and says 'no server running'" } else { Fail "expected a 'no server running' message, got '$output'" }
+
+Test "kill-server -a with nothing to do is a no-op at exit 0"
+& $PSMUX kill-server -a 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { Pass "-a sweeps and returns 0" } else { Fail "-a errored ($LASTEXITCODE)" }
 
 # Final cleanup
 & $PSMUX kill-server 2>&1 | Out-Null

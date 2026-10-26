@@ -116,10 +116,9 @@ function Send-TcpCommand {
                 $lines += $line
                 # For single-line responses, break after first line
                 # unless we expect multiline output
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {
             # ReadTimeout or connection closed

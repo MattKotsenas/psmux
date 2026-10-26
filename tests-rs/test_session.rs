@@ -424,3 +424,129 @@ fn liveness_connected_but_silent_is_dead() {
     assert!(start.elapsed() < Duration::from_secs(2), "probe must stay bounded, not hang");
     drop(listener);
 }
+
+// --- .pid body parsing: one parser shared by every reader --------------------
+// `.pid` is written as `pid:creation_filetime`, but a bare `pid` (the #448 anchor
+// as first written, or an older server mid-upgrade) must still parse so the
+// orphan reaper never loses track of a live server.
+
+#[test]
+fn parse_pid_file_contents_reads_both_forms() {
+    assert_eq!(parse_pid_file_contents("1234:567890"), Some((1234, Some(567890))));
+    assert_eq!(parse_pid_file_contents("1234"), Some((1234, None)));
+    assert_eq!(parse_pid_file_contents("  1234:567890 \n"), Some((1234, Some(567890))));
+    // Unparseable pid -> not a record at all.
+    assert_eq!(parse_pid_file_contents("notanumber"), None);
+    // Valid pid, unparseable creation time -> pid is kept, creation dropped.
+    assert_eq!(parse_pid_file_contents("12:notatime"), Some((12, None)));
+}
+
+#[test]
+fn format_pid_file_contents_round_trips() {
+    let s = format_pid_file_contents(4321, 987654);
+    assert_eq!(s, "4321:987654");
+    assert_eq!(parse_pid_file_contents(&s), Some((4321, Some(987654))));
+}
+
+// --- force_kill_targets: the data-dir-scoped force-kill selector -------------
+// kill-server's force-kill fallback must target only PIDs recorded in *this*
+// data dir's registry, never a machine-wide scan by image name.
+
+#[test]
+fn force_kill_targets_reads_pid_files_in_its_dir() {
+    let dir = temp_psmux_dir("fkt_basic");
+    fs::write(dir.join("ns__a.pid"), "1234:567890").unwrap();
+
+    let targets = force_kill_targets(&dir, KillScope::All);
+
+    assert_eq!(
+        targets,
+        vec![PidTarget { pid: 1234, creation_time: 567890 }],
+        "the .pid file's pid and creation time must be parsed and returned"
+    );
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn force_kill_targets_is_scoped_to_its_dir() {
+    // The whole point of the fix: a kill-server in dir A must never reach a
+    // server registered under dir B.
+    let dir_a = temp_psmux_dir("fkt_a");
+    let dir_b = temp_psmux_dir("fkt_b");
+    fs::write(dir_a.join("a.pid"), "111:1").unwrap();
+    fs::write(dir_b.join("b.pid"), "999:2").unwrap();
+
+    let targets = force_kill_targets(&dir_a, KillScope::All);
+
+    assert_eq!(targets, vec![PidTarget { pid: 111, creation_time: 1 }]);
+    assert!(
+        !targets.iter().any(|t| t.pid == 999),
+        "dir A's selection must not include dir B's pid"
+    );
+    let _ = fs::remove_dir_all(dir_a.parent().unwrap());
+    let _ = fs::remove_dir_all(dir_b.parent().unwrap());
+}
+
+#[test]
+fn force_kill_targets_skips_bare_and_malformed_pid_files() {
+    let dir = temp_psmux_dir("fkt_malformed");
+    fs::write(dir.join("good.pid"), "5:6").unwrap();
+    fs::write(dir.join("bare.pid"), "12345").unwrap();          // no creation time -> no gate
+    fs::write(dir.join("bad_pid.pid"), "notanumber:6").unwrap();
+    fs::write(dir.join("bad_time.pid"), "7:notatime").unwrap();
+
+    let targets = force_kill_targets(&dir, KillScope::All);
+
+    assert_eq!(
+        targets,
+        vec![PidTarget { pid: 5, creation_time: 6 }],
+        "only well-formed pid:creation files are force-kill candidates"
+    );
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn force_kill_targets_honors_ns_prefix() {
+    // Many namespaces share one data dir (-L only changes the filename prefix).
+    // A namespaced kill-server must force-kill only its own namespace's wedged
+    // servers, never another namespace's, even though all .pid files sit side by
+    // side in the same dir.
+    let dir = temp_psmux_dir("fkt_ns");
+    fs::write(dir.join("ns1__a.pid"), "11:1").unwrap();
+    fs::write(dir.join("ns1__b.pid"), "12:2").unwrap();
+    fs::write(dir.join("ns2__c.pid"), "21:3").unwrap();
+    fs::write(dir.join("plain.pid"), "30:4").unwrap();
+
+    let ns1 = force_kill_targets(&dir, KillScope::Namespace(Some("ns1")));
+
+    assert!(
+        ns1.iter().all(|t| t.pid == 11 || t.pid == 12),
+        "ns1 selection must contain only ns1's pids, got {ns1:?}"
+    );
+    assert!(
+        !ns1.iter().any(|t| t.pid == 21 || t.pid == 30),
+        "ns1 selection must not reach ns2's or the default namespace's pids"
+    );
+    assert_eq!(ns1.len(), 2, "ns1 has exactly two sessions");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+// --- confirms_identity: the exact-match gate that defeats pid reuse ----------
+
+#[test]
+fn confirms_identity_matches_exact_creation_time() {
+    assert!(confirms_identity(Some(567890), 567890));
+}
+
+#[test]
+fn confirms_identity_rejects_recycled_pid() {
+    // A different creation time at the same pid means the pid was reused by an
+    // unrelated process. It must never be killed.
+    assert!(!confirms_identity(Some(567891), 567890));
+}
+
+#[test]
+fn confirms_identity_rejects_unqueryable_process() {
+    // Process gone, or OpenProcess/GetProcessTimes failed: fail safe, no kill.
+    assert!(!confirms_identity(None, 567890));
+}
