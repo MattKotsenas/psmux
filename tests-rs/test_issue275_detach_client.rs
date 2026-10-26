@@ -223,9 +223,10 @@ fn send_directive_reports_false_without_channel() {
 /// exact string is delivered; after removal the send reports false again.
 #[test]
 fn send_directive_delivers_then_stops_after_removal() {
-    use crate::types::{register_directive_channel, remove_directive_channel, send_directive_to_client};
+    use crate::types::{register_directive_capture, remove_directive_channel, send_directive_to_client};
     let cid = 0xDEAD_0002u64;
-    let rx = register_directive_channel(cid);
+    // Thread scoped, so another test's broadcast cannot arrive first.
+    let rx = register_directive_capture(cid);
 
     assert!(send_directive_to_client(cid, "DETACH"),
         "registered channel must report queued so the handler takes the grace sleep");
