@@ -3063,6 +3063,9 @@ loop {
             parsed = crate::cli::normalize_flag_equals(first);
         }
     }
+    // `-t s:1.` is `-t s:1`: tmux reads an empty pane part as none
+    // (cmd-find.c), and every resolver below splits only a non-empty one.
+    crate::cli::canonicalize_target_values(&mut parsed);
     let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
     let (cmd, args): (&str, Vec<&str>) = (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect());
     // select-pane / last-pane read flags by exact token below (the -t scan,

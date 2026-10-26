@@ -667,7 +667,8 @@ fn toggle_sync_flips_state_correctly() {
 fn chooser_directives(app: &mut AppState, run: impl FnOnce(&mut AppState)) -> Vec<String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x00c4_0000_0000);
     let cid = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let rx = crate::types::register_directive_channel(cid);
+    // Thread scoped: another test's broadcast never lands here.
+    let rx = crate::types::register_directive_capture(cid);
     app.latest_client_id = Some(cid);
     run(app);
     crate::types::remove_directive_channel(cid);

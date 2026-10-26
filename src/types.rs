@@ -5256,15 +5256,51 @@ pub fn send_directive_to_client(client_id: u64, directive: &str) -> bool {
     false
 }
 
+/// Unit tests that capture what a command sends a client, keyed by the test
+/// thread that registered each channel. Tests run in parallel threads of one
+/// process, and a command run with no client of its own broadcasts (a
+/// chooser with no `latest_client_id`, for one), which landed in whichever
+/// capture another test had open and failed it with a directive it never
+/// asked for. A broadcast reaches a capture only from its own thread.
+#[cfg(test)]
+static THREAD_SCOPED_CHANNELS: std::sync::Mutex<Vec<(u64, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`register_directive_channel`] for a unit test capture: only this thread's
+/// broadcasts reach it. Removed with [`remove_directive_channel`].
+#[cfg(test)]
+pub fn register_directive_capture(client_id: u64) -> std::sync::mpsc::Receiver<String> {
+    if let Ok(mut v) = THREAD_SCOPED_CHANNELS.lock() {
+        v.push((client_id, std::thread::current().id()));
+    }
+    register_directive_channel(client_id)
+}
+
+/// A capture another test thread registered, which this thread's broadcast
+/// must not reach.
+#[cfg(test)]
+fn other_threads_capture(client_id: u64) -> bool {
+    let me = std::thread::current().id();
+    THREAD_SCOPED_CHANNELS
+        .lock()
+        .map_or(false, |v| v.iter().any(|(cid, owner)| *cid == client_id && *owner != me))
+}
+
 /// Send a directive to ALL persistent clients.
 /// Returns how many clients the directive was queued for, so a teardown can
 /// skip waiting for writers to flush it when nobody is attached.
 pub fn send_directive_to_all_clients(directive: &str) -> usize {
     if let Ok(channels) = DIRECTIVE_CHANNELS.lock() {
-        for (_, tx) in channels.iter() {
+        let mut sent = 0;
+        for (_cid, tx) in channels.iter() {
+            #[cfg(test)]
+            if other_threads_capture(*_cid) {
+                continue;
+            }
             let _ = tx.send(directive.to_string());
+            sent += 1;
         }
-        return channels.len();
+        return sent;
     }
     0
 }
@@ -5272,6 +5308,10 @@ pub fn send_directive_to_all_clients(directive: &str) -> usize {
 /// Remove a client's directive channel (called on disconnect).
 pub fn remove_directive_channel(client_id: u64) {
     if let Ok(mut v) = DIRECTIVE_CHANNELS.lock() {
+        v.retain(|(cid, _)| *cid != client_id);
+    }
+    #[cfg(test)]
+    if let Ok(mut v) = THREAD_SCOPED_CHANNELS.lock() {
         v.retain(|(cid, _)| *cid != client_id);
     }
 }

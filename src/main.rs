@@ -1266,10 +1266,26 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
     // `psmux a \; b`: from here on `args` is the first command alone, which
     // decides routing and the client side target check; the whole list goes
     // to the server as one line just before dispatch (run_command_list).
-    let (args, command_list) = match split_command_list_args(&args) {
+    let (mut args, command_list) = match split_command_list_args(&args) {
         Some((first, list)) => (first, Some(list)),
         None => (args, None),
     };
+    // `-t s:1.` is `-t s:1` (tmux reads an empty pane part as none), for the
+    // command's own targets and a global `-t` before it, so routing, the
+    // target checks below and the line sent to the server all see one form.
+    // A list's later commands are canonicalized by the server.
+    if let Some(index) = process_command_index(&args) {
+        crate::cli::canonicalize_target_values(&mut args[index..]);
+        let mut i = 1;
+        while i + 1 < index {
+            if args[i] == "-t" {
+                if let Some(v) = crate::cli::drop_empty_pane_part(&args[i + 1]) {
+                    args[i + 1] = v;
+                }
+            }
+            i += if matches!(args[i].as_str(), "-t" | "-L" | "-f" | "-S") { 2 } else { 1 };
+        }
+    }
     // A list led by a command that runs alone (`ls \; ...`, `run-shell ...
     // \; ...`) runs command by command, each its own invocation, before this
     // process routes anything. new-session runs its own arm and then the rest
