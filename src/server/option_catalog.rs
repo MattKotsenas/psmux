@@ -309,6 +309,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "key-table", scope: Session, option_type: OptionType::String, default: "root", description: "Default key table" },
     OptionDef { name: "word-separators", scope: Session, option_type: OptionType::String, default: crate::grid_reader::DEFAULT_WORD_SEPARATORS, description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: Session, option_type: UNVALIDATED_CHOICE, default: "off", description: "Allow passthrough escape sequences" },
+    OptionDef { name: "sixel", scope: Session, option_type: Boolean, default: "on", description: "Render sixel graphics from panes (issue #431)" },
     OptionDef { name: "allow-rename", scope: Session, option_type: Boolean, default: "on", description: "Allow programs to rename windows" },
     OptionDef { name: "allow-set-title", scope: Session, option_type: Boolean, default: "off", description: "Allow programs to set pane title via escape sequences" },
     OptionDef { name: "update-environment", scope: Session, option_type: OptionType::String, default: "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY", description: "Environment variables to update on attach" },

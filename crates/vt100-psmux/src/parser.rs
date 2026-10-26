@@ -60,10 +60,7 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
         screen.capture_queries(false);
         Self {
             parser: vte::Parser::new(),
-            screen: crate::perform::WrappedScreen {
-                screen,
-                callbacks: CB::default(),
-            },
+            screen: crate::perform::WrappedScreen::from_screen(screen, CB::default()),
         }
     }
 

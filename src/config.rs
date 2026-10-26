@@ -2143,6 +2143,7 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
             app.bold_is_bright = matches!(value, "on" | "true" | "1" | "yes");
             crate::platform::set_bold_is_bright(app.bold_is_bright);
         }
+        "sixel" => app.sixel = matches!(value, "on" | "true" | "1" | "yes"),
         // A bad key was refused (and reported) by the catalog check at the top.
         "prefix" => {
             if let Ok(key) = parse_option_key(value, true) {

@@ -137,6 +137,7 @@ fn pane_sized(content: &[u8], columns: u16) -> LayoutJson {
         rows_v2: crate::layout::serialize_screen_rows(parser.screen(), ROWS, columns),
         title: None,
         copy_hl: Vec::new(),
+        images: vec![],
     }
 }
 

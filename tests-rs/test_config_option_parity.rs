@@ -48,6 +48,7 @@ fn non_default_value(name: &str) -> Option<&'static str> {
         "display-panes-time" => "2345",
         "repeat-time" => "600",
         "mouse" => "off",
+        "sixel" => "off",
         "scroll-enter-copy-mode" => "off",
         "mouse-drag-enter-copy-mode" => "on",
         "ctrl-wheel-zoom" => "on",

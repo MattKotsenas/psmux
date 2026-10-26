@@ -154,6 +154,32 @@ pub fn note_host_shape_before(code: Option<u8>) {
     HOST_SHAPE_BEFORE.store(code.unwrap_or(255), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the terminal said it draws sixel, from its DA1 reply at attach:
+/// 0 nobody said, 1 yes, 2 no.
+static HOST_SIXEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Record what the terminal's DA1 reply said about sixel.
+pub fn note_host_sixel(sixel: Option<bool>) {
+    let v = match sixel {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    HOST_SIXEL.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the client may write sixel images to the terminal.
+///
+/// tmux writes an image only to a terminal with the sixel feature
+/// (`tty_cmd_sixelimage`, tty.c:2183), which a DA1 reply listing 4 turns on
+/// (`tty_keys_device_attributes`, tty-keys.c:1504).  A reply without 4 stops
+/// it here too.  No reply at all leaves it to the `sixel` option: the query
+/// is skipped inside psmux, where the outer psmux takes the image as its
+/// pane's, and for a stdin that is not a console.
+pub(crate) fn host_draws_sixel() -> bool {
+    HOST_SIXEL.load(std::sync::atomic::Ordering::Relaxed) != 2
+}
+
 /// The DECSCUSR code teardown should write to put the shape back, `None` when
 /// this client never asserted one.
 ///
@@ -517,6 +543,10 @@ pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue735_cursor_style_default.rs"]
 mod test_issue735_cursor_style_default;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue431_host_sixel.rs"]
+mod test_issue431_host_sixel;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_wide_char_background_residue.rs"]

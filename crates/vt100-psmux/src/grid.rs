@@ -26,6 +26,13 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<std::sync::Arc<crate::row::Row>>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    /// Absolute line number of the OLDEST row currently retained (the front of
+    /// `scrollback`, or the top of the drawing area when scrollback is empty).
+    /// Starts at 0 and increments by one for every row permanently evicted from
+    /// the front of scrollback.  Used to anchor sixel images to a logical line
+    /// that survives scrolling (see `crate::image`).  MUST be bumped at every
+    /// front-eviction site, so all of them funnel through `evict_front`.
+    first_line: u64,
     /// Copy-mode freeze (psmux issue #494): when set, the visible region is
     /// anchored to its current content even at `scrollback_offset == 0` —
     /// rows pushed into scrollback bump the offset so the view does not
@@ -48,8 +55,45 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            first_line: 0,
             frozen: false,
         }
+    }
+
+    /// Pops the oldest row off the front of scrollback and advances
+    /// `first_line` so that absolute line numbers of retained rows stay stable.
+    /// This is the single centralised front-eviction primitive; every place
+    /// that removes a row from the front of `scrollback` MUST go through here,
+    /// otherwise `first_line` drifts and sixel anchors are computed against the
+    /// wrong absolute line forever (see the sixel design, risk 3).
+    fn evict_front(&mut self) -> Option<std::sync::Arc<crate::row::Row>> {
+        let row = self.scrollback.pop_front();
+        if row.is_some() {
+            self.first_line += 1;
+        }
+        row
+    }
+
+    /// Absolute line number of the oldest retained row (front of scrollback, or
+    /// the top of the drawing area when scrollback is empty).
+    pub fn first_line(&self) -> u64 {
+        self.first_line
+    }
+
+    /// Absolute logical line of the current cursor row.
+    ///
+    /// The scrollback model here keeps evicted rows in `scrollback` (a
+    /// `VecDeque` fed from the front) and the live drawing rows in `rows`.  The
+    /// top of the drawing area therefore sits at `first_line + scrollback.len()`
+    /// absolute lines, and the cursor is `pos.row` rows further down, giving
+    /// `first_line + scrollback.len() + pos.row`.  Verified against
+    /// `visible_rows`/`scroll_up`: rows leave `rows` into the back of
+    /// `scrollback` and are only removed from the front via `evict_front`, so
+    /// this relationship holds regardless of scrollback fill or offset.
+    pub fn absolute_line_of_cursor(&self) -> u64 {
+        self.first_line
+            + u64::try_from(self.scrollback.len()).unwrap_or(u64::MAX)
+            + u64::from(self.pos.row)
     }
 
     pub fn frozen(&self) -> bool {
@@ -296,14 +340,14 @@ impl Grid {
         self.scrollback = history;
         self.scrollback_offset = 0;
         while self.scrollback.len() > self.scrollback_len {
-            self.scrollback.pop_front();
+            self.evict_front();
         }
     }
 
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.scrollback_len = new_len;
         while self.scrollback.len() > self.scrollback_len {
-            self.scrollback.pop_front();
+            self.evict_front();
         }
         if self.scrollback_offset > self.scrollback.len() {
             self.scrollback_offset = self.scrollback.len();
@@ -324,7 +368,7 @@ impl Grid {
         row.compact();
         self.scrollback.push_back(std::sync::Arc::new(row));
         while self.scrollback.len() > self.scrollback_len {
-            self.scrollback.pop_front();
+            self.evict_front();
         }
         if self.scrollback_offset > 0 || self.frozen {
             self.scrollback_offset =
@@ -586,6 +630,12 @@ impl Grid {
     }
 
     pub fn clear_scrollback(&mut self) {
+        // Every retained scrollback row is evicted from the front at once, so
+        // advance first_line by the whole fill to keep absolute line numbers of
+        // the still-visible drawing rows stable (the top of the drawing area was
+        // at first_line + scrollback.len() and stays put).
+        self.first_line +=
+            u64::try_from(self.scrollback.len()).unwrap_or(u64::MAX);
         self.scrollback.clear();
         self.scrollback_offset = 0;
     }
@@ -709,7 +759,7 @@ impl Grid {
                 removed.compact();
                 self.scrollback.push_back(std::sync::Arc::new(removed));
                 while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
+                    self.evict_front();
                 }
                 if self.scrollback_offset > 0 || self.frozen {
                     self.scrollback_offset =
@@ -787,6 +837,11 @@ impl Grid {
         self.pos.row = self.pos.row.saturating_sub(count);
         let lines = self.row_clamp_top(in_scroll_region);
         self.scroll_down(lines + extra_lines);
+    }
+
+    /// The scroll region as `(top, bottom)` screen rows, both inclusive.
+    pub fn scroll_margins(&self) -> (u16, u16) {
+        (self.scroll_top, self.scroll_bottom)
     }
 
     pub fn row_set(&mut self, i: u16) {

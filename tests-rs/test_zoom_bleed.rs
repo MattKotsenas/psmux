@@ -33,6 +33,7 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         content: Vec::new(),
         rows_v2: Vec::new(),
         title: None, copy_hl: Vec::new(),
+        images: vec![],
     }
 }
 

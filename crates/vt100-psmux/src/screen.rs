@@ -166,6 +166,13 @@ pub struct Screen {
     /// fine: real workloads use a bounded set of distinct URIs.
     hyperlinks: Vec<String>,
 
+    /// Sixel images captured from the pane's DCS stream, a side-channel
+    /// mirroring `hyperlinks`/`osc94_progress`.  Each carries its own re-emit
+    /// blob plus an absolute-line anchor so it survives scrolling; images are
+    /// pruned once their anchor falls off retained scrollback (or on the wrong
+    /// grid).  See [`crate::image`].
+    sixel_images: Vec<crate::image::SixelImage>,
+
     /// Currently-running command as announced by the shell via shell-integration
     /// OSC sequences (issue #299). `None` when the shell is idle (at the prompt)
     /// or hasn't emitted any command-identity sequence. `Some(<cmd>)` when:
@@ -330,6 +337,7 @@ impl Screen {
             pending_queries: Vec::new(),
             osc52_clipboard: None,
             hyperlinks: Vec::new(),
+            sixel_images: Vec::new(),
             osc_shell_command: None,
             palette: None,
             palette_generation: 0,
@@ -1174,6 +1182,123 @@ impl Screen {
         self.osc94_progress = Some((s, v));
     }
 
+    /// Records a sixel image at the current cursor position and returns its
+    /// assigned id.  The image is tagged with the active grid (`on_alt`), its
+    /// absolute-line anchor and current column, then pruned against the active
+    /// grid.  Mirrors the `set_progress` side-channel; called by the parser
+    /// from `unhook` once a full sixel DCS has been reconstructed.
+    pub fn add_image(&mut self, mut img: crate::image::SixelImage) -> u64 {
+        let id = crate::image::next_image_id();
+        img.id = id;
+        img.on_alt = self.mode(MODE_ALTERNATE_SCREEN);
+        img.anchor_line = self.grid().absolute_line_of_cursor();
+        img.anchor_col = self.grid().pos().col;
+        self.sixel_images.push(img);
+        self.prune_images();
+        id
+    }
+
+    /// The cursor row and the margins a sixel starting there is laid out in,
+    /// as `(row, top, bottom)` screen rows.  A cursor below the scroll region
+    /// is not confined by it.
+    pub(crate) fn sixel_text_area(&self) -> (u16, u16, u16) {
+        let grid = self.grid();
+        let row = grid.pos().row;
+        let (top, bottom) = grid.scroll_margins();
+        if row > bottom {
+            (row, 0, grid.size().rows - 1)
+        } else {
+            (row, top, bottom)
+        }
+    }
+
+    /// Ends a sixel the way the pane's console host does: `scroll` line feeds
+    /// at the bottom margin to make room, then the text cursor goes to `row`,
+    /// back in the column the image started in.
+    pub(crate) fn finish_sixel(&mut self, scroll: u16, row: u16, col: u16) {
+        let (_, _, bottom) = self.sixel_text_area();
+        let grid = self.grid_mut();
+        if scroll > 0 {
+            grid.row_set(bottom);
+            grid.row_inc_scroll(scroll);
+        }
+        grid.row_set(row);
+        grid.col_set(col);
+    }
+
+    /// Returns the sixel images currently retained on this screen (both grids).
+    /// Consumers filter by the active grid via `on_alt` as needed.
+    #[must_use]
+    pub fn images(&self) -> &[crate::image::SixelImage] {
+        &self.sixel_images
+    }
+
+    /// Absolute logical line shown at viewport row 0 (scrollback offset 0) of
+    /// the currently-active grid.  Equals `first_line + retained_scrollback_rows`.
+    /// The server converts a sixel image's absolute `anchor_line` into a
+    /// viewport-relative draw row with this value (subtracting the current
+    /// scrollback offset); see [`crate::image`] and the sixel design.
+    #[must_use]
+    pub fn drawing_top_line(&self) -> u64 {
+        let g = self.grid();
+        g.first_line().saturating_add(
+            u64::try_from(g.scrollback_filled()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Prunes images owned by the currently-active grid whose anchor has
+    /// scrolled off retained scrollback (`anchor_line + cell_height <=
+    /// first_line`), then caps the active grid to 64 images (evicting the lowest
+    /// `anchor_line` first).  Runs after every `add_image`.
+    ///
+    /// Deviation from the sixel design (section 2): the design's prune retains
+    /// ONLY images whose `on_alt` matches the active grid, which would drop a
+    /// main-grid image the instant an alt-screen image is added.  That breaks
+    /// the "main-grid image survives an alt session" contract, so we leave
+    /// inactive-grid images untouched here.  Their scroll-off is judged against
+    /// their own grid's `first_line`, and they are removed wholesale by
+    /// `exit_alternate_grid` (alt images) or `drop_current_grid_images`.
+    fn prune_images(&mut self) {
+        let on_alt = self.mode(MODE_ALTERNATE_SCREEN);
+        let first_line = self.grid().first_line();
+        self.sixel_images.retain(|img| {
+            img.on_alt != on_alt
+                || img.anchor_line + u64::from(img.cell_height) > first_line
+        });
+        // Cap the ACTIVE grid at 64, evicting the oldest (lowest anchor_line)
+        // first; inactive-grid images do not count against this cap.
+        const MAX_IMAGES: usize = 64;
+        loop {
+            let active = self
+                .sixel_images
+                .iter()
+                .filter(|img| img.on_alt == on_alt)
+                .count();
+            if active <= MAX_IMAGES {
+                break;
+            }
+            if let Some((idx, _)) = self
+                .sixel_images
+                .iter()
+                .enumerate()
+                .filter(|(_, img)| img.on_alt == on_alt)
+                .min_by_key(|(_, img)| img.anchor_line)
+            {
+                self.sixel_images.remove(idx);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Drops every image owned by the currently-active grid.  Used by CSI 2J /
+    /// 3J, which clear the visible screen (and, for 3J, scrollback) and so
+    /// invalidate any anchored image on that grid.
+    fn drop_current_grid_images(&mut self) {
+        let on_alt = self.mode(MODE_ALTERNATE_SCREEN);
+        self.sixel_images.retain(|img| img.on_alt != on_alt);
+    }
+
     /// Store an OSC 52 clipboard copy request emitted by the child.
     /// `selector` is the raw selector field (e.g. `b"c"`), `data` is the
     /// base64-encoded payload exactly as received.  Later writes overwrite
@@ -1467,6 +1592,9 @@ impl Screen {
         if !self.allow_alternate_screen {
             self.copy_alt_visible_to_main_scrollback();
         }
+        // Alt-screen images are ephemeral: drop them on exit, leaving any
+        // main-grid images (on_alt == false) intact.
+        self.sixel_images.retain(|img| !img.on_alt);
         self.clear_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_saved_cursor = None;
     }
@@ -1992,10 +2120,12 @@ impl Screen {
             1 => self.grid_mut().erase_all_backward(attrs),
             2 => {
                 self.grid_mut().erase_all(attrs);
+                self.drop_current_grid_images();
                 self.check_squelch_signal();
             }
             3 => {
                 self.grid_mut().clear_scrollback();
+                self.drop_current_grid_images();
                 self.check_squelch_signal();
             }
             _ => unhandled(self),
@@ -2375,4 +2505,8 @@ mod test_issue155_sgr_attrs;
 #[cfg(test)]
 #[path = "../../../tests-rs/test_issue361_osc8_hyperlink.rs"]
 mod test_issue361_osc8_hyperlink;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue431_sixel_storage.rs"]
+mod test_issue431_sixel_storage;
 

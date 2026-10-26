@@ -193,6 +193,29 @@ pub struct RowRunsJson {
     pub runs: Vec<CellRunJson>,
 }
 
+/// Per-leaf sixel image descriptor (issue #431). Emitted by the server's
+/// `write_node` fast path (viewport-culled, blob shipped separately in the
+/// top-level `image_blobs` map) and parsed here so the client can position and
+/// re-emit the cached raw sixel bytes. `row` is VIEWPORT-RELATIVE and SIGNED:
+/// an image anchored above the visible viewport reports a negative row.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ImageDescJson {
+    /// Stable per-`Screen` image id; key into the client blob cache.
+    pub id: u64,
+    /// Viewport-relative top row (signed: negative when anchored above view).
+    pub row: i32,
+    /// Viewport-relative left column.
+    pub col: u16,
+    /// Pixel width of the rasterized image.
+    pub pw: u32,
+    /// Pixel height of the rasterized image.
+    pub ph: u32,
+    /// Cell-grid width (columns) the image occupies.
+    pub cw: u16,
+    /// Cell-grid height (rows) the image occupies.
+    pub ch: u16,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum LayoutJson {
@@ -249,6 +272,11 @@ pub enum LayoutJson {
         /// `[row, first col, last col, kind]` (`copy_mode::copy_highlights`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         copy_hl: Vec<[u16; 4]>,
+        /// Sixel image descriptors visible in this leaf's viewport (#431).
+        /// Empty on frames/panes with no images. Blob bytes ship once in the
+        /// top-level `image_blobs` map keyed by `ImageDescJson::id`.
+        #[serde(default)]
+        images: Vec<ImageDescJson>,
     },
 }
 
@@ -431,7 +459,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(),
+                            content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![],
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -453,7 +481,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(),
+                        content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(), images: vec![],
                     };
                 };
                 let screen = parser.screen();
@@ -648,6 +676,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                     rows_v2,
                     title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
                     copy_hl: Vec::new(),
+                    images: vec![],
                 }
             }
         }
@@ -939,7 +968,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
                                 "\"view_offset\":0,",
-                                "\"rows_v2\":[],\"content\":[],\"title\":null}}"),
+                                "\"rows_v2\":[],\"content\":[],\"images\":[],\"title\":null}}"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
                         return;
@@ -974,12 +1003,13 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     view_offset: usize,
                     rows_v2: Vec<RowSnap>,
                     content: Vec<Vec<CopyCell>>,
+                    images: Vec<crate::server::helpers::ImageDesc>,
                 }
 
                 let snap = 'snap: {
                     let parser = match p.term.lock() {
                         Ok(g) => g,
-                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![] },
+                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![], images: vec![] },
                     };
                     let screen = parser.screen();
                     // Issue #685: this pane's OSC 4 palette, read once for the
@@ -1121,7 +1151,16 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                     }
 
-                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content }
+                    // Snapshot visible sixel image descriptors (viewport-culled,
+                    // viewport-relative rows) while the parser mutex is still
+                    // held.  Uses the same scrollback offset the leaf serialises
+                    // below (`so`): only the active copy-mode pane scrolls back.
+                    let img_scroll_off = if is_active && in_copy { scroll_off } else { 0 };
+                    let images = crate::server::helpers::visible_pane_images(
+                        screen, p.last_rows, img_scroll_off,
+                    );
+
+                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content, images }
                 };
                 // ── Parser mutex is now RELEASED ──
                 // All JSON string building below happens without holding the lock,
@@ -1282,6 +1321,18 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     out.push_str("]}");
                 }
                 out.push_str("]");
+
+                // ── images (viewport-culled sixel descriptors) ──────
+                out.push_str(",\"images\":[");
+                for (ii, img) in snap.images.iter().enumerate() {
+                    if ii > 0 { out.push(','); }
+                    let _ = std::fmt::Write::write_fmt(out, format_args!(
+                        "{{\"id\":{},\"row\":{},\"col\":{},\"pw\":{},\"ph\":{},\"cw\":{},\"ch\":{}}}",
+                        img.id, img.row, img.col, img.pw, img.ph, img.cw, img.ch,
+                    ));
+                }
+                out.push(']');
+
                 // Append pane title if set
                 if !p.title.is_empty() {
                     out.push_str(",\"title\":\"");

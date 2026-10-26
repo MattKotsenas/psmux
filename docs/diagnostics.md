@@ -299,6 +299,26 @@ whichever console host is under it.
 The keystroke win is real and large. Set this when you want it, knowing you are also taking on a
 console host that Windows Update does not patch for you.
 
+#### Sixel images need this host
+
+A sixel image is a DCS sequence (`ESC P ... q ... ESC \`) that a program writes to the terminal.
+The inbox `conhost.exe` drops it before psmux reads the pane, whether or not passthrough is on,
+so a pane under the default host never shows one. OpenConsole passes it on byte for byte.
+Measured on Windows 11 26300 (inbox conhost 10.0.26100.8875) with the nuget package at
+1.24.261001001, 1.25.260930003 and 1.26.260930004-preview, and with the `OpenConsole.exe` from
+Windows Terminal 1.24 next to a nuget `conpty.dll`: all four deliver the sequence, the inbox host
+none of it.
+
+OpenConsole also lays the image out, as Windows Terminal does, and the text it sends afterwards
+assumes that layout. psmux follows it rather than tmux: the cursor stays in the column the image
+started in, on the row holding the top of the last sixel band, where tmux moves to the line below
+the image. A pane's image is drawn again by the client whenever the images on screen change, so
+psmux stores each one with a raster size of its own; without one, Windows Terminal fills the
+background from the image to the bottom right of the screen.
+
+The `sixel` option turns drawing off. Programs that ask DA1 before sending sixel get psmux's
+answer under OpenConsole, `ESC[?1;2c`, which does not list sixel.
+
 `PSMUX_NO_PASSTHROUGH=1` is independent of this and does not change either number.
 
 ## Measuring the Terminal Around You

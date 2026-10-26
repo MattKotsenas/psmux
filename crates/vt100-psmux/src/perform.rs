@@ -1,10 +1,24 @@
 const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
+/// The most a sixel DCS may hold before it is thrown away: tmux's
+/// `input-buffer-size` default (INPUT_BUF_DEFAULT_SIZE, tmux.h), past which
+/// `input_input` sets INPUT_DISCARD and the image is never drawn.  Without a
+/// limit a pane that writes `ESC P q` and no ST grew the server by twice
+/// what it wrote.
+const SIXEL_MAX_BYTES: usize = 1 << 20;
 
 pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
     pub screen: crate::screen::Screen,
     pub callbacks: CB,
+    /// Set by `hook` when a sixel DCS (final `q`, no intermediates) begins, so
+    /// `put`/`unhook` know to accumulate and materialise the image.  Any other
+    /// DCS leaves this `false`, preserving the pre-existing no-op behaviour.
+    dcs_active: bool,
+    /// Accumulates the exact re-emit bytes of an in-progress sixel DCS:
+    /// `ESC P` + params + intermediates + `q` (from `hook`), the payload (from
+    /// `put`), and a trailing `ST` (appended in `unhook`).
+    dcs_buf: Vec<u8>,
 }
 
 impl WrappedScreen<()> {
@@ -26,6 +40,19 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
                 scrollback_len,
             ),
             callbacks,
+            dcs_active: false,
+            dcs_buf: Vec::new(),
+        }
+    }
+
+    /// Wrap an existing screen, with no DCS in progress.  Used by
+    /// `Parser::snapshot`, which clones the screen but starts a fresh parser.
+    pub(crate) fn from_screen(screen: crate::screen::Screen, callbacks: CB) -> Self {
+        Self {
+            screen,
+            callbacks,
+            dcs_active: false,
+            dcs_buf: Vec::new(),
         }
     }
 }
@@ -464,6 +491,303 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             }
         }
     }
+
+    // --- DCS (Device Control String) handling ------------------------------
+    //
+    // vte drives the DCS state machine and, for any DCS, calls hook (once, with
+    // the parsed params/intermediates/final byte), then put per payload byte,
+    // then unhook at the terminator.  Historically WrappedScreen left all three
+    // as trait defaults, so sixel graphics (DCS `q`) were parsed and silently
+    // discarded (issue #431).  We now capture ONLY sixel and leave every other
+    // DCS (e.g. DECRQSS `ESC P $ q ... ST`) a no-op exactly as before.
+
+    fn hook(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        // Sixel is DCS with final byte 'q' and NO intermediates.  DECRQSS also
+        // ends in 'q' but carries the '$' (0x24) intermediate, so gating on an
+        // empty intermediates slice keeps DECRQSS (and all other DCS) untouched.
+        if action == 'q' && intermediates.is_empty() {
+            self.dcs_buf.clear();
+            // Reconstruct the exact introducer: ESC P + params + intermediates
+            // + 'q'.  (intermediates is empty here but appended for fidelity.)
+            self.dcs_buf.push(0x1b); // ESC
+            self.dcs_buf.push(b'P');
+            for (i, param) in params.iter().enumerate() {
+                if i > 0 {
+                    self.dcs_buf.push(b';');
+                }
+                // A single top-level param may carry colon-separated
+                // subparams; rejoin them with ':' so the blob round-trips.
+                for (j, sub) in param.iter().enumerate() {
+                    if j > 0 {
+                        self.dcs_buf.push(b':');
+                    }
+                    self.dcs_buf.extend_from_slice(sub.to_string().as_bytes());
+                }
+            }
+            self.dcs_buf.extend_from_slice(intermediates);
+            self.dcs_buf.push(b'q');
+            self.dcs_active = true;
+        }
+        // Any other DCS: no-op (do NOT set active, do NOT route anywhere).
+    }
+
+    fn put(&mut self, byte: u8) {
+        if self.dcs_active {
+            if self.dcs_buf.len() >= SIXEL_MAX_BYTES {
+                self.dcs_active = false;
+                self.dcs_buf = Vec::new();
+                return;
+            }
+            self.dcs_buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if !self.dcs_active {
+            return;
+        }
+        // Terminate the reconstructed blob with ST (ESC \).
+        self.dcs_buf.push(0x1b);
+        self.dcs_buf.push(b'\\');
+
+        let (row, top, bottom) = self.screen.sixel_text_area();
+        let (_, col) = self.screen.cursor_position();
+        let layout = sixel_layout(&self.dcs_buf, bottom + 1 - row, bottom + 1 - top);
+        let (px_width, px_height) = (layout.px_width, layout.px_height);
+        let (cell_width, cell_height) =
+            crate::image::cell_dims_from_px(px_width, px_height);
+
+        let img = crate::image::SixelImage {
+            id: 0,             // assigned by add_image
+            raw: bound_background(&self.dcs_buf, &layout),
+            px_width,
+            px_height,
+            cell_width,
+            cell_height,
+            anchor_line: 0,    // filled by add_image
+            anchor_col: 0,     // filled by add_image
+            on_alt: false,     // filled by add_image
+        };
+        self.screen.add_image(img);
+
+        // The pane's real terminal is the console host, and the text it sends
+        // after the image (a CR LF, a prompt, cursor moves) assumes the cursor
+        // is where that host left it.  tmux moves to the line below the image
+        // (screen-write.c:2947), but OpenConsole, the only host that passes
+        // sixel through, follows Windows Terminal: same column, on the row
+        // holding the top of the last sixel band.  Following tmux here put
+        // every later line one row lower than the host had it.
+        let final_row = row
+            .saturating_add(layout.cursor_rows)
+            .saturating_sub(layout.scroll_rows)
+            .max(top)
+            .min(bottom);
+        self.screen
+            .finish_sixel(layout.scroll_rows, final_row, col);
+
+        self.dcs_active = false;
+        // Let go of the image's bytes rather than keep the capacity.
+        self.dcs_buf = Vec::new();
+    }
+}
+
+/// Where a sixel lands and where it leaves the text cursor, in the units the
+/// pane's console host uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SixelLayout {
+    /// Image width in pixels: the widest band, or the raster width if larger.
+    pub px_width: u32,
+    /// Image height in pixels: down to the bottom of the last band that drew
+    /// something, or the raster height if larger.
+    pub px_height: u32,
+    /// Rows from the image's top row down to the row the cursor ends on.
+    pub cursor_rows: u16,
+    /// Lines the text scrolls up first so the image fits above the bottom
+    /// margin.
+    pub scroll_rows: u16,
+    /// Pixel aspect ratio the introducer selects, before any raster command.
+    pub aspect: u32,
+}
+
+/// The blob with a raster command `"aspect;1;width;height` put right after the
+/// introducer, so a terminal that fills the background stops at the image.
+///
+/// With background select 0 (the default) and no raster size, Windows
+/// Terminal fills from the image to the bottom right of the page with colour
+/// 0 (`_fillImageBackground`).  Text written afterwards erases that fill,
+/// which hides it when an application prints the image once.  The client
+/// draws the image again whenever the set of images changes, though, and
+/// ratatui does not rewrite unchanged cells, so the fill blanked every row
+/// below the image, other panes to its right and the status line.
+///
+/// The aspect ratio is the one the introducer already selects, so the image
+/// keeps its shape, and a raster command of the image's own comes after this
+/// one and still wins.
+fn bound_background(buf: &[u8], layout: &SixelLayout) -> Vec<u8> {
+    let Some(q) = buf.iter().position(|&b| b == b'q') else {
+        return buf.to_vec();
+    };
+    let raster = format!(
+        "\"{};1;{};{}",
+        layout.aspect, layout.px_width, layout.px_height
+    );
+    let mut out = Vec::with_capacity(buf.len() + raster.len());
+    out.extend_from_slice(&buf[..=q]);
+    out.extend_from_slice(raster.as_bytes());
+    out.extend_from_slice(&buf[q + 1..]);
+    out
+}
+
+/// Lays out a reconstructed sixel DCS the way Windows Terminal's
+/// `SixelParser` does (microsoft/terminal, src/terminal/adapter/SixelParser.cpp
+/// at c829d4ca), since OpenConsole runs that parser for the pane and its
+/// later output assumes the result.  `avail_rows` is the room from the cursor
+/// row to the bottom margin and `margin_rows` the height of the margins.
+///
+/// - Cells are 10 by 20 pixels (`CellSizeForLevel`).
+/// - A sixel band is 6 pixels times the pixel aspect ratio.  The ratio comes
+///   from the first introducer parameter, 2:1 when it is 0 or omitted
+///   (`_initRasterAttributes`), and a raster command `"Pan;Pad;...` replaces
+///   it with `ceil(Pan / Pad)` (`_updateRasterAttributes`).
+/// - Each graphics new line (`-`) first scrolls the text while the band does
+///   not fit with a pixel to spare, then moves down one band
+///   (`_executeNextLine`, `_maybeFlushImageBuffer`).  The end of the sequence
+///   runs the same scroll check.
+/// - The cursor ends on the row holding the top of the last band
+///   (`_updateTextCursor`).
+pub(crate) fn sixel_layout(buf: &[u8], avail_rows: u16, margin_rows: u16) -> SixelLayout {
+    let cell_h = i64::from(crate::image::DEFAULT_CELL_PX.1);
+
+    // The introducer sits between ESC P and the first 'q'.
+    let q = buf.iter().position(|&b| b == b'q').unwrap_or(buf.len());
+    let intro = buf.get(2..q).unwrap_or(&[]);
+    let macro_param = intro
+        .split(|&b| b == b';')
+        .next()
+        .and_then(|p| std::str::from_utf8(p).ok())
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let intro_aspect: u32 = match macro_param {
+        0 | 1 | 5 | 6 => 2,
+        2 => 5,
+        3 | 4 => 3,
+        _ => 1,
+    };
+    let mut aspect = i64::from(intro_aspect);
+    let margin_px = i64::from(margin_rows) * cell_h;
+    let max_aspect = (margin_px / 6).max(1);
+    let mut sixel_h = 6 * aspect;
+    let mut segment_h = sixel_h;
+    let mut avail = i64::from(avail_rows) * cell_h;
+    let mut y: i64 = 0;
+    let mut scroll: i64 = 0;
+    let mut cur_x: u32 = 0;
+    let mut max_x: u32 = 0;
+    let mut drawn_bottom: i64 = 0;
+    let mut raster = (0u32, 0u32);
+
+    let fit = |segment_h: i64, avail: &mut i64, scroll: &mut i64| {
+        if segment_h > *avail {
+            while *avail < margin_px && segment_h >= *avail {
+                *scroll += 1;
+                *avail += cell_h;
+            }
+        }
+    };
+
+    let payload = buf.get(q + 1..).unwrap_or(&[]);
+    let mut i = 0usize;
+    // Reads `;` separated decimal fields starting at `payload[i]`.
+    let read_fields = |i: &mut usize| -> Vec<u32> {
+        let mut fields = vec![0u32];
+        while *i < payload.len() {
+            match payload[*i] {
+                b @ b'0'..=b'9' => {
+                    let last = fields.last_mut().expect("never empty");
+                    *last = last.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                }
+                b';' => fields.push(0),
+                _ => break,
+            }
+            *i += 1;
+        }
+        fields
+    };
+    while i < payload.len() {
+        match payload[i] {
+            b'"' => {
+                i += 1;
+                let f = read_fields(&mut i);
+                let (pan, pad) = (f.first().copied().unwrap_or(0), f.get(1).copied().unwrap_or(0));
+                if pad > 0 {
+                    aspect = (i64::from(pan.div_ceil(pad))).clamp(1, max_aspect);
+                    sixel_h = 6 * aspect;
+                    segment_h = segment_h.max(sixel_h);
+                }
+                raster = (
+                    f.get(2).copied().filter(|&w| w > 0).unwrap_or(raster.0),
+                    f.get(3).copied().filter(|&h| h > 0).unwrap_or(raster.1),
+                );
+                max_x = max_x.max(cur_x);
+                cur_x = 0;
+                continue;
+            }
+            b'#' => {
+                i += 1;
+                let _ = read_fields(&mut i);
+                continue;
+            }
+            b'!' => {
+                i += 1;
+                let n = read_fields(&mut i).first().copied().unwrap_or(0).max(1);
+                if i < payload.len() && (0x3f..=0x7e).contains(&payload[i]) {
+                    cur_x = cur_x.saturating_add(n);
+                    drawn_bottom = drawn_bottom.max(y + sixel_h);
+                    i += 1;
+                }
+                continue;
+            }
+            b'$' => {
+                max_x = max_x.max(cur_x);
+                cur_x = 0;
+            }
+            b'-' => {
+                max_x = max_x.max(cur_x);
+                cur_x = 0;
+                fit(segment_h, &mut avail, &mut scroll);
+                segment_h = sixel_h;
+                if avail > 0 {
+                    y += sixel_h;
+                    avail -= sixel_h;
+                }
+            }
+            0x3f..=0x7e => {
+                cur_x = cur_x.saturating_add(1);
+                drawn_bottom = drawn_bottom.max(y + sixel_h);
+            }
+            0x1b => break, // ESC of the ST terminator
+            _ => {}
+        }
+        i += 1;
+    }
+    fit(segment_h, &mut avail, &mut scroll);
+    max_x = max_x.max(cur_x);
+
+    let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
+    let to_u16 = |v: i64| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+    SixelLayout {
+        px_width: max_x.max(raster.0).max(1),
+        px_height: to_u32(drawn_bottom).max(raster.1).max(1),
+        cursor_rows: to_u16(y / cell_h),
+        scroll_rows: to_u16(scroll),
+        aspect: intro_aspect,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,3 +918,7 @@ fn canonicalize_params_decstbm(
 
     (top, bottom)
 }
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue431_sixel_parse.rs"]
+mod test_issue431_sixel_parse;

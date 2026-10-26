@@ -773,6 +773,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
+        "sixel" => if app.sixel { "on".into() } else { "off".into() },
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
         "mouse-drag-enter-copy-mode" => if app.mouse_drag_enter_copy_mode { "on".into() } else { "off".into() },
         "ctrl-wheel-zoom" => if app.ctrl_wheel_zoom { "on".into() } else { "off".into() },
@@ -1076,6 +1077,7 @@ pub(crate) fn is_boolean_option(name: &str) -> bool {
         name,
         "mouse"
             | "bold-is-bright"
+            | "sixel"
             | "scroll-enter-copy-mode"
             | "mouse-drag-enter-copy-mode"
             | "ctrl-wheel-zoom"
@@ -1287,6 +1289,7 @@ pub(crate) fn apply_set_option(
                 crate::platform::set_process_priority(&app.priority);
             }
         }
+        "sixel" => { app.sixel = matches!(value, "on" | "true" | "1" | "yes"); }
         "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"); }
         "mouse-drag-enter-copy-mode" => { app.mouse_drag_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"); }
         "ctrl-wheel-zoom" => { app.ctrl_wheel_zoom = matches!(value, "on" | "true" | "1" | "yes"); }

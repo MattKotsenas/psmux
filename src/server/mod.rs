@@ -256,6 +256,49 @@ fn serialize_overlay_json(app: &AppState) -> String {
     out
 }
 
+/// Build the top-level `image_blobs` JSON object for a dump-state frame.
+///
+/// Returns `{"<id>":"<base64 of SixelImage.raw>", ...}` for every sixel image
+/// currently visible in the active window (per `helpers::visible_image_blobs`)
+/// whose id is NOT yet in `app.shipped_image_ids`, and records each emitted id
+/// so subsequent frames ship only the tiny per-leaf descriptor.  When every
+/// visible id has already shipped this returns `"{}"`, keeping steady-state
+/// frames small and NC-dedup effective (sixel design section 3b / M4).  Called
+/// at BOTH dump-state build sites (design risk 7), and by the shared
+/// server's `shared::frame::build_frame`.
+pub(crate) fn build_image_blobs_json(app: &mut AppState) -> String {
+    use base64::Engine as _;
+    let visible = helpers::visible_image_blobs(app);
+    let mut json = String::from("{");
+    let mut first = true;
+    for (id, raw) in visible {
+        if app.shipped_image_ids.contains(&id) {
+            continue;
+        }
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        // ids are decimal digits and the standard base64 alphabet
+        // (A-Za-z0-9+/=) needs no JSON escaping, so embed both verbatim.
+        let _ = std::fmt::Write::write_fmt(&mut json, format_args!("\"{}\":\"{}\"", id, b64));
+        app.shipped_image_ids.insert(id);
+    }
+    json.push('}');
+    if app.shipped_image_ids.len() > SHIPPED_IMAGE_IDS_PRUNE_AT {
+        let live = helpers::all_image_ids(app);
+        app.shipped_image_ids.retain(|id| live.contains(id));
+    }
+    json
+}
+
+/// How many shipped ids the session keeps before it forgets the ones no pane
+/// holds any more.  Ids are never reused, so an id that is gone never needs
+/// its blob again; pruning only past this keeps the frame path free of the
+/// walk over every window's panes.
+const SHIPPED_IMAGE_IDS_PRUNE_AT: usize = 1024;
+
 /// The longest the standby waits after the boot hold for the pool to have its
 /// spares. It is only needed by the NEXT `new-session`.
 const STANDBY_OWED_MAX: Duration = Duration::from_millis(2000);
@@ -3997,6 +4040,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // switch (issue #691).
                         notify_events.push("client-session-changed");
                         hook_event = Some("client-attached");
+                        // Sixel M4 resync: a newly attached (or re-attaching) client
+                        // has an empty per-connection blob cache, so re-ship every
+                        // currently-visible blob.  Clearing the shipped set makes the
+                        // next dump-state frame re-emit all visible `image_blobs`;
+                        // force a rebuild so that frame is actually produced.
+                        app.shipped_image_ids.clear();
+                        state_dirty = true;
                         // update-environment from the ATTACHING client's
                         // environment (tmux cmd-attach-session.c environ_update
                         // from c->environ, #775), sent as `client-environ` just
@@ -4157,7 +4207,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         None => "null",
                     };
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index_of(app.active_idx), cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -4176,6 +4226,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         crate::mouse_keys::drag_end_is_default(&app),
                         crate::mouse_keys::client_overrides(&app),
                         app.bold_is_bright,
+                        app.sixel,
                     ));
                     // #633 follow up: a malformed buffer here used to be a quiet
                     // no op; never let it end the server. Skipping the append
@@ -6591,6 +6642,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("status-right-length {}\n", app.status_right_length));
                     output.push_str(&format!("window-size {}\n", app.window_size));
                     output.push_str(&format!("allow-passthrough {}\n", app.allow_passthrough));
+                    output.push_str(&format!("sixel {}\n", if app.sixel { "on" } else { "off" }));
                     output.push_str(&format!("set-clipboard {}\n", app.set_clipboard));
                     if !app.copy_command.is_empty() {
                         output.push_str(&format!("copy-command \"{}\"\n", app.copy_command));
@@ -7861,7 +7913,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.status_message = Some(("lock: not available on Windows".to_string(), std::time::Instant::now(), None));
                     state_dirty = true;
                 }
-                CtrlReq::RefreshClient => { state_dirty = true; meta_dirty = true; }
+                CtrlReq::RefreshClient => {
+                    // Sixel M4 resync: a full redraw (refresh-client) means the
+                    // client repaints from scratch, discarding any painted sixel,
+                    // so re-ship every visible blob on the next frame.
+                    app.shipped_image_ids.clear();
+                    state_dirty = true;
+                    meta_dirty = true;
+                }
                 CtrlReq::SuspendClient => {
                     app.status_message = Some(("suspend: not available on Windows".to_string(), std::time::Instant::now(), None));
                     state_dirty = true;
@@ -8992,7 +9051,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 None => "null",
             };
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"cursor_blink_mode\":{},\"status_visible\":{},\"repeat_time\":{},\"escape_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"mouse_selection_force\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"mouse_drag_enter_copy_mode\":{},\"ctrl_wheel_zoom\":{},\"drag_end_default\":{},\"mouse_overrides\":{},\"bold_is_bright\":{},\"sixel\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index_of(app.active_idx), cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -9010,6 +9069,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::mouse_keys::drag_end_is_default(&app),
                 crate::mouse_keys::client_overrides(&app),
                 app.bold_is_bright,
+                app.sixel,
             ));
             // #633 follow up: a malformed buffer here used to be a quiet
             // no op; never let it end the server. Skipping the append degrades
@@ -9448,6 +9508,10 @@ mod test_issue167_startup_log;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
 mod test_issue370_startup_error_passthrough;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue431_m4_blobs.rs"]
+pub(crate) mod test_issue431_m4_blobs;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue459_warm_single_instance.rs"]

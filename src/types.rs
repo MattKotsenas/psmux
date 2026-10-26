@@ -1602,6 +1602,16 @@ pub struct AppState {
     /// which keeps explicit 256-indexed low colors byte-accurate at the cost of
     /// losing bold-is-bright on basic colors.
     pub bold_is_bright: bool,
+    /// sixel: when on (default), render sixel graphics emitted by panes on the
+    /// outer terminal.  Server always parses and stores sixel images; this flag
+    /// only gates the client-side emission (issue #431).
+    pub sixel: bool,
+    /// Ids of sixel image blobs already shipped to attached clients this
+    /// session.  The dump-state builder ships each blob's base64 bytes exactly
+    /// once (in `image_blobs`) and records the id here; later frames carry only
+    /// the tiny descriptor.  Cleared on client attach / refresh-client so a new
+    /// (or re-attaching) client re-receives every currently-visible blob (M4).
+    pub shipped_image_ids: std::collections::HashSet<u64>,
     /// Issue #473: the host terminal's colors as reported by the most recently
     /// attached client (or the PSMUX_HOST_COLORS override).  None until a
     /// client reports; the responder then falls back to the Campbell palette.
@@ -3202,6 +3212,8 @@ impl AppState {
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             mouse_enabled: true,
             bold_is_bright: true,
+            sixel: true,
+            shipped_image_ids: std::collections::HashSet::new(),
             host_colors: std::env::var("PSMUX_HOST_COLORS").ok()
                 .map(|s| HostColors::from_spec(&s))
                 .filter(|hc| hc.has_any() || hc.dark.is_some()),
