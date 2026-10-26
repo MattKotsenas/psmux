@@ -1,4 +1,5 @@
-//! Passthrough client: `attach -f passthrough` and `new-session -f passthrough`.
+//! Scrollback client: `attach -f scrollback` and `new-session -f scrollback`
+//! (`-f passthrough` is another name for it).
 //!
 //! The normal client draws the session in frames and places every cell with
 //! a cursor move, so the host terminal never sees a line scroll off its top
@@ -16,6 +17,9 @@
 //! of that capture on the live output is written as it arrives. The host
 //! terminal shows the one active pane, with no status line and no borders.
 //! `prefix d` detaches; the prefix pressed twice sends it to the pane once.
+//! `read-only` and `ignore-size` go to the server as `refresh-client -f`,
+//! so the server refuses a read only client's keys and other clients see
+//! its flags.
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Write};
@@ -31,6 +35,11 @@ const FACTS_FORMAT: &str =
 /// How often the host terminal's size is compared with the client size.
 const SIZE_POLL: Duration = Duration::from_millis(250);
 
+/// How long a client whose terminal went away waits for the server to
+/// confirm its detach. The reader ends the process as soon as the server
+/// answers, which takes milliseconds; this only bounds a server that does
+/// not answer at all.
+const DETACH_DEADLINE: Duration = Duration::from_secs(2);
 /// Where a pane's cursor is and how many lines it holds, from `FACTS_FORMAT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneFacts {
@@ -163,6 +172,21 @@ pub fn route_keys(input: &[u8], prefix: Option<u8>, after_prefix: &mut bool) -> 
     (keys, KeyAction::None)
 }
 
+/// The `refresh-client -f` that hands the server the client flags it acts
+/// on: `read-only` makes the server refuse this client's keys and commands
+/// and shows in `list-clients`, `ignore-size` leaves the window size to the
+/// other clients.
+pub fn client_flags_command(flags: &crate::cli::ClientFlags) -> Option<String> {
+    let mut names = Vec::new();
+    if flags.read_only {
+        names.push("read-only");
+    }
+    if flags.ignore_size {
+        names.push("ignore-size");
+    }
+    (!names.is_empty()).then(|| format!("refresh-client -f {}", names.join(",")))
+}
+
 pub fn send_keys_command(keys: &[u8]) -> String {
     let mut s = String::from("send-keys -H");
     for b in keys {
@@ -201,9 +225,11 @@ fn ask_capture(link: &Mutex<Link>, history: bool) -> io::Result<()> {
 }
 
 /// The prefix key as the one byte a terminal sends for it, if it is one.
+/// `-A` gives the session's own prefix where it sets one and the global one
+/// otherwise; `-g` alone would miss a session level prefix.
 fn prefix_byte(link: &Mutex<Link>) -> Option<u8> {
     let (tx, rx) = mpsc::channel();
-    send(link, "show-options -gv prefix", Reply::Lines(tx)).ok()?;
+    send(link, "show-options -Av prefix", Reply::Lines(tx)).ok()?;
     let name = rx.recv_timeout(Duration::from_secs(2)).ok()?.into_iter().next()?;
     let (code, mods) = crate::config::parse_key_name(&name)?;
     let bytes = crate::input::encode_key_event(&crossterm::event::KeyEvent::new(code, mods))?;
@@ -334,10 +360,9 @@ fn read_server(mut reader: io::BufReader<TcpStream>, link: Arc<Mutex<Link>>, end
     ending.finish(&view)
 }
 
-pub fn run() -> io::Result<()> {
+pub fn run(flags: crate::cli::ClientFlags) -> io::Result<()> {
     let session = std::env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let shown = std::env::var("PSMUX_SESSION_DISPLAY_NAME").unwrap_or_else(|_| session.clone());
-    let read_only = std::env::var("PSMUX_CLIENT_READONLY").map(|v| v == "1").unwrap_or(false);
 
     let console = Arc::new(crate::platform::RawVtConsole::enable());
     let (reader, out) = crate::session::open_control_connection(&session, "CONTROL_QUIET")?;
@@ -349,7 +374,11 @@ pub fn run() -> io::Result<()> {
         std::thread::spawn(move || read_server(reader, link, ending));
     }
 
-    // The client size goes first, so the first capture is taken at it.
+    // The flags go first, so `ignore-size` is set before the size, then the
+    // size, so the first capture is taken at it.
+    if let Some(command) = client_flags_command(&flags) {
+        send(&link, &command, Reply::Ignore)?;
+    }
     let mut size = crossterm::terminal::size().ok();
     if let Some((w, h)) = size {
         send(&link, &format!("refresh-client -C {}x{}", w, h), Reply::Ignore)?;
@@ -382,7 +411,7 @@ pub fn run() -> io::Result<()> {
             Ok(n) => n,
         };
         let (keys, action) = route_keys(&buf[..n], prefix, &mut after_prefix);
-        if !keys.is_empty() && !read_only {
+        if !keys.is_empty() {
             send(&link, &send_keys_command(&keys), Reply::Ignore)?;
         }
         if action == KeyAction::Detach {
@@ -392,12 +421,13 @@ pub fn run() -> io::Result<()> {
     }
     // The terminal went away (an SSH connection dropped): the session keeps
     // running. The reader exits once the server confirms the detach.
+    ending.detaching.store(true, Ordering::Release);
     let _ = send(&link, "detach-client", Reply::Ignore);
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(DETACH_DEADLINE);
     console.restore();
     Ok(())
 }
 
 #[cfg(test)]
-#[path = "../tests-rs/test_passthrough_client.rs"]
+#[path = "../tests-rs/test_scrollback_client.rs"]
 mod tests;

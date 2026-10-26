@@ -1330,3 +1330,11 @@ fn plan_sixel_frame_redraws_after_a_resize_without_repainting() {
     assert!(plan.repaint.is_empty());
     assert_eq!(plan.draw, last);
 }
+
+#[test]
+fn soft_hyphen_is_one_space_for_ratatui() {
+    // ratatui lays text out with unicode-width, which gives U+00AD no columns.
+    // The client has to hand it a one column stand-in or the row shifts left.
+    assert_eq!(ratatui_text("a\u{AD}b"), "a b");
+    assert!(matches!(ratatui_text("plain"), std::borrow::Cow::Borrowed("plain")));
+}
