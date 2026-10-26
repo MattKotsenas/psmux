@@ -31,7 +31,9 @@ is accepted as another name for it; it has nothing to do with the
   size like any other attached client's (`window-size`, `latest` by default,
   so the session takes the size of whichever client was resized last). With
   `-f scrollback,ignore-size` it leaves the window size to the other clients;
-  pane lines wider than the terminal then wrap there.
+  pane lines wider than the terminal then wrap there. As in tmux,
+  `ignore-size` only applies while another client without it is attached;
+  a scrollback client attached on its own still sizes the window.
 - When the active pane or window changes, the client prints the new pane's
   screen and follows its output.
 
