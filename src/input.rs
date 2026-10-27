@@ -3994,6 +3994,10 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         if text == "\x1b" {
             app.mode = Mode::Passthrough;
         }
+        // send-keys Enter arrives as "\r": choose the selected item.
+        if text == "\r" {
+            return send_key_to_active(app, "enter");
+        }
         return Ok(());
     }
     if matches!(app.mode, Mode::PaneChooser { .. }) {
@@ -4381,7 +4385,9 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                         if !item.is_separator && !item.command.is_empty() {
                             let cmd = item.command.clone();
                             app.mode = Mode::Passthrough;
-                            crate::config::parse_config_line(app, &cmd);
+                            // As MenuSelect runs it: the config parser has
+                            // no arm for kill-pane or split-window.
+                            let _ = execute_command_string(app, &cmd);
                             return Ok(());
                         }
                     }

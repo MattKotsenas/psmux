@@ -102,3 +102,64 @@ fn send_keys_y_still_runs_an_option_command() {
     send_text_to_active(&mut a, "y").unwrap();
     assert_eq!(a.user_options.get("@skc").map(String::as_str), Some("ran"));
 }
+
+// ── display-menu answered with send-keys ────────────────────────────────
+// send-keys Enter reaches the server as the text "\r"
+// (send_text_to_active), which the menu ignored, so the menu stayed open;
+// and the "enter" key arm ran the item through the config parser, which
+// drops runtime commands. MenuSelect runs it with execute_command_string,
+// and tmux's menu runs the chosen item's command on Enter (menu.c).
+
+fn open_menu(app: &mut AppState, first: &str) {
+    let item = |name: &str, key: char, command: &str| crate::types::MenuItem {
+        name: name.to_string(),
+        key: Some(key),
+        command: command.to_string(),
+        is_separator: false,
+    };
+    app.mode = Mode::MenuMode {
+        menu: crate::types::Menu {
+            title: "menu".to_string(),
+            items: vec![item("First", 'f', first), item("Second", 's', "rename-window SECOND")],
+            selected: 0,
+            x: None,
+            y: None,
+        },
+    };
+}
+
+#[test]
+fn menu_send_keys_enter_runs_the_selected_runtime_command() {
+    let mut a = app();
+    open_menu(&mut a, "rename-window FIRST");
+    send_text_to_active(&mut a, "\r").unwrap();
+    assert!(matches!(a.mode, Mode::Passthrough), "Enter closes the menu");
+    assert_eq!(a.windows[0].name, "FIRST", "Enter must run the selected item");
+}
+
+#[test]
+fn menu_enter_key_runs_the_selected_runtime_command() {
+    let mut a = app();
+    open_menu(&mut a, "rename-window FIRST");
+    send_key_to_active(&mut a, "enter").unwrap();
+    assert!(matches!(a.mode, Mode::Passthrough));
+    assert_eq!(a.windows[0].name, "FIRST");
+}
+
+#[test]
+fn menu_down_then_enter_runs_the_second_item_only() {
+    let mut a = app();
+    open_menu(&mut a, "rename-window FIRST");
+    send_key_to_active(&mut a, "down").unwrap();
+    send_text_to_active(&mut a, "\r").unwrap();
+    assert_eq!(a.windows[0].name, "SECOND");
+}
+
+#[test]
+fn menu_escape_still_closes_without_running() {
+    let mut a = app();
+    open_menu(&mut a, "rename-window FIRST");
+    send_text_to_active(&mut a, "\x1b").unwrap();
+    assert!(matches!(a.mode, Mode::Passthrough));
+    assert_eq!(a.windows[0].name, "main");
+}

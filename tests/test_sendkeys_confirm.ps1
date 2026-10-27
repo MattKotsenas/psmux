@@ -52,6 +52,28 @@ function Run-Case([string]$guarded, [string[]]$confirmFlags, [scriptblock]$answe
     return $r
 }
 
+# A detached display-menu whose first item is $first and second sets @skc,
+# chosen with the given keys and then Enter.
+function Run-Menu([string]$first, [string[]]$keysBefore) {
+    $ns = "skm" + [guid]::NewGuid().ToString('N').Substring(0, 6)
+    P $ns new-session -d -s t | Out-Null
+    Start-Sleep -Milliseconds 1500
+    P $ns split-window -t t | Out-Null
+    P $ns split-window -t t | Out-Null
+    Start-Sleep -Milliseconds 600
+    $before = Panes $ns
+    P $ns display-menu -t t -T menu "First" f $first "Second" s "set -g @skc second" | Out-Null
+    Start-Sleep -Milliseconds 400
+    $opened = (P $ns dump-state -t t | Out-String) -match '"menu_active":true'
+    foreach ($k in $keysBefore) { P $ns send-keys -t t $k | Out-Null; Start-Sleep -Milliseconds 150 }
+    P $ns send-keys -t t Enter | Out-Null
+    Start-Sleep -Milliseconds 900
+    $closed = -not ((P $ns dump-state -t t | Out-String) -match '"menu_active":true')
+    $r = [pscustomobject]@{ Before = $before; After = (Panes $ns); Opened = $opened; Closed = $closed; Opt = (P $ns show -gqv '@skc' | Out-String).Trim() }
+    P $ns kill-server | Out-Null
+    return $r
+}
+
 $modes = if ($Mode -eq "both") { @("default", "shared") } else { @($Mode) }
 try {
     foreach ($m in $modes) {
@@ -81,6 +103,21 @@ try {
         $r = Run-Case "set -g @skc ran" @() { param($ns) P $ns send-keys -t t y | Out-Null }
         if ($r.Opt -eq "ran") { Write-Pass "send-keys y still runs a guarded set (@skc=ran)" }
         else { Write-Fail "send-keys y / set: @skc='$($r.Opt)'" }
+
+        # A menu item chosen with send-keys Enter runs as MenuSelect does.
+        # Shared mode refuses display-menu for now (src/server/shared/refused.rs).
+        if ($m -eq "shared") { Write-Host "  [SKIP] menu cases: display-menu is not supported in shared mode yet" -ForegroundColor DarkYellow; continue }
+        $r = Run-Menu "kill-pane" @()
+        if ($r.Opened -and $r.Closed -and $r.Before -eq "3" -and $r.After -eq "2") { Write-Pass "menu: send-keys Enter runs a kill-pane item (3 -> 2)" }
+        else { Write-Fail "menu kill-pane: panes $($r.Before) -> $($r.After), opened=$($r.Opened) closed=$($r.Closed)" }
+
+        $r = Run-Menu "split-window" @()
+        if ($r.Closed -and $r.Before -eq "3" -and $r.After -eq "4") { Write-Pass "menu: send-keys Enter runs a split-window item (3 -> 4)" }
+        else { Write-Fail "menu split-window: panes $($r.Before) -> $($r.After)" }
+
+        $r = Run-Menu "split-window" @("Down")
+        if ($r.Closed -and $r.After -eq "3" -and $r.Opt -eq "second") { Write-Pass "menu: Down then Enter runs the second item only" }
+        else { Write-Fail "menu Down: panes $($r.Before) -> $($r.After), @skc='$($r.Opt)'" }
     }
 } finally {
     Remove-Item Env:\PSMUX_DATA_DIR -EA SilentlyContinue
