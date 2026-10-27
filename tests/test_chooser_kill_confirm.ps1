@@ -99,7 +99,9 @@ $escCancels = $src -match "if chooser_kill\.is_some\(\) \{(?:(?!\} else)[\s\S])*
 Add-Result "Escape clears only the question" $escCancels ""
 
 Write-Test "the question is drawn in the confirm box"
-$drawn = $src -match "\.or\(chooser_kill\.as_ref\(\)\.map\(\|k\| k\.prompt\.as_str\(\)\)\)"
+# Since #616 a binding's box carries its own prompt, so the chooser's
+# question gets its `? (y/n)` where the box is drawn.
+$drawn = $src -match "\.or\(chooser_kill\.as_ref\(\)\.map\(\|k\| format!\(`"\{\}\? \(y/n\)`", k\.prompt\)\)\)"
 Add-Result "confirm box draws the question" $drawn ""
 
 Write-Test "a jump key cannot move the cursor while the question is up"

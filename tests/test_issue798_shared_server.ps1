@@ -241,8 +241,9 @@ try {
     Write-Host "      per-session: $(($perLine -replace "`n", '\n'))   shared: $(($shLine -replace "`n", '\n'))"
     Check ($perLine -ceq "OK`nERROR: unknown command: bogus`n") "per session reply to an unknown command in a list" ($perLine -replace "`n", '\n')
     Check ($shLine -ceq $perLine) "shared reply is byte for byte the same" ($shLine -replace "`n", '\n')
-    $sh2 = Tcp-Raw $ctx 'A' @('rotate-window')
-    Check ($sh2 -ceq "OK`nERROR: unknown command: rotate-window`n") "a command step 2 does not run gets the same shape" ($sh2 -replace "`n", '\n')
+    # rotate-window runs in shared mode since 3b2d300e; break-pane still does not.
+    $sh2 = Tcp-Raw $ctx 'A' @('break-pane')
+    Check ($sh2 -ceq "OK`nERROR: unknown command: break-pane`n") "a command step 2 does not run gets the same shape" ($sh2 -replace "`n", '\n')
     $sh3 = Tcp-Raw $ctx 'A' @('TARGET A:0', 'join-pane -s B:0')
     Check ($sh3 -ceq "OK`nERROR: unknown command: join-pane`n") "also behind a TARGET line" ($sh3 -replace "`n", '\n')
     $rp = Run $pctx '<unset>' @('bogus'); $rs = S $ctx @('bogus')
