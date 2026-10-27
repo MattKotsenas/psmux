@@ -150,13 +150,9 @@ fn newest_buffer(app: &AppState) -> String {
     app.paste_top().unwrap_or_default().to_string()
 }
 
-/// The Win32 clipboard is a single process-global resource, and reading it
-/// (`GlobalLock` on the clipboard-owned handle) while another thread replaces
-/// it (`EmptyClipboard` frees that same handle) is a use-after-free. `cargo
-/// test` runs these in parallel, so every test that reaches
-/// `copy_to_system_clipboard` (`yank_selection`, `copy_end_of_line`) takes this
-/// lock first.
-static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
+/// What the clipboard holds is one value for the whole test process, so a
+/// test that copies and then reads it back holds the crate wide contents lock
+/// (the Win32 calls themselves are serialized inside clipboard.rs).
 
 /// Serializes clipboard access for the duration of a test and puts the user's
 /// previous clipboard contents back afterwards, so running the suite locally
@@ -169,7 +165,7 @@ struct ClipboardGuard {
 impl ClipboardGuard {
     fn new() -> Self {
         // A panicking test must not poison the lock for the rest of the suite.
-        let lock = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::clipboard::TEST_CLIPBOARD_CONTENTS.lock().unwrap_or_else(|e| e.into_inner());
         let prev = crate::clipboard::read_from_system_clipboard();
         ClipboardGuard { _lock: lock, prev }
     }

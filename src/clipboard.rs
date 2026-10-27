@@ -24,6 +24,26 @@ use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 
+/// Every OpenClipboard..CloseClipboard section in this process runs under this
+/// lock. The Win32 clipboard lock only keeps processes apart: with no owner
+/// window, `OpenClipboard` on a second thread of the same process succeeds
+/// while the first still has it open, so one thread's `EmptyClipboard` could
+/// free the handle another thread was reading in `GetClipboardData` (a double
+/// free in USER32, STATUS_HEAP_CORRUPTION). The server reads the clipboard on
+/// connection threads while its main loop writes it.
+#[cfg(windows)]
+static CLIPBOARD_SECTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn clipboard_section() -> std::sync::MutexGuard<'static, ()> {
+    CLIPBOARD_SECTION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Tests that assert what the clipboard holds take this for their whole body,
+/// so one test's write cannot land between another's write and read.
+#[cfg(test)]
+pub(crate) static TEST_CLIPBOARD_CONTENTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Write `text` to the Windows system clipboard as CF_UNICODETEXT.
 ///
 /// Other processes may briefly hold the clipboard open, so this retries a
@@ -67,8 +87,10 @@ pub fn copy_to_system_clipboard(text: &str) {
     // Other processes can briefly hold the clipboard open; retry a few times.
     let mut transferred = false;
     for _ in 0..5 {
+        let _section = clipboard_section();
         let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
         if opened == 0 {
+            drop(_section);
             thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -121,8 +143,10 @@ pub struct ClipboardBusy;
 pub fn try_read_from_system_clipboard() -> Result<Option<String>, ClipboardBusy> {
     const CF_UNICODETEXT: u32 = 13;
     for _ in 0..5 {
+        let _section = clipboard_section();
         let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
         if opened == 0 {
+            drop(_section);
             thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -183,3 +207,7 @@ pub fn clipboard_sequence_number() -> u32 {
 
 #[cfg(not(windows))]
 pub fn clipboard_sequence_number() -> u32 { 0 }
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_clipboard_thread_lock.rs"]
+mod tests_clipboard_thread_lock;
