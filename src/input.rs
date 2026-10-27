@@ -3981,8 +3981,10 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
             let yes = crate::confirm::is_yes(confirm_key, default_yes, input);
             let cmd = command.clone();
             app.mode = Mode::Passthrough;
+            // Run it as confirm-respond and a key press do; the config
+            // parser has no arm for kill-pane or split-window.
             if yes {
-                crate::config::parse_config_line(app, &cmd);
+                let _ = execute_command_string(app, &cmd);
             }
         }
         return Ok(());
@@ -4353,7 +4355,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let cmd = command.clone();
                 app.mode = Mode::Passthrough;
                 if default_yes {
-                    crate::config::parse_config_line(app, &cmd);
+                    let _ = execute_command_string(app, &cmd);
                 }
             }
             _ => {} // y/n handled via send_text_to_active
@@ -5047,3 +5049,7 @@ mod tests_issue783_prompt_edit_unify_server;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue860_modifier_order.rs"]
 mod tests_issue860_modifier_order;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_sendkeys_confirm.rs"]
+mod tests_sendkeys_confirm;
