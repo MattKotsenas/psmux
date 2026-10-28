@@ -288,8 +288,11 @@ try {
         $shown = S $c @('show-buffer', '-t', $sess)
         Check ($shown.Code -eq 0 -and $shown.Out -match "(?m)^BUF896-$sess" -and $shown.Out -notmatch 'unknown command') "$sess show-buffer prints the buffer" "[$($shown.Code)] $($shown.Out)"
     }
+    # Since #925 the shared server keeps one set of buffers, as tmux does
+    # (paste.c), so C saves the buffer D's capture-pane made ($plain is D's,
+    # the loop's last pass).
     $other = Save-Buffer $ctx 'C' 'other-session' @()
-    Check ($other.Code -eq 0 -and $other.Hex -ceq '') "shared: C does not see D's buffer (an empty file, as a per session server writes)" "[$($other.Code) $($other.Hex)]"
+    Check ($other.Code -eq 0 -and $other.Hex -ceq $plain.Hex) "shared: C sees D's buffer, one set of buffers for the server (#925)" "[$($other.Code) $($other.Hex)]"
 
     Head "Part 6: a real attached client on each session"
     foreach ($s in 'A', 'C') {

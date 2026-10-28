@@ -86,10 +86,9 @@ try {
         P copy-mode -t "=a:" | Out-Null
         $inMode = ((P display -p -t "=a:" '#{pane_in_mode}') -join '').Trim()
         if ($inMode -ne '1') {
-            # A one shot copy-mode does not enter copy mode on the shared
-            # server yet (a separate gap, not a buffer one), so there is no
-            # yank to check from here.
-            Write-Host "  [SKIP] one shot copy-mode did not enter copy mode in shared mode" -ForegroundColor Yellow
+            # The shared router used to refuse a one shot copy-mode, so this
+            # stayed 0 and the yank below never ran.
+            Write-Fail "one shot copy-mode -t =a: entered copy mode (pane_in_mode=$inMode)"
         } else {
             P send-keys -t "=a:" -X search-backward "yank925marker" | Out-Null
             P send-keys -t "=a:" -X select-line | Out-Null
