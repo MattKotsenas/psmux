@@ -119,8 +119,12 @@ portable-pty = { version = "0.9.8", path = "crates/portable-pty-psmux", package 
 which = "8.0.6"
 chrono = "0.4.45"
 vt100 = { version = "0.16.13", path = "crates/vt100-psmux", package = "vt100-psmux" }
-unicode-width = "0.2.2"
-serde = { version = "1.0.229", features = ["derive"] }
+# Held at 0.2.2: 0.2.3 gives U+FF9E/U+FF9F width 1, and ratatui-core 0.1.2
+# (buffer/cell_width.rs) still adds 1 per mark for the old width 0, so the
+# client would count each halfwidth (han)dakuten twice. Lift the pin when
+# ratatui-core drops its compensation (test_osc8_stale_link case12 guards it).
+unicode-width = "=0.2.2"
+serde ={ version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 regex = "1.13.1"
 glob = "0.3.4"
