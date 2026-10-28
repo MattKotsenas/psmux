@@ -79,6 +79,8 @@ pub enum ChoiceKind {
     ExtendedKeysFormat,
     /// tmux `options_table_remain_on_exit_list` (options-table.c:93 at 3.8).
     RemainOnExit,
+    /// psmux's `sixel`: off/on/auto, see `SixelMode`.
+    Sixel,
 }
 
 /// tmux's `remain-on-exit-format` default (options-table.c:1713-1718).
@@ -114,6 +116,10 @@ impl ChoiceKind {
             Self::RemainOnExit => crate::types::RemainOnExit::parse(value.trim())
                 .map(|_| ())
                 .ok_or_else(|| format!("unknown value: {}", value)),
+            Self::Sixel => match crate::types::SixelMode::parse(value) {
+                Some(_) => Ok(()),
+                None => Err(format!("unknown value: {}", value)),
+            },
             Self::CopyModeLineNumbers => {
                 if crate::copy_line_numbers::CHOICES.contains(&value.trim()) {
                     Ok(())
@@ -140,7 +146,7 @@ impl ChoiceKind {
     const fn allows_append(self) -> bool {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
-            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit => true,
+            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -148,7 +154,7 @@ impl ChoiceKind {
     const fn allows_local_window_override(self) -> bool {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
-            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit => true,
+            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -322,7 +328,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "key-table", scope: Session, option_type: OptionType::String, default: "root", description: "Default key table" },
     OptionDef { name: "word-separators", scope: Session, option_type: OptionType::String, default: crate::grid_reader::DEFAULT_WORD_SEPARATORS, description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: Session, option_type: UNVALIDATED_CHOICE, default: "off", description: "Allow passthrough escape sequences" },
-    OptionDef { name: "sixel", scope: Session, option_type: Boolean, default: "on", description: "Render sixel graphics from panes (issue #431)" },
+    OptionDef { name: "sixel", scope: Session, option_type: Choice(ChoiceKind::Sixel), default: "auto", description: "When to draw the sixel images panes write (off/on/auto): auto draws only when the terminal's DA1 reply lists sixel, as tmux does; on always draws (issue #431)" },
     OptionDef { name: "allow-rename", scope: Session, option_type: Boolean, default: "on", description: "Allow programs to rename windows" },
     OptionDef { name: "allow-set-title", scope: Session, option_type: Boolean, default: "off", description: "Allow programs to set pane title via escape sequences" },
     OptionDef { name: "update-environment", scope: Session, option_type: OptionType::String, default: "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY", description: "Environment variables to update on attach" },

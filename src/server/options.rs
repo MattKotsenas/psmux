@@ -799,7 +799,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
-        "sixel" => if app.sixel { "on".into() } else { "off".into() },
+        "sixel" => app.sixel.as_str().into(),
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
         "mouse-drag-enter-copy-mode" => if app.mouse_drag_enter_copy_mode { "on".into() } else { "off".into() },
         "ctrl-wheel-zoom" => if app.ctrl_wheel_zoom { "on".into() } else { "off".into() },
@@ -1113,6 +1113,7 @@ pub(crate) fn is_boolean_option(name: &str) -> bool {
         name,
         "mouse"
             | "bold-is-bright"
+            // Also takes auto, which a toggle leaves alone (toggled_value).
             | "sixel"
             | "scroll-enter-copy-mode"
             | "mouse-drag-enter-copy-mode"
@@ -1174,15 +1175,19 @@ pub(crate) fn toggle_option(app: &mut AppState, option: &str) -> bool {
     apply_set_option(app, option, &new_value, false).is_ok()
 }
 
-/// What `set <option>` with no value writes over `current`. A flag flips;
-/// `remain-on-exit` is a CHOICE in tmux, where `off` and `on` swap and
-/// `failed`, `key` and `failed-key` stay (options.c:1263-1266,
-/// options_from_string_choice).
-fn toggled_value(option: &str, current: &str) -> String {
+/// What `set <option>` with no value writes over `current`. A flag flips.
+/// `remain-on-exit` and `sixel` are CHOICEs in tmux's sense, and tmux
+/// toggles a choice only between its first two values (options.c:1263-1266,
+/// options_from_string_choice): `off` and `on` swap, while remain-on-exit's
+/// `failed`, `key` and `failed-key` and sixel's `auto` stay where they are.
+pub(crate) fn toggled_value(option: &str, current: &str) -> String {
     if option == "remain-on-exit" {
         if let Some(remain) = crate::types::RemainOnExit::parse(current) {
             return remain.toggled().as_str().to_string();
         }
+    }
+    if option == "sixel" && current == "auto" {
+        return current.to_string();
     }
     if matches!(current, "on" | "true" | "1" | "yes") { "off" } else { "on" }.to_string()
 }
@@ -1337,7 +1342,11 @@ pub(crate) fn apply_set_option(
                 crate::platform::set_process_priority(&app.priority);
             }
         }
-        "sixel" => { app.sixel = matches!(value, "on" | "true" | "1" | "yes"); }
+        "sixel" => {
+            if let Some(mode) = crate::types::SixelMode::parse(value) {
+                app.sixel = mode;
+            }
+        }
         "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"); }
         "mouse-drag-enter-copy-mode" => { app.mouse_drag_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"); }
         "ctrl-wheel-zoom" => { app.ctrl_wheel_zoom = matches!(value, "on" | "true" | "1" | "yes"); }
