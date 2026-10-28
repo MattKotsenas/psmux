@@ -25,6 +25,7 @@ fn session(name: &str, id: usize) -> Session {
 // unwind the loop thread and end the server with every session in it.
 #[test]
 fn a_panic_in_the_loops_per_session_work_ends_only_that_session() {
+    let _lock = crate::util::lock_test_env();
     let mut sessions: BTreeMap<usize, Session> = BTreeMap::new();
     for (id, name) in [(1usize, "A"), (2, "B"), (3, "C")] {
         sessions.insert(id, session(name, id));
@@ -44,6 +45,8 @@ fn a_panic_in_the_loops_per_session_work_ends_only_that_session() {
 
 #[test]
 fn the_loops_per_session_work_names_the_session_for_the_crash_report() {
+    // CURRENT is process wide; the 798 request tests enter sessions under this lock.
+    let _lock = crate::util::lock_test_env();
     let mut sessions: BTreeMap<usize, Session> = BTreeMap::new();
     sessions.insert(7, session("named", 7));
     let mut seen = String::new();
