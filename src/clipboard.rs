@@ -11,7 +11,6 @@
 
 #[cfg(windows)]
 use std::thread;
-#[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::GlobalFree;
@@ -193,6 +192,51 @@ pub fn try_read_from_system_clipboard() -> Result<Option<String>, ClipboardBusy>
 #[cfg(not(windows))]
 pub fn try_read_from_system_clipboard() -> Result<Option<String>, ClipboardBusy> { Ok(None) }
 
+/// How long `refresh-client -l` waits for a clipboard another window holds
+/// open: tmux waits this long for the terminal's OSC 52 answer before it
+/// gives up on the query (tty.c TTY_QUERY_TIMEOUT, tty_clipboard_query).
+pub const CLIPBOARD_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a paste the user asked for in the attached client (Ctrl+V whose
+/// release reads the clipboard, Ctrl+Shift+V, right click) waits for a
+/// clipboard another window holds open.  tmux has no client side paste; this
+/// is the Windows clipboard's lock.  The client input loop waits with it, so
+/// keys typed meanwhile stay behind the paste in order, and it is short
+/// enough that a clipboard held for good costs one second, not five.
+pub const PASTE_GESTURE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// [`read_from_system_clipboard`] for a caller that asked for the clipboard
+/// and can wait for it, such as `refresh-client -l` on a connection thread.
+///
+/// The retries inside [`try_read_from_system_clipboard`] cover about 10 ms.
+/// A clipboard history listener, a remote desktop clipboard bridge or an
+/// Office app routinely holds the clipboard open for tens to hundreds of
+/// milliseconds after a change, and the plain read then answered "no text",
+/// so `refresh-client -l` silently stored nothing.  This keeps trying until
+/// the clipboard is free or `timeout` passes, returning as soon as it reads.
+pub fn read_from_system_clipboard_waiting(timeout: Duration) -> Option<String> {
+    wait_for_clipboard(timeout, try_read_from_system_clipboard, || {
+        std::thread::sleep(Duration::from_millis(10))
+    })
+}
+
+/// The loop of [`read_from_system_clipboard_waiting`], with the read and the
+/// pause passed in so the timing rules can be tested without a desktop.
+fn wait_for_clipboard(
+    timeout: Duration,
+    mut read: impl FnMut() -> Result<Option<String>, ClipboardBusy>,
+    mut pause: impl FnMut(),
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match read() {
+            Ok(text) => return text,
+            Err(ClipboardBusy) if std::time::Instant::now() < deadline => pause(),
+            Err(ClipboardBusy) => return None,
+        }
+    }
+}
+
 /// The system clipboard's change counter.
 ///
 /// `GetClipboardSequenceNumber` is a read of one shared value: it does not open
@@ -207,6 +251,10 @@ pub fn clipboard_sequence_number() -> u32 {
 
 #[cfg(not(windows))]
 pub fn clipboard_sequence_number() -> u32 { 0 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_refresh_client_l_busy_clipboard.rs"]
+mod tests_refresh_client_l_busy_clipboard;
 
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_clipboard_thread_lock.rs"]

@@ -5797,8 +5797,13 @@ match cmd {
             // on this desktop, so the Windows clipboard is read directly and
             // the buffer exists before the next command runs, which makes
             // `refresh-client -l ; paste-buffer -p` paste the clipboard
-            // (#796).
-            if let Some(text) = crate::clipboard::read_from_system_clipboard() {
+            // (#796).  A clipboard another window holds open is waited for,
+            // as tmux waits for the terminal's answer (tty.c
+            // TTY_QUERY_TIMEOUT); this runs on the connection thread, so the
+            // server loop does not wait with it.
+            if let Some(text) = crate::clipboard::read_from_system_clipboard_waiting(
+                crate::clipboard::CLIPBOARD_QUERY_TIMEOUT,
+            ) {
                 if !text.is_empty() {
                     let _ = tx.send(CtrlReq::SetBuffer(text));
                 }

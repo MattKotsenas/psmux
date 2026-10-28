@@ -17,7 +17,7 @@ use crate::rendering::{
 };
 use crate::style::{map_color, parse_tmux_style_components};
 use crate::config::{parse_key_string, normalize_key_for_binding};
-use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard_waiting, PASTE_GESTURE_TIMEOUT};
 use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled,
     reconnect_log, reconnect_log_enabled};
 use crate::layout::RowRunsJson;
@@ -7223,7 +7223,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     && key.modifiers.contains(KeyModifiers::CONTROL)
                                     && key.modifiers.contains(KeyModifiers::SHIFT) =>
                                 {
-                                    if let Some(text) = read_from_system_clipboard() {
+                                    if let Some(text) = read_from_system_clipboard_waiting(PASTE_GESTURE_TIMEOUT) {
                                         if !text.is_empty() {
                                             paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
@@ -7902,7 +7902,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     selection_changed = true;
-                                    if let Some(text) = read_from_system_clipboard() {
+                                    if let Some(text) = read_from_system_clipboard_waiting(PASTE_GESTURE_TIMEOUT) {
                                         if !text.is_empty() {
                                             paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
@@ -8555,8 +8555,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     .map_or(false, |t| Instant::now() < t)
                     || paste_fallback_suppress_until.map_or(false, |t| Instant::now() < t);
                 if !suppressed {
-                    // No recent paste — read clipboard as fallback
-                    if let Some(text) = read_from_system_clipboard() {
+                    // No recent paste — read clipboard as fallback.  Waits
+                    // for a clipboard another window holds open: the plain
+                    // read's ~10 ms of retries dropped this paste whole.
+                    if let Some(text) = read_from_system_clipboard_waiting(PASTE_GESTURE_TIMEOUT) {
                         if paste_gesture.blocks(&text) {
                             // The same text already went out as a burst of
                             // characters for this very Ctrl+V; reading the

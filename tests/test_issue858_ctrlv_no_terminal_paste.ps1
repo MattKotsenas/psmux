@@ -60,7 +60,11 @@ $inj = Join-Path $root "paste_host_injector.exe"
 $rec = Join-Path $root "paste_recorder.exe"
 & $csc /nologo /optimize /out:$inj (Join-Path $PSScriptRoot "paste_host_injector.cs") 2>&1 | Out-Null
 & $csc /nologo /optimize /platform:x64 /out:$rec (Join-Path $PSScriptRoot "paste_recorder.cs") 2>&1 | Out-Null
-if (-not (Test-Path $inj) -or -not (Test-Path $rec)) { Write-Host "FATAL: could not compile the injector or the recorder" -ForegroundColor Red; exit 1 }
+$holder = Join-Path $root "clipboard_holder.exe"
+& $csc /nologo /optimize /r:System.Windows.Forms.dll /out:$holder (Join-Path $PSScriptRoot "clipboard_holder.cs") 2>&1 | Out-Null
+if (-not (Test-Path $inj) -or -not (Test-Path $rec) -or -not (Test-Path $holder)) { Write-Host "FATAL: could not compile the injector, the recorder or the clipboard holder" -ForegroundColor Red; exit 1 }
+$script:holdMs = 0
+$script:holders = @()
 
 function P { & $PSMUX -L $NS @args 2>&1 }
 $ESC = [char]27
@@ -105,8 +109,18 @@ try {
             Start-Sleep -Milliseconds 100
         }
         Start-Sleep -Milliseconds 400
+        # Optionally another window holds the clipboard open across the keys.
+        $hp = $null
+        if ($script:holdMs -gt 0) {
+            $ready = Join-Path $root "held$($script:n)"
+            $hp = Start-Process $holder -ArgumentList $script:holdMs, $ready -PassThru -WindowStyle Hidden
+            $script:holders += $hp
+            $hw = [Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $ready) -and $hw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 2 }
+        }
         & $inj $client.Id $mode $delay $text | Out-Null
         $rc = $LASTEXITCODE
+        if ($hp) { $hp.WaitForExit(7000) | Out-Null }
         Start-Sleep -Milliseconds 1200
         New-Item -ItemType File -Force $stop | Out-Null
         $w.Restart()
@@ -192,6 +206,22 @@ try {
     }
     Wait-OneWindow
 
+    # --- 5b. the same with the clipboard held open by another window ---------
+    # Full sweep 2026-10-28 failed case 5 with "pane got ''": the client read
+    # the clipboard with ~10 ms of retries, and a clipboard another window
+    # held open for longer (a history listener, an RDP clipboard bridge) made
+    # it paste nothing.  Holding it 300 ms reproduced that 2/2 on 9b5c3e0e.
+    Write-Host "`n[5b] release only, the clipboard held open 300 ms by another window" -ForegroundColor Yellow
+    $script:holdMs = 300
+    $r = Record release 50 x
+    $script:holdMs = 0
+    if ($r.rc -eq 2) { Write-Skip "AttachConsole refused" }
+    else {
+        Write-Info "pane received: $($r.hex)"
+        if ($r.hex -eq $bracketed) { Write-Pass "held clipboard: the client waited and pasted once, bracketed" } else { Write-Fail "held clipboard: pane got '$($r.hex)', expected '$bracketed'" }
+    }
+    Wait-OneWindow
+
     # --- 6. host style paste (no press, characters, release) unchanged -------
     Write-Host "`n[6] host paste: characters then the release, no press" -ForegroundColor Yellow
     $r = Record host 150 $marker
@@ -221,6 +251,7 @@ try {
 }
 catch { if ($_.Exception.Message -notin 'noclient', 'noclip') { Write-Fail "unexpected: $_" } }
 finally {
+    foreach ($h in $script:holders) { if ($h -and -not $h.HasExited) { Stop-Process -Id $h.Id -Force -EA SilentlyContinue } }
     if ($client) { Stop-Process -Id $client.Id -Force -EA SilentlyContinue }
     P kill-server | Out-Null
     if ($clipSaved) {
@@ -228,7 +259,9 @@ finally {
         $back = $false
         for ($i = 0; $i -lt 50 -and -not $back; $i++) {
             try { Set-Clipboard -Value $savedClip -EA Stop } catch {}
-            $back = ((try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip)
+            # $( ) and not ( ): a try statement inside plain parentheses is
+            # not an expression, every pass threw and the check never held.
+            $back = ($(try { Get-Clipboard -Raw -EA Stop } catch { $null }) -eq $savedClip)
             if (-not $back) { Start-Sleep -Milliseconds 100 }
         }
         if (-not $back) { Write-Host "  [WARN] the clipboard could not be restored" -ForegroundColor Yellow }
