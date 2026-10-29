@@ -29,14 +29,17 @@ function Wait-Prompt([string]$target, [int]$timeoutMs = 15000) {
     }
     return (& $PSMUX capture-pane -p -t $target 2>$null) -join "`n"
 }
+# Reads history too: with remain-on-exit, a pane that dies writes its dead line
+# at the last row and linefeeds as tmux does (server-fn.c, #923), so a short
+# command's output on row 0 scrolls off the visible screen.
 function Wait-Text([string]$target, [string]$pattern, [int]$timeoutMs = 15000) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
-        $cap = (& $PSMUX capture-pane -p -t $target 2>$null) -join "`n"
+        $cap = (& $PSMUX capture-pane -p -S - -t $target 2>$null) -join "`n"
         if ($cap -match $pattern) { return $cap }
         Start-Sleep -Milliseconds 100
     }
-    return (& $PSMUX capture-pane -p -t $target 2>$null) -join "`n"
+    return (& $PSMUX capture-pane -p -S - -t $target 2>$null) -join "`n"
 }
 function Get-PaneInfo([string]$target) {
     $line = (& $PSMUX display-message -p -t $target '#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_dead}|#{pane_width}x#{pane_height}' 2>$null)
