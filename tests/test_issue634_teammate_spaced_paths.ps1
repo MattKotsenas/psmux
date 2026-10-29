@@ -50,7 +50,10 @@ function New-TeammatePane {
 function Get-PaneText([string]$pane) {
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 300
-        $t = (& $PSMUX capture-pane -p -t $pane 2>&1 | Out-String).Trim()
+        # -S -: a dead pane's remain-on-exit-format line is written after a
+        # linefeed on the last row, as tmux does (server-fn.c), so a child's
+        # only line on row 0 scrolls into history (#923).
+        $t = (& $PSMUX capture-pane -p -S - -t $pane 2>&1 | Out-String).Trim()
         if ($t.Length -gt 0) { return $t }
     }
     return ""

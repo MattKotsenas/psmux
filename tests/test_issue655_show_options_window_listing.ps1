@@ -333,7 +333,10 @@ if ($pa.out -match '(?m)^remain-on-exit\* on$') {
 Invoke-Psmux @('set-option', '-p', '-t', "${SESSION}:zero", 'remain-on-exit', 'failed') | Out-Null
 Start-Sleep -Milliseconds 300
 $pl = Invoke-Psmux @('show-options', '-pA', '-t', "${SESSION}:zero")
-if ($pl.out -match '(?m)^remain-on-exit failed$' -and $pl.out -notmatch '\*') {
+# remain-on-exit-format is a window and pane option too (#923, tmux
+# options-table.c), so -pA also lists it inherited; only remain-on-exit
+# itself must not appear twice.
+if ($pl.out -match '(?m)^remain-on-exit failed$' -and $pl.out -notmatch '(?m)^remain-on-exit\* ') {
     Write-Pass "a pane LOCAL value is listed plain and not duplicated by -A"
 } else {
     Write-Fail "-pA with a pane local: [$($pl.out)]"
