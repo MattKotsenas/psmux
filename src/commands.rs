@@ -3378,6 +3378,13 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
         }
         "kill-session" | "kill-ses" => {
+            if parts.len() == 3 && parts[1] == "-t" {
+                let named = crate::cli::strip_exact_match_prefix(parts[2]);
+                if named != app.session_name {
+                    app.status_message = Some((format!("can't find session: {}", named), Instant::now(), None));
+                    return Ok(());
+                }
+            }
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, "kill-session\n", &app.session_key);
             }
@@ -4583,3 +4590,7 @@ mod tests_unlink_window_focus;
 #[cfg(test)]
 #[path = "../tests-rs/test_refresh_client_l_server_route.rs"]
 mod tests_refresh_client_l_server_route;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_hook_kill_session_target.rs"]
+mod tests_hook_kill_session_target;
