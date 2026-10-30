@@ -411,3 +411,81 @@ fn issue613_force_wheel_does_not_relax_the_457_build_gate() {
             "PSMUX_FORCE_WHEEL must not relax the #457 build gate");
     });
 }
+
+#[test]
+fn issue934_pane_option_routes_the_wheel_to_a_main_screen_pane() {
+    let mut forced = make_pane(parser_with(b""));
+    let untouched = make_pane(parser_with(b""));
+    for raw in ["on", "1", "true", "yes", "  ON  ", "True"] {
+        forced
+            .pane_options
+            .insert("@mouse-force".to_string(), raw.to_string());
+        assert!(
+            pane_wheel_forward(&forced),
+            "BUG #934: @mouse-force {raw:?} must route the wheel to the pane"
+        );
+        assert!(
+            !pane_wheel_forward(&untouched),
+            "BUG #934: @mouse-force on one pane must not route another"
+        );
+    }
+}
+
+#[test]
+fn issue934_pane_option_off_leaves_a_main_screen_pane_to_copy_mode() {
+    let mut pane = make_pane(parser_with(b""));
+    for raw in ["off", "0", "false", "no", "maybe", "2", "", "   "] {
+        pane.pane_options
+            .insert("@mouse-force".to_string(), raw.to_string());
+        assert!(
+            !pane_wheel_forward(&pane),
+            "@mouse-force {raw:?} must not route the wheel to a main screen pane"
+        );
+    }
+}
+
+#[test]
+fn issue934_pane_option_off_keeps_the_routes_a_pane_earned() {
+    let mut alternate = make_pane(parser_with(b"\x1b[?1049h"));
+    alternate
+        .pane_options
+        .insert("@mouse-force".to_string(), "off".to_string());
+    assert!(
+        pane_wheel_forward(&alternate),
+        "@mouse-force off must not take the wheel from an alternate screen pane"
+    );
+
+    let mut owner = make_pane(parser_with(b""));
+    owner.mouse_proto_owner = Some((vt100::MouseProtocolMode::AnyMotion, true));
+    owner
+        .pane_options
+        .insert("@mouse-force".to_string(), "off".to_string());
+    assert!(
+        pane_wheel_forward(&owner),
+        "@mouse-force off must not take the wheel from a pane that owns a mouse protocol"
+    );
+}
+
+#[test]
+fn issue934_env_var_alone_leaves_the_route_to_copy_mode() {
+    let pane = make_pane(parser_with(b""));
+    with_env(Some("1"), None, None, || {
+        assert!(
+            !pane_wheel_forward(&pane),
+            "PSMUX_FORCE_WHEEL must not take copy mode from every main screen pane"
+        );
+    });
+}
+
+#[test]
+fn issue934_pane_option_on_routes_the_wheel_with_the_env_var_set() {
+    let mut pane = make_pane(parser_with(b""));
+    pane.pane_options
+        .insert("@mouse-force".to_string(), "on".to_string());
+    with_env(Some("1"), None, None, || {
+        assert!(
+            pane_wheel_forward(&pane),
+            "BUG #934: @mouse-force on must route the wheel whatever the env var says"
+        );
+    });
+}

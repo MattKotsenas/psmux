@@ -381,10 +381,16 @@ pub(crate) fn wheel_auth_holds(pane: &mut Pane) -> bool {
 /// gate and #573's `PSMUX_FORCE_MOUSE` govern the opposite direction (whether
 /// psmux may write mouse DECSET OUT to the terminal), and are untouched.
 pub(crate) fn wheel_forced(pane: &Pane) -> bool {
-    if let Some(v) = pane.pane_options.get("@mouse-force") {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
-    }
-    crate::ssh_input::wheel_gate_forced()
+    wheel_force_option(pane).unwrap_or_else(crate::ssh_input::wheel_gate_forced)
+}
+
+fn wheel_force_option(pane: &Pane) -> Option<bool> {
+    pane.pane_options.get("@mouse-force").map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        )
+    })
 }
 
 /// The wheel-forwarding decision (#548 + #570): forward when the pane is on
@@ -394,7 +400,9 @@ pub(crate) fn wheel_forced(pane: &Pane) -> bool {
 /// `update_mouse_proto_owner` attributes to the shell).  Everything else
 /// gets copy-mode scrollback, exactly like tmux over a plain pane.
 pub(crate) fn pane_wheel_forward(pane: &Pane) -> bool {
-    pane_in_alt_screen(pane) || matches!(pane.mouse_proto_owner, Some((_, true)))
+    wheel_force_option(pane) == Some(true)
+        || pane_in_alt_screen(pane)
+        || matches!(pane.mouse_proto_owner, Some((_, true)))
 }
 
 /// Gate for mouse click/button forwarding.
