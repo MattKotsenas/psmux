@@ -45,7 +45,11 @@ Start-Sleep -Seconds 5
 if ($LASTEXITCODE -ne 0) { Write-Fail "session creation failed"; exit 1 }
 
 $port = (Get-Content "$psmuxDir\$SESSION.port" -Raw).Trim()
-$serverPid = (Get-NetTCPConnection -LocalPort ([int]$port) -State Listen -EA SilentlyContinue | Select-Object -First 1).OwningProcess
+# The listener is the socket on this port with no remote end; its state is
+# not used, since after KB5127936 (2026-10-30) Windows 11 26300 reports a
+# listener's state as 0 and -State Listen matches nothing.
+$serverPid = (Get-NetTCPConnection -LocalPort ([int]$port) -EA SilentlyContinue |
+    Where-Object { $_.RemotePort -eq 0 -and $_.OwningProcess -ne 0 } | Select-Object -First 1).OwningProcess
 Write-Host "session up: server=$serverPid client=$($proc.Id)"
 
 function Get-Spares {

@@ -43,8 +43,13 @@ function Is-PsmuxPid($procId) {
     return ($null -ne $p -and $p.ProcessName -eq 'psmux')
 }
 function ListenPid($port) {
-    $line = (netstat -ano | Select-String -Pattern ":$port\s" | Select-String -Pattern "LISTENING" | Select-Object -First 1)
-    if ($line) { return ($line.ToString() -split '\s+')[-1] }
+    # The listener is the local socket on this port with no remote end. Its
+    # state is not used: since KB5127936 (2026-10-30) Windows 11 26300 reports
+    # every listener's state as 0, so netstat drops LISTENING lines and
+    # -State Listen matches nothing, while the owning PID is still right.
+    $c = Get-NetTCPConnection -LocalPort ([int]$port) -EA SilentlyContinue |
+        Where-Object { $_.RemotePort -eq 0 -and $_.OwningProcess -ne 0 } | Select-Object -First 1
+    if ($c) { return [string]$c.OwningProcess }
     return $null
 }
 function Cleanup-Sessions {

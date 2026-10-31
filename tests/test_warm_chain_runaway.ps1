@@ -62,11 +62,12 @@ function Get-PsmuxProcs {
         Select-Object @{N='ProcessId';E={[int]$_.ProcessId}}, @{N='ParentProcessId';E={[int]$_.ParentProcessId}}, CommandLine, CreationDate
 }
 function Get-PortOwnerPid($port) {
-    $lines = netstat -ano -p tcp | Select-String ":$port\s" | Select-String "LISTENING"
-    foreach ($l in $lines) {
-        $parts = ($l.Line -split '\s+') | Where-Object { $_ -ne '' }
-        if ($parts[1] -match ":$port$") { return [int]$parts[-1] }
-    }
+    # The listener is the socket on this port with no remote end. Its state is
+    # not used: since KB5127936 (2026-10-30) Windows 11 26300 reports a
+    # listener's state as 0, so netstat has no LISTENING line for it.
+    $c = Get-NetTCPConnection -LocalPort ([int]$port) -EA SilentlyContinue |
+        Where-Object { $_.RemotePort -eq 0 -and $_.OwningProcess -ne 0 } | Select-Object -First 1
+    if ($c) { return [int]$c.OwningProcess }
     return $null
 }
 function Query-LiveSessionName($port, $key) {

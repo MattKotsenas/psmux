@@ -49,12 +49,13 @@ function Get-ServerPid {
     $portFile = "$PSMUX_DIR\$SESSION.port"
     if (!(Test-Path $portFile)) { return $null }
     $sessionPort = [int](Get-Content $portFile)
-    $listener = netstat -ano 2>$null | Select-String "127\.0\.0\.1:$sessionPort\s" |
-        Select-String "LISTENING" | Select-Object -First 1
+    # The listener is the socket on this port with no remote end. Its state is
+    # not used: since KB5127936 (2026-10-30) Windows 11 26300 reports a
+    # listener's state as 0, so netstat has no LISTENING line for it.
+    $listener = Get-NetTCPConnection -LocalPort $sessionPort -EA SilentlyContinue |
+        Where-Object { $_.RemotePort -eq 0 -and $_.OwningProcess -ne 0 } | Select-Object -First 1
     if ($listener) {
-        $parts = ($listener.ToString().Trim()) -split '\s+'
-        $foundPid = [int]$parts[-1]
-        return Get-Process -Id $foundPid -ErrorAction SilentlyContinue
+        return Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
     }
     return Get-Process psmux -ErrorAction SilentlyContinue |
         Where-Object { $_.Id -ne $PID } |
