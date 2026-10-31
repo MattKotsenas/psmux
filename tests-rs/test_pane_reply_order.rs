@@ -176,3 +176,21 @@ fn a_flood_of_colour_queries_gets_a_bounded_injection() {
     let bytes: usize = out.iter().map(String::len).sum();
     assert!(bytes <= vt100::MAX_PENDING_QUERIES * BG.len(), "{bytes} bytes");
 }
+
+#[test]
+fn delivery_says_when_the_server_loop_has_replies_to_write() {
+    // The parser thread publishes a batch before it answers the batch's
+    // queries, so what the batch drew is not held behind the injection.  It
+    // then wakes the server loop a second time only when a reply was left for
+    // it, which `deliver_replies` reports.  With no child pid there is no
+    // injection, so every reply takes its fallback.
+    let pending = std::sync::atomic::AtomicU32::new(0);
+    let pane = 9_941_001usize;
+    let da1 = pane_replies(&scan_device_queries(b"\x1b[c"), &DecrqmState::default(), &HostColors::campbell(), &mut false);
+    assert!(deliver_replies(pane, None, &da1, &pending), "a DA1 reply goes down the PTY from the server loop");
+    assert_eq!(crate::types::take_device_replies(pane), Some(DA1.as_bytes().to_vec()));
+    let xt = pane_replies(&scan_device_queries(b"\x1b[>q"), &DecrqmState::default(), &HostColors::campbell(), &mut false);
+    assert!(!deliver_replies(pane, None, &xt, &pending), "a lost XTVERSION leaves nothing for the loop");
+    assert_eq!(crate::types::take_device_replies(pane), None);
+    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+}

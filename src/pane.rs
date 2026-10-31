@@ -4319,14 +4319,15 @@ pub(crate) fn pane_replies(
 /// Deliver one batch's replies: the child's with one injection, in order,
 /// and the console host's down the PTY.  When the injection fails, or there
 /// is no child pid to inject into, each of the child's replies goes its
-/// `ReplyFallback` way, the PTY ones in order with the console host's; the caller's
-/// pass then wakes the server loop to write them.
+/// `ReplyFallback` way, the PTY ones in order with the console host's.
+/// Returns true when anything was left for the server loop to write, so the
+/// caller wakes it again.
 fn deliver_replies(
     pane_id: usize,
     child_pid: Option<u32>,
     replies: &[PaneReply],
     color_query_pending: &std::sync::atomic::AtomicU32,
-) {
+) -> bool {
     let text: String = replies.iter().filter(|r| !r.console_host).map(|r| r.text.as_str()).collect();
     let delivered = !text.is_empty() && match child_pid {
         Some(pid) => crate::platform::mouse_inject::send_vt_reply(pid, &text),
@@ -4348,11 +4349,13 @@ fn deliver_replies(
             }
         }
     }
+    let queued = !pipe.is_empty() || bits != 0;
     crate::types::push_device_reply(pane_id, pipe);
     if bits != 0 {
         color_query_pending.fetch_or(bits, Ordering::AcqRel);
         crate::types::COLOR_QUERY_PENDING.store(true, Ordering::Release);
     }
+    queued
 }
 
 // Test adapter exercises the same query capture used by the parser thread.
@@ -4762,12 +4765,21 @@ pub fn spawn_reader_thread(
                 cpr_pending.store(true, Ordering::Release);
                 crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
             }
+            dv_writer.fetch_add(1, Ordering::Release);
+            crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+            crate::pty_trace::mark("p", pane_id, &bytes);
+            // Wake the server loop on the event instead of leaving it to notice
+            // the flag when its poll interval happens to expire.
+            crate::types::wake_server_loop();
             // Answer this batch's queries in the order they were asked, with
-            // one injection.  Anything that cannot be injected goes the way it
-            // went before (`ReplyFallback`), to the server loop this pass wakes
-            // below.  So does the console host's own first DA1, which on a pane
-            // launch is the difference between a prompt at 0.7 s and one at
-            // 3.8 s (issue #597).
+            // one injection.  The batch is published above first, so what it
+            // drew is not held behind the injection (2 to 4 ms, longer when an
+            // attach fails); tmux too draws a batch and queues its replies
+            // without one waiting on the other.  Anything that cannot be
+            // injected goes the way it went before (`ReplyFallback`), to the
+            // server loop, woken again for it here.  So does the console
+            // host's own first DA1, which on a pane launch is the difference
+            // between a prompt at 0.7 s and one at 3.8 s (issue #597).
             if !device_queries.is_empty() {
                 if device_queries.len() >= vt100::MAX_PENDING_QUERIES {
                     crate::platform::mouse_inject::log_query_bound(pane_id, vt100::MAX_PENDING_QUERIES);
@@ -4777,14 +4789,12 @@ pub fn spawn_reader_thread(
                 let replies = pane_replies(
                     &device_queries, &st, &colours, &mut console_host_da1_open,
                 );
-                deliver_replies(pane_id, child_pid, &replies, &color_query_pending);
+                if deliver_replies(pane_id, child_pid, &replies, &color_query_pending) {
+                    crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+                    crate::types::wake_server_loop();
+                }
+                crate::pty_trace::mark_plain("q", pane_id);
             }
-            dv_writer.fetch_add(1, Ordering::Release);
-            crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-            crate::pty_trace::mark("p", pane_id, &bytes);
-            // Wake the server loop on the event instead of leaving it to notice
-            // the flag when its poll interval happens to expire.
-            crate::types::wake_server_loop();
         }
     });
 }
