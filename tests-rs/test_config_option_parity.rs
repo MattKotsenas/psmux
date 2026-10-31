@@ -76,6 +76,8 @@ fn non_default_value(name: &str) -> Option<&'static str> {
         "status-left-length" => "22",
         "status-right-length" => "33",
         "status-style" => "bg=blue",
+        "status-bg" => "red",
+        "status-fg" => "colour7",
         "status-left-style" => "fg=red",
         "status-right-style" => "fg=cyan",
         "message-style" => "bg=red",

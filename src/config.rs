@@ -2053,8 +2053,12 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
         }
     }
 
-    // Handle -a (append to current value)
-    let final_value = if append_mode {
+    // Handle -a (append to current value). A colour option is set to the
+    // colour given instead, as tmux appends only to a string (options.c:
+    // 1303-1305 at 3.8).
+    let colour_option = crate::server::option_catalog::option_definition(key)
+        .is_some_and(|d| d.option_type == crate::server::option_catalog::OptionType::Colour);
+    let final_value = if append_mode && !colour_option {
         let current = crate::format::lookup_option_pub(key, app).unwrap_or_default();
         format!("{}{}", current, value)
     } else {

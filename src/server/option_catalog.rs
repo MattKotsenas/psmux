@@ -27,6 +27,8 @@ pub enum NumberKind {
     Index,
     RepeatTime,
     InputBufferSize,
+    /// status-left-length and status-right-length.
+    StatusLength,
 }
 
 impl NumberKind {
@@ -40,6 +42,9 @@ impl NumberKind {
             Self::RepeatTime => (0, crate::server::options::REPEAT_TIME_MAX_MS as i128),
             // tmux options-table.c:437: INPUT_BUF_DEFAULT_SIZE to UINT_MAX.
             Self::InputBufferSize => (vt100::DEFAULT_INPUT_BUFFER_SIZE as i128, u32::MAX as i128),
+            // tmux options-table.c:1075-1082 and :1111-1118 at 3.8: 0 to
+            // SHRT_MAX.
+            Self::StatusLength => (0, i16::MAX as i128),
         }
     }
 
@@ -84,7 +89,16 @@ pub enum ChoiceKind {
     RemainOnExit,
     /// psmux's `sixel`: off/on/auto, see `SixelMode`.
     Sixel,
+    /// tmux `options_table_status_justify_list` (options-table.c:50-52 at 3.8).
+    StatusJustify,
+    /// tmux `options_table_status_position_list` (options-table.c:53-55 at 3.8).
+    StatusPosition,
 }
+
+/// The values tmux's CHOICE option `status-justify` takes.
+pub const STATUS_JUSTIFY_CHOICES: &[&str] = &["left", "centre", "right", "absolute-centre"];
+/// The values tmux's CHOICE option `status-position` takes.
+pub const STATUS_POSITION_CHOICES: &[&str] = &["top", "bottom"];
 
 /// tmux's `remain-on-exit-format` default (options-table.c:1713-1718).
 pub const REMAIN_ON_EXIT_FORMAT_DEFAULT: &str = concat!(
@@ -111,6 +125,21 @@ impl ChoiceKind {
                     EXTENDED_KEYS_FORMAT_CHOICES
                 };
                 if choices.contains(&value.trim()) {
+                    Ok(())
+                } else {
+                    Err(format!("unknown value: {}", value))
+                }
+            }
+            // options_find_choice (options.c:1239-1255 at 3.8) compares with
+            // strcmp, so the value must be one of the list as it is. The value
+            // is stored as given and the client matches it the same way.
+            Self::StatusJustify | Self::StatusPosition => {
+                let choices = if self == Self::StatusJustify {
+                    STATUS_JUSTIFY_CHOICES
+                } else {
+                    STATUS_POSITION_CHOICES
+                };
+                if choices.contains(&value) {
                     Ok(())
                 } else {
                     Err(format!("unknown value: {}", value))
@@ -149,7 +178,8 @@ impl ChoiceKind {
     const fn allows_append(self) -> bool {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
-            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel => true,
+            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel
+            | Self::StatusJustify | Self::StatusPosition => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -157,7 +187,8 @@ impl ChoiceKind {
     const fn allows_local_window_override(self) -> bool {
         match self {
             Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers
-            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel => true,
+            | Self::ExtendedKeys | Self::ExtendedKeysFormat | Self::RemainOnExit | Self::Sixel
+            | Self::StatusJustify | Self::StatusPosition => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -171,6 +202,10 @@ pub enum OptionType {
     Number(NumberKind),
     /// tmux OPTIONS_TABLE_KEY (prefix, prefix2): a key name or None.
     Key,
+    /// tmux OPTIONS_TABLE_COLOUR (status-bg, status-fg): one colour, refused
+    /// with `bad colour` when it is none (options.c:1332-1336 at 3.8). See
+    /// [`crate::style::option_colour_name`] for the names taken.
+    Colour,
 }
 
 impl OptionType {
@@ -181,21 +216,26 @@ impl OptionType {
             // prefix2 has always taken an empty value as no key.
             Self::Key if value.is_empty() && name == "prefix2" => Ok(()),
             Self::Key => crate::config::parse_option_key(value, false).map(|_| ()),
+            Self::Colour => crate::style::option_colour_name(value)
+                .map(|_| ())
+                .ok_or_else(|| format!("bad colour: {}", value)),
             Self::String | Self::Boolean => Ok(()),
         }
     }
 
+    // tmux takes `-a` on a colour option and sets the colour given: only the
+    // string case of options_from_string appends (options.c:1303-1305 at 3.8).
     const fn allows_append(self) -> bool {
         match self {
             Self::Choice(kind) => kind.allows_append(),
-            Self::String | Self::Boolean | Self::Number(_) | Self::Key => true,
+            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour => true,
         }
     }
 
     const fn allows_local_window_override(self) -> bool {
         match self {
             Self::Choice(kind) => kind.allows_local_window_override(),
-            Self::String | Self::Boolean | Self::Number(_) | Self::Key => true,
+            Self::String | Self::Boolean | Self::Number(_) | Self::Key | Self::Colour => true,
         }
     }
 }
@@ -245,8 +285,8 @@ impl ValidationOnlyOptionDef {
     }
 }
 
-use ChoiceKind::{Priority, Unvalidated};
-use NumberKind::{I64, Index, InputBufferSize, RepeatTime, U64, Usize};
+use ChoiceKind::{Priority, StatusJustify, StatusPosition, Unvalidated};
+use NumberKind::{I64, Index, InputBufferSize, RepeatTime, StatusLength, U64, Usize};
 use OptionScope::{Pane, Server, Session, Window};
 use OptionType::{Boolean, Choice, Number};
 
@@ -308,14 +348,18 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "copy-mode-current-match-style", scope: Window, option_type: OptionType::String, default: "bg=magenta,fg=black", description: "Style of the search match under the copy-mode cursor" },
     OptionDef { name: "copy-mode-mark-style", scope: Window, option_type: OptionType::String, default: "bg=red,fg=black", description: "Style of the marked line in copy mode" },
     OptionDef { name: "status", scope: Session, option_type: Boolean, default: "on", description: "Show/hide the status bar" },
-    OptionDef { name: "status-position", scope: Session, option_type: UNVALIDATED_CHOICE, default: "bottom", description: "Status bar position (top/bottom)" },
+    OptionDef { name: "status-position", scope: Session, option_type: Choice(StatusPosition), default: "bottom", description: "Status bar position (top/bottom)" },
     OptionDef { name: "status-interval", scope: Session, option_type: Number(U64), default: "15", description: "Status bar refresh interval in seconds" },
-    OptionDef { name: "status-justify", scope: Session, option_type: UNVALIDATED_CHOICE, default: "left", description: "Window list alignment (left/centre/right)" },
+    OptionDef { name: "status-justify", scope: Session, option_type: Choice(StatusJustify), default: "left", description: "Window list alignment (left/centre/right/absolute-centre)" },
     OptionDef { name: "status-left", scope: Session, option_type: OptionType::String, default: "[#S] ", description: "Left side of the status bar" },
     OptionDef { name: "status-right", scope: Session, option_type: OptionType::String, default: "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y", description: "Right side of the status bar" },
-    OptionDef { name: "status-left-length", scope: Session, option_type: Number(Usize), default: "10", description: "Max width of left status section" },
-    OptionDef { name: "status-right-length", scope: Session, option_type: Number(Usize), default: "40", description: "Max width of right status section" },
+    OptionDef { name: "status-left-length", scope: Session, option_type: Number(StatusLength), default: "10", description: "Max width of left status section" },
+    OptionDef { name: "status-right-length", scope: Session, option_type: Number(StatusLength), default: "40", description: "Max width of right status section" },
     OptionDef { name: "status-style", scope: Session, option_type: OptionType::String, default: "bg=green,fg=black", description: "Status bar style" },
+    // options-table.c:1014-1028 at 3.8: COLOUR, default 8 (`default`).
+    // Laid over status-style when the line is drawn (status.c:248-254).
+    OptionDef { name: "status-bg", scope: Session, option_type: OptionType::Colour, default: "default", description: "Status bar background colour, laid over status-style (deprecated, use status-style)" },
+    OptionDef { name: "status-fg", scope: Session, option_type: OptionType::Colour, default: "default", description: "Status bar foreground colour, laid over status-style (deprecated, use status-style)" },
     OptionDef { name: "status-left-style", scope: Session, option_type: OptionType::String, default: "default", description: "Left status section style" },
     OptionDef { name: "status-right-style", scope: Session, option_type: OptionType::String, default: "default", description: "Right status section style" },
     OptionDef { name: "message-style", scope: Session, option_type: OptionType::String, default: "bg=yellow,fg=black", description: "Command prompt / message style" },

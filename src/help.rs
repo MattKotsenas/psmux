@@ -646,6 +646,8 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("status-left-length",         "10"),
     ("status-right-length",        "40"),
     ("status-style",               "bg=green,fg=black"),
+    ("status-bg",                  "default"),
+    ("status-fg",                  "default"),
     ("status-left-style",          "\"\""),
     ("status-right-style",         "\"\""),
     // Window status

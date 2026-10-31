@@ -1729,6 +1729,10 @@ pub(crate) fn dispatch(
                             "status-left" => { app.status_left.push_str(&value); }
                             "status-right" => { app.status_right.push_str(&value); }
                             "status-style" => { app.status_style.push_str(&value); }
+                            // A colour is set, not appended to (options.c:1303-1305).
+                            "status-bg" | "status-fg" => {
+                                let _ = apply_set_option(&mut app, &option, &value, true);
+                            }
                             "pane-border-style" => { app.pane_border_style.push_str(&value); }
                             "pane-active-border-style" => { app.pane_active_border_style.push_str(&value); }
                             "pane-border-hover-style" => { app.pane_border_hover_style.push_str(&value); }
@@ -1981,6 +1985,8 @@ pub(crate) fn dispatch(
                     if !app.status_style.is_empty() {
                         output.push_str(&format!("status-style \"{}\"\n", app.status_style));
                     }
+                    output.push_str(&format!("status-bg {}\n", app.status_bg));
+                    output.push_str(&format!("status-fg {}\n", app.status_fg));
                     if !app.status_left_style.is_empty() {
                         output.push_str(&format!("status-left-style \"{}\"\n", app.status_left_style));
                     }

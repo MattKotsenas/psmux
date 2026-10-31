@@ -188,10 +188,10 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `choose-tree-preview` | Bool | `off` | Open `choose-session` / `choose-tree` pickers with the live preview pane already visible (saves pressing `p`). See [preview.md](preview.md) |
 | `bold-is-bright` | Bool | `on` | Restore standard SGR codes for the 16 basic colors so the outer terminal renders `bold` as bright (matches a bare shell). Set `off` to keep explicit 256-indexed low colors byte-accurate. See [Bold Is Bright](#bold-is-bright-color-rendering) |
 | `status` | Bool/Int | `on` | Show status bar (number = line count) |
-| `status-position` | Str | `bottom` | `top` or `bottom` |
-| `status-justify` | Str | `left` | `left`, `centre`, `right`, `absolute-centre` |
-| `status-left-length` | Int | `10` | Max width of status-left |
-| `status-right-length` | Int | `40` | Max width of status-right |
+| `status-position` | Str | `bottom` | `top` or `bottom`; any other value is refused with `unknown value`, as in tmux |
+| `status-justify` | Str | `left` | `left`, `centre`, `right` or `absolute-centre`; any other value, `center` too, is refused with `unknown value`, as in tmux |
+| `status-left-length` | Int | `10` | Max width of status-left, 0 to 32767 |
+| `status-right-length` | Int | `40` | Max width of status-right, 0 to 32767 |
 | `focus-events` | Bool | `off` | Pass focus events to apps |
 | `sixel` | Choice | `auto` | When to draw the sixel images programs in a pane write (`off`/`on`/`auto`). They reach psmux only through a console host that passes sixel on, which the inbox `conhost.exe` does not: point `PSMUX_CONPTY_DIR` at an OpenConsole, see [The Console Host Seam](diagnostics.md#the-console-host-seam). With `auto` the client draws them only when the outer terminal's DA1 reply lists sixel (4), as Windows Terminal's does, which is what tmux does. `on` draws them whatever the terminal said, for a terminal that sends no reply, and `off` never draws them |
 | `input-buffer-size` | Int | `1048576` | Bytes a sixel image's DCS may hold before it is dropped, as in tmux. Range `1048576` to `4294967295`. tmux also holds OSC and APC strings to it; psmux holds only sixel |
@@ -251,8 +251,8 @@ As in tmux, a name that is neither in this table, nor in tmux's own options tabl
 | `status-style` | Str | `bg=green,fg=black` | Status bar style |
 | `status-left-style` | Str | | Left status style |
 | `status-right-style` | Str | | Right status style |
-| `status-bg` | Str | | Legacy convenience setter. Rewrites only the `bg=` part of `status-style` and leaves the rest intact |
-| `status-fg` | Str | | Legacy convenience setter. Rewrites only the `fg=` part of `status-style` and leaves the rest intact |
+| `status-bg` | Colour | `default` | Background colour of the status line, laid over `status-style` when the line is drawn (deprecated in tmux, use `status-style`). `default` and `terminal` leave `status-style`'s colour. `status-style` itself is not changed, so `set -u status-bg` takes it off again. It takes `#rrggbb`, `colour0` to `colour255`, `default`, `terminal`, the eight colour names and their `bright` forms, or their numbers `0` to `7` and `90` to `97`, and `show-options` prints the colour in that form (`1` as `red`). tmux also takes the X11 colour names and its theme colours, which psmux does not draw, so they are refused with `bad colour` |
+| `status-fg` | Colour | `default` | Foreground colour of the status line, laid over `status-style` the same way |
 | `message-style` | Str | `bg=yellow,fg=black` | Message style |
 | `message-command-style` | Str | `bg=black,fg=yellow` | Command prompt style |
 | `mode-style` | Str | `bg=yellow,fg=black` | Copy-mode highlight |

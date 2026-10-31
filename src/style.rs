@@ -68,7 +68,51 @@ pub fn map_color(name: &str) -> Color {
         "brightcyan" | "bright-cyan" => Color::LightCyan,
         "brightwhite" | "bright-white" => Color::White,
         "default" | "terminal" => Color::Reset,
-        _ => Color::Reset,
+        // tmux colour_fromstring (colour.c:429-460 at 3.8) also takes the
+        // SGR numbers of the eight colours and their bright forms.
+        _ => match option_colour_name(name).as_deref() {
+            Some(named) if named != name => map_color(named),
+            _ => Color::Reset,
+        },
+    }
+}
+
+/// The colour names a colour option such as status-bg takes, in the form
+/// tmux shows them, or `None` for a value that is no colour.
+///
+/// tmux's colour_fromstring (colour.c:387-462 at 3.8) takes `#rrggbb`,
+/// `colourN` and `colorN` (0 to 255), `default`, `terminal`, the eight
+/// colour names and their `bright` forms in any case, and the SGR numbers
+/// `0` to `7` and `90` to `97`; colour_tostring then shows them as
+/// `#rrggbb` in lower case, `colourN`, or the lower case name. tmux also
+/// takes the X11 colour names and, from 3.8, the theme colours; psmux draws
+/// neither ([`map_color`]), so they are no colour here.
+pub fn option_colour_name(value: &str) -> Option<String> {
+    const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+    if let Some(hex) = value.strip_prefix('#') {
+        return (hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("#{}", hex.to_ascii_lowercase()));
+    }
+    let lower = value.to_ascii_lowercase();
+    if let Some(number) = lower.strip_prefix("colour").or_else(|| lower.strip_prefix("color")) {
+        return (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| number.parse::<u8>().ok())
+            .flatten()
+            .map(|n| format!("colour{}", n));
+    }
+    if lower == "default" || lower == "terminal" {
+        return Some(lower);
+    }
+    if let Some(i) = NAMES.iter().position(|name| *name == lower) {
+        return Some(NAMES[i].to_string());
+    }
+    if let Some(i) = lower.strip_prefix("bright").and_then(|rest| NAMES.iter().position(|name| *name == rest)) {
+        return Some(format!("bright{}", NAMES[i]));
+    }
+    match value.parse::<u8>() {
+        Ok(n @ 0..=7) if value.len() == 1 => Some(NAMES[n as usize].to_string()),
+        Ok(n @ 90..=97) if value.len() == 2 => Some(format!("bright{}", NAMES[(n - 90) as usize])),
+        _ => None,
     }
 }
 

@@ -412,6 +412,24 @@ pub(crate) fn status_format_json(app: &AppState) -> String {
     sf
 }
 
+/// The status line's base style: status-style with status-fg and then
+/// status-bg laid over it, each only when it names a colour, as tmux's
+/// status_redraw does (status.c:248-254 at 3.8; COLOUR_DEFAULT counts both
+/// `default` and `terminal` as none). The client reads a later `fg=` or `bg=`
+/// over an earlier one, so appending them is the overlay.
+pub(crate) fn status_line_style(app: &AppState, status_style: &str) -> String {
+    let mut style = status_style.to_string();
+    for (key, colour) in [("fg", &app.status_fg), ("bg", &app.status_bg)] {
+        if colour != "default" && colour != "terminal" {
+            if !style.is_empty() {
+                style.push(',');
+            }
+            style.push_str(&format!("{}={}", key, colour));
+        }
+    }
+    style
+}
+
 /// Expand every per-frame status/style format in one guarded pass.
 ///
 /// `status_style` is passed in rather than read from `app` because both callers
@@ -455,7 +473,7 @@ pub(crate) fn expand_status_formats(
                 crate::pane_border::PaneBorderIndicators::default()
             });
     StatusFormats {
-        status_style: expand_format(status_style, app),
+        status_style: status_line_style(app, &expand_format(status_style, app)),
         status_left: expand_format(&app.status_left, app),
         status_right: expand_format(&app.status_right, app),
         pane_border_style: expand_format(&app.pane_border_style, app),

@@ -951,6 +951,8 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "pane-active-border-style" => app.pane_active_border_style.clone(),
         "pane-border-hover-style" => app.pane_border_hover_style.clone(),
         "status-style" => app.status_style.clone(),
+        "status-bg" => app.status_bg.clone(),
+        "status-fg" => app.status_fg.clone(),
         "window-status-format" => app.window_status_format.clone(),
         "window-status-current-format" => app.window_status_current_format.clone(),
         "window-status-separator" => app.window_status_separator.clone(),
@@ -1527,28 +1529,20 @@ pub(crate) fn apply_set_option(
         }
         "status-position" => { app.status_position = value.to_string(); }
         "status-style" => { app.status_style = value.to_string(); }
-        // Deprecated but ubiquitous: map status-bg/status-fg to status-style
-        "status-bg" => {
-            let current = &app.status_style;
-            let filtered: String = current.split(',')
-                .filter(|s| !s.trim().starts_with("bg="))
-                .collect::<Vec<_>>().join(",");
-            app.status_style = if filtered.is_empty() {
-                format!("bg={}", value)
+        // Colour options of their own, as in tmux (options-table.c:1014-1028
+        // at 3.8): kept in the form show prints, and laid over status-style
+        // only when the line is drawn (helpers::status_line_style), so
+        // status-style itself is left as it is. They used to be written into
+        // status-style's bg= and fg= here, which `-u` could not undo and a
+        // later status-style replaced, and the config file never reached.
+        "status-bg" | "status-fg" => {
+            let colour = crate::style::option_colour_name(value)
+                .ok_or_else(|| format!("bad colour: {}", value))?;
+            if option == "status-bg" {
+                app.status_bg = colour;
             } else {
-                format!("{},bg={}", filtered, value)
-            };
-        }
-        "status-fg" => {
-            let current = &app.status_style;
-            let filtered: String = current.split(',')
-                .filter(|s| !s.trim().starts_with("fg="))
-                .collect::<Vec<_>>().join(",");
-            app.status_style = if filtered.is_empty() {
-                format!("fg={}", value)
-            } else {
-                format!("{},fg={}", filtered, value)
-            };
+                app.status_fg = colour;
+            }
         }
         "focus-events" => { app.focus_events = matches!(value, "on" | "true" | "1" | "yes"); }
         "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1" | "yes"); }

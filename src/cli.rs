@@ -1526,11 +1526,11 @@ SET OPTIONS (use with: set -g <option> <value>):
     status-left         Str  Left status content (default: "[#S] ")
     status-right        Str  Right status content
     status-style        Str  Status bar style (default: bg=green,fg=black)
-    status-bg           Str  Status background color (deprecated, use status-style)
-    status-fg           Str  Status foreground color (deprecated, use status-style)
+    status-bg           Str  Status background colour, over status-style (default: default; deprecated)
+    status-fg           Str  Status foreground colour, over status-style (default: default; deprecated)
     status-left-style   Str  Left status area style
     status-right-style  Str  Right status area style
-    status-justify      Str  Tab alignment: left, centre, right
+    status-justify      Str  Tab alignment: left, centre, right, absolute-centre
     message-style       Str  Message bar style
     message-command-style Str Command prompt style
     mode-style          Str  Copy-mode highlight style

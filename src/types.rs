@@ -2024,6 +2024,11 @@ pub struct AppState {
     pub priority: String,
     /// status-style: stored for compat
     pub status_style: String,
+    /// status-bg and status-fg: tmux's colour options, in the form show prints
+    /// them (`default` until set), laid over status-style when the status line
+    /// is drawn (helpers::status_line_style).
+    pub status_bg: String,
+    pub status_fg: String,
     /// default-command / default-shell: shell to launch for new panes
     pub default_shell: String,
     /// word-separators: characters that delimit words in copy mode
@@ -3471,6 +3476,8 @@ impl AppState {
             // consulted where the class is actually applied, at startup.
             priority: crate::platform::DEFAULT_PRIORITY.to_string(),
             status_style: "bg=green,fg=black".to_string(),
+            status_bg: "default".to_string(),
+            status_fg: "default".to_string(),
             default_shell: String::new(),
             word_separators: crate::grid_reader::DEFAULT_WORD_SEPARATORS.to_string(),
             renumber_windows: false,
