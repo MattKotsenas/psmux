@@ -131,6 +131,9 @@ try {
     Case 'show-options @nope' 'invalid option: @nope'
     Case 'display-message -x hi' $null
     Case 'show-options -p' $null
+    # The same arms with other flags, and through a line if-shell feeds back.
+    Case 'show-options -g nosuch' 'invalid option: nosuch'
+    Case 'if-shell -F 1 "show-options @nope"' 'invalid option: @nope'
     # The same prompt with a command that works, for comparison.
     Case 'show-options -s codepoint-widths' 'codepoint-widths'
 }
