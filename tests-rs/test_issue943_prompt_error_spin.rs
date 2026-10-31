@@ -86,3 +86,57 @@ fn show_options_p_runs_once() {
 fn set_option_with_a_bad_flag_runs_once() {
     assert_runs_once("set-option -Z x y");
 }
+
+/// The same four arms reached with other flags, and through a line that
+/// if-shell feeds back into the loop: each one ran for ever on master.
+#[test]
+fn other_flags_and_an_if_shell_branch_run_once() {
+    for command in [
+        "show-options -g nosuch",
+        "show-options -gv nosuch",
+        "show-options -A nosuch",
+        "show-window-options nosuch",
+        "show-options -w @nope",
+        "show-options -s @nope",
+        "display-message -Z",
+        "if-shell -F 1 \"show-options @nope\"",
+    ] {
+        assert_runs_once(command);
+    }
+}
+
+/// Every other kind of failure at the prompt already read the next line;
+/// this keeps it so. None of these starts a process.
+#[test]
+fn every_failing_command_kind_reads_the_next_line() {
+    for command in [
+        "nosuchcommand a b",
+        "set-option nosuch x",
+        "set-option -g @x",
+        "set-window-option nosuch x",
+        "set-hook nosuch x",
+        "show-options -t nosuch",
+        "show -p -t %999",
+        "show-hooks nosuch",
+        "show-environment NOSUCH",
+        "display-message -t nosuch hi",
+        "display -c nosuch hi",
+        "select-window -t 99",
+        "select-pane -t %999",
+        "kill-window -t 99",
+        "rename-window -t 99 x",
+        "swap-pane -s %998 -t %999",
+        "show-buffer -b nosuch",
+        "delete-buffer -b nosuch",
+        "unbind-key -T nosuch x",
+        "list-keys -T nosuch",
+        "if-shell",
+        "bind-key",
+        "wait-for",
+        "command-prompt -Z",
+        "show-options codepoint-width ; set -g @chain 1",
+        "set -g @a 1 ; show-options @nope ; set -g @b 1",
+    ] {
+        assert_runs_once(command);
+    }
+}
