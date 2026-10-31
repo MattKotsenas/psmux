@@ -8761,3 +8761,7 @@ mod tests_set_hook_quoted_command;
 #[cfg(test)]
 #[path = "../../tests-rs/test_readonly_control_client.rs"]
 mod tests_readonly_control_client;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue943_prompt_error_spin.rs"]
+mod tests_issue943_prompt_error_spin;
