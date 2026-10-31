@@ -2099,3 +2099,7 @@ mod tests_issue919_input_buffer_size;
 #[cfg(test)]
 #[path = "../../tests-rs/test_codepoint_widths_array.rs"]
 mod tests_codepoint_widths_array;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue947_status_format_array.rs"]
+mod tests_issue947_status_format_array;
