@@ -376,6 +376,39 @@ pub(crate) struct StatusFormats {
     pub host_title: Option<String>,
 }
 
+/// The `status-format` lines the client draws, expanded, as a JSON array of
+/// strings: element `i` for each status line `i`, and a missing element as
+/// an empty string, which the client draws as a blank line (line 0 as the
+/// default layout). tmux expands `status-format[i]` for each `i` below the
+/// number of status lines and no other (status.c:269-300 at tag 3.8), so an
+/// element past the last line costs nothing here however large its index.
+/// Trailing missing lines are left off, so with no element set the array is
+/// `[]` as before.
+pub(crate) fn status_format_json(app: &AppState) -> String {
+    let lines = app.status_lines.max(1) as u64;
+    let Some((last, _)) = app
+        .status_format
+        .iter()
+        .take_while(|(index, _)| u64::from(*index) < lines)
+        .last()
+    else {
+        return String::from("[]");
+    };
+    let mut sf = String::from("[");
+    for i in 0..=last {
+        if i > 0 {
+            sf.push(',');
+        }
+        sf.push('"');
+        if let Some(fmt_str) = app.status_format.get(i) {
+            sf.push_str(&json_escape_string(&crate::format::expand_format(fmt_str, app)));
+        }
+        sf.push('"');
+    }
+    sf.push(']');
+    sf
+}
+
 /// Expand every per-frame status/style format in one guarded pass.
 ///
 /// `status_style` is passed in rather than read from `app` because both callers
@@ -475,17 +508,7 @@ pub(crate) fn expand_status_formats(
             },
             word_separators: Some(app.word_separators.clone()),
         },
-        status_format_json: {
-            let mut sf = String::from("[");
-            for (i, fmt_str) in app.status_format.iter().enumerate() {
-                if i > 0 { sf.push(','); }
-                sf.push('"');
-                sf.push_str(&json_escape_string(&expand_format(fmt_str, app)));
-                sf.push('"');
-            }
-            sf.push(']');
-            sf
-        },
+        status_format_json: status_format_json(app),
         // set-titles-string was expanded outside the guard on BOTH paths, so it
         // blocked even where the rest of the bar did not. It belongs here.
         host_title: if app.set_titles {

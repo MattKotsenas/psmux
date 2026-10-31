@@ -2159,8 +2159,10 @@ pub struct AppState {
     pub status_right_length: usize,
     /// status lines: number of status bar lines (default 1, set via `set status N`)
     pub status_lines: usize,
-    /// status-format: custom format strings for each status line (index 1+)
-    pub status_format: Vec<String>,
+    /// status-format: an ARRAY option (crate::option_array), one format per
+    /// status line by index; `status-format[0]`, when set, replaces the
+    /// default status-left, window list and status-right layout of line 0.
+    pub status_format: crate::option_array::OptionArray,
     /// window-size: "smallest", "largest", "manual", "latest" (default "latest")
     pub window_size: String,
     /// Requested manual geometry, keyed by window ID. The visible geometry may
@@ -3534,7 +3536,9 @@ impl AppState {
             status_left_length: 10,
             status_right_length: 40,
             status_lines: 1,
-            status_format: Vec::new(),
+            status_format: crate::option_array::OptionArray::with_default(
+                crate::option_array::spec("status-format").expect("status-format is in ARRAY_OPTIONS"),
+            ),
             window_size: "latest".to_string(),
             manual_window_sizes: std::collections::HashMap::new(),
             allow_passthrough: "off".to_string(),

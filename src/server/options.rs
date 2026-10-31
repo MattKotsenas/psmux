@@ -59,6 +59,7 @@ pub(crate) fn set_warm_pool_size(app: &mut AppState, value: &str) {
 fn array_option_mut<'a>(app: &'a mut AppState, base: &str) -> Option<&'a mut OptionArray> {
     match base {
         "codepoint-widths" => Some(&mut app.codepoint_widths),
+        "status-format" => Some(&mut app.status_format),
         "terminal-overrides" => Some(&mut app.terminal_overrides),
         _ => None,
     }
@@ -67,6 +68,7 @@ fn array_option_mut<'a>(app: &'a mut AppState, base: &str) -> Option<&'a mut Opt
 fn array_option<'a>(app: &'a AppState, base: &str) -> Option<&'a OptionArray> {
     match base {
         "codepoint-widths" => Some(&app.codepoint_widths),
+        "status-format" => Some(&app.status_format),
         "terminal-overrides" => Some(&app.terminal_overrides),
         _ => None,
     }
@@ -1411,8 +1413,8 @@ pub(crate) fn apply_set_option(
                 app.pane_base_index = idx;
             }
         }
-        // codepoint-widths, terminal-overrides and their elements
-        // (`terminal-overrides[N]`), as for any array option.
+        // codepoint-widths, status-format, terminal-overrides and their
+        // elements (`status-format[N]`), as for any array option.
         name if is_stored_array_option(name) => {
             set_array_option(app, name, value, false)?;
         }
@@ -1722,16 +1724,6 @@ pub(crate) fn apply_set_option(
             }
         }
         _ => {
-            // Handle status-format[N] patterns
-            if option.starts_with("status-format[") && option.ends_with(']') {
-                if let Ok(idx) = option["status-format[".len()..option.len()-1].parse::<usize>() {
-                    while app.status_format.len() <= idx {
-                        app.status_format.push(String::new());
-                    }
-                    app.status_format[idx] = value.to_string();
-                    return Ok(());
-                }
-            }
             // Store @user-options in dedicated map (NOT environment) to avoid
             // leaking into child shell env vars (#105).
             if option.starts_with('@') {

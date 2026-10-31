@@ -8,9 +8,8 @@
 //!
 //! [`ARRAY_OPTIONS`] lists the options built on this so far. tmux 3.7c has
 //! more, and they move here one at a time: terminal-features and user-keys
-//! split on `,`; status-format,
-//! update-environment and pane-colours on space and `,`; every hook is an
-//! array of commands that does not split at all.
+//! split on `,`; update-environment and pane-colours on space and `,`; every
+//! hook is an array of commands that does not split at all.
 
 use std::collections::BTreeMap;
 
@@ -52,6 +51,19 @@ pub static ARRAY_OPTIONS: &[ArraySpec] = &[
         separator: ",",
         default: "",
         trim: true,
+    },
+    // options-table.c:1030-1040 at tag 3.8. It names no separator, so a
+    // value without an index is split on space and `,` (options.c:640-641).
+    // The default is psmux's own and empty: tmux's is three formats
+    // (options-table.c:238-299, the window list line and the `P:` and `S:`
+    // lines for `status 2` and `3`), while psmux draws its own status-left,
+    // window list and status-right whenever status-format[0] is empty, and
+    // has no pane or session list line to show on the others.
+    ArraySpec {
+        name: "status-format",
+        separator: " ,",
+        default: "",
+        trim: false,
     },
     // options-table.c:518-525
     ArraySpec {

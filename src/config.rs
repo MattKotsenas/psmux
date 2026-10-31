@@ -2318,8 +2318,8 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         "allow-set-title" => {
             app.allow_set_title = matches!(value, "on" | "true" | "1" | "yes");
         }
-        // The array options and their elements: codepoint-widths and
-        // terminal-overrides, whose smcup/rmcup decide whether the attach
+        // The array options and their elements: codepoint-widths,
+        // status-format and terminal-overrides, whose smcup/rmcup decide whether the attach
         // client uses the host's alternate screen (issue #700).
         name if crate::server::options::is_stored_array_option(name) => {
             if let Err(error) = crate::server::options::set_array_option(app, name, value, false) {
@@ -2425,16 +2425,6 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
             }
         }
         _ => {
-            // Handle status-format[N] patterns
-            if key.starts_with("status-format[") && key.ends_with(']') {
-                if let Ok(idx) = key["status-format[".len()..key.len()-1].parse::<usize>() {
-                    while app.status_format.len() <= idx {
-                        app.status_format.push(String::new());
-                    }
-                    app.status_format[idx] = value.to_string();
-                    return true;
-                }
-            }
             // A catalog option this match does not route is still a real
             // option: hand it to the runtime setter so `set -g NAME VALUE` in
             // a config file lands exactly where the same command typed at
