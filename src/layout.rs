@@ -91,13 +91,14 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if cell.hidden() { fl |= FLAG_HIDDEN; }
                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
                 let (cell_ul, cell_ulc) = cell_underline(cell, pal);
+                let cell_ol = cell.overline();
 
                 // A hyperlink change must also break the run so the client can
                 // wrap exactly the linked text in OSC 8 (#361).
                 let merged = if let Some(last) = runs.last_mut() {
                     if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
                         && prev_flags == fl && prev_link == Some(cell_link)
-                        && last.ul == cell_ul && last.ulc == cell_ulc
+                        && last.ul == cell_ul && last.ulc == cell_ulc && last.ol == cell_ol
                     {
                         last.text.push_str(t);
                         last.width = last.width.saturating_add(w);
@@ -110,14 +111,14 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                     let link = if cell_link != 0 {
                         screen.hyperlink_uri(cell_link).map(|s| s.to_string())
                     } else { None };
-                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc });
+                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc, ol: cell_ol });
                 }
 
                 (w, cell_fg, cell_bg, fl, cell_link)
             } else {
                 let merged = if let Some(last) = runs.last_mut() {
                     if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
-                        && prev_flags == 0 && prev_link == Some(0)
+                        && prev_flags == 0 && prev_link == Some(0) && !last.ol
                     {
                         last.text.push(' ');
                         last.width = last.width.saturating_add(1);
@@ -125,7 +126,7 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                     } else { false }
                 } else { false };
                 if !merged {
-                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
+                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None, ol: false });
                 }
                 (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
             };
@@ -155,7 +156,12 @@ pub fn cycle_top_layout(app: &mut AppState) {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CellJson { pub text: String, pub fg: String, pub bg: String, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub dim: bool, pub blink: bool, pub hidden: bool, pub strikethrough: bool }
+pub struct CellJson {
+    pub text: String, pub fg: String, pub bg: String, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub dim: bool, pub blink: bool, pub hidden: bool, pub strikethrough: bool,
+    /// SGR 53 overline; written only when set, as `CellRunJson::ol` is.
+    #[serde(default, skip_serializing_if = "crate::layout::is_false")]
+    pub overline: bool,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CellRunJson {
@@ -179,6 +185,17 @@ pub struct CellRunJson {
     /// SGR 58 underline colour name for this run, if one was set (#589).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ulc: Option<String>,
+    /// SGR 53 overline. `flags` has no bit left, so it travels as its own
+    /// field, written only when set, like `ul`: the payload of an ordinary run
+    /// is unchanged and an older client ignores the field.
+    #[serde(default, skip_serializing_if = "crate::layout::is_false")]
+    pub ol: bool,
+}
+
+/// For `skip_serializing_if` on a flag that is off for nearly every run.
+#[must_use]
+pub fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Runs with no underline or a plain single underline need no `ul` field on
@@ -565,6 +582,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             if cell.hidden() { fl |= FLAG_HIDDEN; }
                             if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
                             let (cell_ul, cell_ulc) = cell_underline(cell, pal);
+                            let cell_ol = cell.overline();
 
                             // Run merging — push &str directly, no String allocation.
                             // Break on hyperlink change so OSC 8 wraps exactly the
@@ -572,7 +590,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             let merged = if let Some(last) = runs.last_mut() {
                                 if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
                                     && prev_flags == fl && prev_link == Some(cell_link)
-                                    && last.ul == cell_ul && last.ulc == cell_ulc
+                                    && last.ul == cell_ul && last.ulc == cell_ulc && last.ol == cell_ol
                                 {
                                     last.text.push_str(t);
                                     last.width = last.width.saturating_add(w);
@@ -585,7 +603,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                 let link = if cell_link != 0 {
                                     screen.hyperlink_uri(cell_link).map(|s| s.to_string())
                                 } else { None };
-                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc.clone() });
+                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc.clone(), ol: cell_ol });
                             }
 
                             if need_full_content {
@@ -595,14 +613,14 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                     text: t.to_string(), fg: fg_str.clone(), bg: bg_str.clone(),
                                     bold: cell.bold(), italic: cell.italic(),
                                     underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
-                                    blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(),
+                                    blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(),
                                 });
                                 for _ in 1..w {
                                     row.push(CellJson {
                                         text: String::new(), fg: fg_str.clone(), bg: bg_str.clone(),
                                         bold: cell.bold(), italic: cell.italic(),
                                         underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim(),
-                                        blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(),
+                                        blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(),
                                     });
                                 }
                             }
@@ -612,7 +630,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             // No cell — default space
                             let merged = if let Some(last) = runs.last_mut() {
                                 if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
-                                    && prev_flags == 0 && prev_link == Some(0)
+                                    && prev_flags == 0 && prev_link == Some(0) && !last.ol
                                 {
                                     last.text.push(' ');
                                     last.width = last.width.saturating_add(1);
@@ -620,13 +638,13 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                 } else { false }
                             } else { false };
                             if !merged {
-                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
+                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None, ol: false });
                             }
                             if need_full_content {
                                 row.push(CellJson {
                                     text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(),
                                     bold: false, italic: false, underline: false, inverse: false, dim: false,
-                                    blink: false, hidden: false, strikethrough: false,
+                                    blink: false, hidden: false, strikethrough: false, overline: false,
                                 });
                             }
                             (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
@@ -650,7 +668,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                                 dim: false,
                                 blink: false,
                                 hidden: false,
-                                strikethrough: false,
+                                strikethrough: false, overline: false,
                             });
                         }
                         lines.push(row);
@@ -878,7 +896,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
 
     /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
     #[allow(clippy::too_many_arguments)]
-    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, link: Option<&str>, ul: u8, ulc: vt100::Color, out: &mut String) {
+    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, link: Option<&str>, ul: u8, ulc: vt100::Color, ol: bool, out: &mut String) {
         out.push_str("\",\"fg\":\"");
         push_color(fg, out);
         out.push_str("\",\"bg\":\"");
@@ -894,6 +912,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
             out.push_str(",\"ulc\":\"");
             push_color(ulc, out);
             out.push('"');
+        }
+        // SGR 53 overline, only when set (CellRunJson::ol).
+        if ol {
+            out.push_str(",\"ol\":true");
         }
         // OSC 8 URI (#361).  The client re-emits hyperlinks only for runs that
         // carry this field, and `CellRunJson::link` skips serialising when it is
@@ -1001,9 +1023,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 // also holds p.term's mutex while processing ConPTY output).
                 // Without this, WSL echo gets starved because its output sits
                 // in the ConPTY pipe while we build the JSON string.
-                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16, link: Option<String>, ul: u8, ulc: vt100::Color }
+                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16, link: Option<String>, ul: u8, ulc: vt100::Color, ol: bool }
                 struct RowSnap { runs: Vec<Run> }
-                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, width: u16 }
+                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, overline: bool, width: u16 }
                 struct LeafSnap {
                     cr: u16, cc: u16, alt: bool,
                     wants_mouse: bool,
@@ -1057,6 +1079,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         let mut prev_link: Option<u32> = None;
                         let mut prev_ul: u8 = 0;
                         let mut prev_ulc = vt100::Color::Default;
+                        let mut prev_ol = false;
 
                         while c < p.last_cols {
                             if let Some(cell) = screen.cell(r, c) {
@@ -1080,9 +1103,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 let clink = cell.hyperlink_id();
                                 let cul = cell.underline_style().sgr_subparam();
                                 let culc = pal_resolve(pal, cell.underline_color());
+                                let c_ol = cell.overline();
                                 if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
                                     && prev_link == Some(clink)
-                                    && prev_ul == cul && prev_ulc == culc
+                                    && prev_ul == cul && prev_ulc == culc && prev_ol == c_ol
                                 {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push_str(t);
@@ -1092,7 +1116,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                     let link = if clink != 0 {
                                         screen.hyperlink_uri(clink).map(|s| s.to_string())
                                     } else { None };
-                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w, link, ul: cul, ulc: culc });
+                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w, link, ul: cul, ulc: culc, ol: c_ol });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
@@ -1100,6 +1124,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 prev_link = Some(clink);
                                 prev_ul = cul;
                                 prev_ulc = culc;
+                                prev_ol = c_ol;
                                 c += w.max(1);
                             } else {
                                 let cfg = vt100::Color::Default;
@@ -1107,14 +1132,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 let fl  = 0u8;
                                 if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
                                     && prev_link == Some(0)
-                                    && prev_ul == 0 && prev_ulc == vt100::Color::Default
+                                    && prev_ul == 0 && prev_ulc == vt100::Color::Default && !prev_ol
                                 {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push(' ');
                                         last.width += 1;
                                     }
                                 } else {
-                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1, link: None, ul: 0, ulc: vt100::Color::Default });
+                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1, link: None, ul: 0, ulc: vt100::Color::Default, ol: false });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
@@ -1122,6 +1147,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 prev_link = Some(0);
                                 prev_ul = 0;
                                 prev_ulc = vt100::Color::Default;
+                                prev_ol = false;
                                 c += 1;
                             }
                         }
@@ -1144,13 +1170,13 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                         // cells, so it resolves the palette too.
                                         text: t.to_string(), fg: pal_resolve(pal, cell.fgcolor()), bg: pal_resolve(pal, cell.bgcolor()),
                                         bold: cell.bold(), italic: cell.italic(), underline: cell.underline(),
-                                        inverse: cell.inverse(), dim: cell.dim(), blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), width: w,
+                                        inverse: cell.inverse(), dim: cell.dim(), blink: cell.blink(), hidden: cell.hidden(), strikethrough: cell.strikethrough(), overline: cell.overline(), width: w,
                                     });
                                     c += w;
                                 } else {
                                     row_cells.push(CopyCell {
                                         text: " ".to_string(), fg: vt100::Color::Default, bg: vt100::Color::Default,
-                                        bold: false, italic: false, underline: false, inverse: false, dim: false, blink: false, hidden: false, strikethrough: false, width: 1,
+                                        bold: false, italic: false, underline: false, inverse: false, dim: false, blink: false, hidden: false, strikethrough: false, overline: false, width: 1,
                                     });
                                     c += 1;
                                 }
@@ -1288,9 +1314,11 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                             out.push_str("\",\"bg\":\"");
                             push_color(cell.bg, out);
                             let _ = std::fmt::Write::write_fmt(out, format_args!(
-                                "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{},\"blink\":{},\"hidden\":{},\"strikethrough\":{}}}",
+                                "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{},\"blink\":{},\"hidden\":{},\"strikethrough\":{}",
                                 cell.bold, cell.italic, cell.underline, cell.inverse, cell.dim, cell.blink, cell.hidden, cell.strikethrough,
                             ));
+                            if cell.overline { out.push_str(",\"overline\":true"); }
+                            out.push('}');
                             // Emit width-2 filler cells
                             for _ in 1..cell.width {
                                 out.push_str(",{\"text\":\"\",\"fg\":\"");
@@ -1298,9 +1326,11 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 out.push_str("\",\"bg\":\"");
                                 push_color(cell.bg, out);
                                 let _ = std::fmt::Write::write_fmt(out, format_args!(
-                                    "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{},\"blink\":{},\"hidden\":{},\"strikethrough\":{}}}",
+                                    "\",\"bold\":{},\"italic\":{},\"underline\":{},\"inverse\":{},\"dim\":{},\"blink\":{},\"hidden\":{},\"strikethrough\":{}",
                                     cell.bold, cell.italic, cell.underline, cell.inverse, cell.dim, cell.blink, cell.hidden, cell.strikethrough,
                                 ));
+                                if cell.overline { out.push_str(",\"overline\":true"); }
+                                out.push('}');
                             }
                         }
                         // pad to full column width
@@ -1324,7 +1354,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         if i > 0 { out.push(','); }
                         out.push_str("{\"text\":\"");
                         json_esc(&run.text, out);
-                        close_run(run.fg, run.bg, run.flags, run.width, run.link.as_deref(), run.ul, run.ulc, out);
+                        close_run(run.fg, run.bg, run.flags, run.width, run.link.as_deref(), run.ul, run.ulc, run.ol, out);
                     }
                     out.push_str("]}");
                 }

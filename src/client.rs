@@ -1820,6 +1820,7 @@ pub(crate) fn render_float_overlays(
                 if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
                 if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                 if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+                style = crate::rendering::with_overline(style, run.ol);
                 let run_w = run.width.max(1);
                 let text = if run.flags & 64 != 0 {
                     " ".repeat(run_w as usize)
@@ -2032,6 +2033,7 @@ pub(crate) fn render_popup_runs_line(
         if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
         if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
         if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+        style = crate::rendering::with_overline(style, run.ol);
         let run_w = run.width.max(1);
         // ratatui-crossterm omits SGR 8 (HIDDEN), render as spaces. One space
         // per column of the run: the column accounting below advances by
@@ -2453,6 +2455,7 @@ pub fn render_layout_json(
                         if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
                         if cell.blink { style = style.add_modifier(Modifier::SLOW_BLINK); }
                         if cell.strikethrough { style = style.add_modifier(Modifier::CROSSED_OUT); }
+                        style = crate::rendering::with_overline(style, cell.overline);
                         let text = ratatui_text(if cell.hidden {
                             " "
                         } else if cell.text.is_empty() {
@@ -2517,6 +2520,7 @@ pub fn render_layout_json(
                         }
                         if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                         if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+                        style = crate::rendering::with_overline(style, run.ol);
                         let run_w = run.width.max(1);
                         let text = if run.flags & 64 != 0 {
                             " ".repeat(run_w as usize)

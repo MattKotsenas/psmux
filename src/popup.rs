@@ -18,7 +18,7 @@ use crate::types::{Pane, AppState, Mode};
 
 /// Appends the extended underline style and SGR 58 colour of one run to the
 /// hand-written popup JSON, in the same shape `dump_layout_json_fast` uses
-/// (#589).  Both fields are omitted for ordinary runs.
+/// (#589), and the SGR 53 overline. Each is omitted for ordinary runs.
 fn push_run_underline(run: &crate::layout::CellRunJson, out: &mut String) {
     if run.ul > 1 {
         let _ = std::fmt::Write::write_fmt(out, format_args!(",\"ul\":{}", run.ul));
@@ -27,6 +27,9 @@ fn push_run_underline(run: &crate::layout::CellRunJson, out: &mut String) {
         out.push_str(",\"ulc\":\"");
         out.push_str(ulc);
         out.push('"');
+    }
+    if run.ol {
+        out.push_str(",\"ol\":true");
     }
 }
 
@@ -1112,6 +1115,7 @@ pub fn render_popup_overlay(
                             if cell.strikethrough() {
                                 style = style.add_modifier(Modifier::CROSSED_OUT);
                             }
+                            style = crate::rendering::with_overline(style, cell.overline());
                             // ratatui-crossterm 0.1.0 omits SGR 8, so
                             // Modifier::HIDDEN won't reach the terminal.
                             // Render hidden cells as spaces instead.

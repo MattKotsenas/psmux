@@ -2716,6 +2716,7 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
     let mut prev_inverse = false;
     let mut prev_hidden = false;
     let mut prev_strikethrough = false;
+    let mut prev_overline = false;
 
     // A -J row that ran on into the next one with a style still set.
     let mut style_carried = false;
@@ -2746,6 +2747,7 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
                 let inverse = cell.inverse();
                 let hidden = cell.hidden();
                 let strikethrough = cell.strikethrough();
+                let overline = cell.overline();
 
                 let style_changed = Some(fg) != prev_fg || Some(bg) != prev_bg
                     || bold != prev_bold || dim != prev_dim
@@ -2755,7 +2757,8 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
                     || Some(ulcolor) != prev_ulcolor
                     || blink != prev_blink
                     || inverse != prev_inverse || hidden != prev_hidden
-                    || strikethrough != prev_strikethrough;
+                    || strikethrough != prev_strikethrough
+                    || overline != prev_overline;
 
                 let sgr = if style_changed {
                     let mut params = Vec::new();
@@ -2777,6 +2780,10 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
                     if inverse { params.push("7".to_string()); }
                     if hidden { params.push("8".to_string()); }
                     if strikethrough { params.push("9".to_string()); }
+                    // After 9, as tmux orders its codes (grid.c:1079-1092 at tag
+                    // 3.8). tmux prints 53 as `5:3`, its form for the two digit
+                    // underscore codes, which reads back as blink; plain 53 does not.
+                    if overline { params.push("53".to_string()); }
                     match fg {
                         vt100::Color::Default => {}
                         vt100::Color::Idx(n) => {
@@ -2812,6 +2819,7 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
                     prev_inverse = inverse;
                     prev_hidden = hidden;
                     prev_strikethrough = strikethrough;
+                    prev_overline = overline;
                     any_style_active = true;
                     Some(format!("\x1b[{}m", params.join(";")))
                 } else {

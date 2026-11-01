@@ -2516,6 +2516,9 @@ impl Screen {
                 [27] => self.attrs.set_inverse(false),
                 [28] => self.attrs.set_hidden(false),
                 [29] => self.attrs.set_strikethrough(false),
+                // Overline (tmux input.c:2497-2501 at tag 3.8).
+                [53] => self.attrs.set_overline(true),
+                [55] => self.attrs.set_overline(false),
                 [n] if (30..=37).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }

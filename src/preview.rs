@@ -149,6 +149,8 @@ fn apply_sgr(style: &mut Style, params: &[u32]) {
             25 => *style = style.remove_modifier(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK),
             27 => *style = style.remove_modifier(Modifier::REVERSED),
             29 => *style = style.remove_modifier(Modifier::CROSSED_OUT),
+            53 => *style = crate::rendering::with_overline(*style, true),
+            55 => *style = style.remove_modifier(Modifier::from_bits_retain(crate::rendering::OVERLINE_BIT)),
             30..=37 => *style = style.fg(sgr_color_from_8bit((p - 30) as u8)),
             39 => *style = style.fg(Color::Reset),
             40..=47 => *style = style.bg(sgr_color_from_8bit((p - 40) as u8)),
@@ -538,7 +540,7 @@ pub fn render_runs_line(
     let mut last_bg = Color::Reset;
     for run in runs {
         if c >= width { break; }
-        let style = run_style(&run.fg, &run.bg, run.flags);
+        let style = crate::rendering::with_overline(run_style(&run.fg, &run.bg, run.flags), run.ol);
         last_bg = style.bg.unwrap_or(Color::Reset);
         let run_w = run.width.max(1);
         // Hidden cells render as spaces to match the main view's behavior, one

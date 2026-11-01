@@ -17,7 +17,7 @@ fn full_cell(text: &str, fg: &str, bg: &str) -> CellJson {
         dim: false,
         blink: false,
         hidden: false,
-        strikethrough: false,
+        strikethrough: false, overline: false,
     }
 }
 
@@ -30,7 +30,7 @@ fn run(text: &str, fg: &str, bg: &str, width: u16) -> CellRunJson {
         width,
         link: None,
         ul: 0,
-        ulc: None,
+        ulc: None, ol: false,
     }
 }
 
@@ -242,7 +242,7 @@ fn explicit_hidden_run_background_covers_the_full_run_width() {
                 width: 3,
                 link: None,
                 ul: 0,
-                ulc: None,
+                ulc: None, ol: false,
             }],
         }],
     );

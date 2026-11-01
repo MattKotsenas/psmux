@@ -104,11 +104,13 @@ impl BufWrite for ClearAttrs {
     }
 }
 
+/// A change of the bold and dim bits: SGR 22 first when either goes (it
+/// clears both), then SGR 1 and 2 for those to set.
 #[derive(Debug, Clone, Copy)]
-pub enum Intensity {
-    Normal,
-    Bold,
-    Dim,
+pub struct Intensity {
+    pub reset: bool,
+    pub bold: bool,
+    pub dim: bool,
 }
 
 #[derive(Default, Debug)]
@@ -125,6 +127,7 @@ pub struct Attrs {
     blink: Option<bool>,
     hidden: Option<bool>,
     strikethrough: Option<bool>,
+    overline: Option<bool>,
 }
 
 impl Attrs {
@@ -185,6 +188,11 @@ impl Attrs {
         self.strikethrough = Some(strikethrough);
         self
     }
+
+    pub fn overline(mut self, overline: bool) -> Self {
+        self.overline = Some(overline);
+        self
+    }
 }
 
 impl BufWrite for Attrs {
@@ -202,6 +210,7 @@ impl BufWrite for Attrs {
             && self.blink.is_none()
             && self.hidden.is_none()
             && self.strikethrough.is_none()
+            && self.overline.is_none()
         {
             return;
         }
@@ -273,10 +282,14 @@ impl BufWrite for Attrs {
         }
 
         if let Some(intensity) = self.intensity {
-            match intensity {
-                Intensity::Normal => write_param!(22),
-                Intensity::Bold => write_param!(1),
-                Intensity::Dim => write_param!(2),
+            if intensity.reset {
+                write_param!(22);
+            }
+            if intensity.bold {
+                write_param!(1);
+            }
+            if intensity.dim {
+                write_param!(2);
             }
         }
 
@@ -362,6 +375,14 @@ impl BufWrite for Attrs {
                 write_param!(9);
             } else {
                 write_param!(29);
+            }
+        }
+
+        if let Some(overline) = self.overline {
+            if overline {
+                write_param!(53);
+            } else {
+                write_param!(55);
             }
         }
 

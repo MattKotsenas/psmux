@@ -454,7 +454,7 @@ fn make_run(text: &str, width: u16) -> crate::layout::CellRunJson {
         width,
         link: None,
         ul: 0,
-        ulc: None,
+        ulc: None, ol: false,
     }
 }
 

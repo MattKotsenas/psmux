@@ -25,7 +25,7 @@ fn run(text: &str, fg: &str, bg: &str, flags: u8, width: u16) -> CellRunJson {
         width,
         link: None,
         ul: 0,
-        ulc: None,
+        ulc: None, ol: false,
     }
 }
 

@@ -29,10 +29,33 @@ pub fn ul_style_of(m: Modifier) -> u8 {
     ((m.bits() & UL_STYLE_MASK) >> UL_STYLE_SHIFT) as u8
 }
 
-/// Strips the smuggled bits so only modifiers ratatui itself defines remain.
+/// SGR 53 overline (tmux `GRID_ATTR_OVERLINE`), which ratatui has no modifier
+/// for either: smuggled in another unused bit the same way, and written by
+/// `draw_cells` as `CSI 53 m` / `CSI 55 m` (tmux writes `Smol`, `\E[53m`,
+/// tty.c:2757 and tty-features.c:143-150 at tag 3.8).
+pub const OVERLINE_BIT: u16 = 1 << 11;
+
+/// Whether a modifier carries the smuggled overline bit.
+#[must_use]
+pub fn overline_of(m: Modifier) -> bool {
+    m.bits() & OVERLINE_BIT != 0
+}
+
+/// Adds the overline to a style when `overline` is set.
+#[must_use]
+pub fn with_overline(style: Style, overline: bool) -> Style {
+    if overline {
+        style.add_modifier(Modifier::from_bits_retain(OVERLINE_BIT))
+    } else {
+        style
+    }
+}
+
+/// Strips every smuggled bit (the underline style and the overline) so only
+/// modifiers ratatui itself defines remain.
 #[must_use]
 pub fn strip_ul_style(m: Modifier) -> Modifier {
-    Modifier::from_bits_truncate(m.bits() & !UL_STYLE_MASK)
+    Modifier::from_bits_truncate(m.bits() & !(UL_STYLE_MASK | OVERLINE_BIT))
 }
 
 /// Adds the underline attributes for one cell to a style: the plain

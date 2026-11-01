@@ -90,6 +90,11 @@ pub struct Attrs {
     /// every existing caller of `underline()` keeps working.
     pub ul_style: UnderlineStyle,
     pub mode: u8,
+    /// SGR 53 overline, cleared by SGR 55 or SGR 0 (tmux
+    /// `GRID_ATTR_OVERLINE`, input.c:2497-2501 at tag 3.8).  `mode` has no
+    /// bit left; this takes padding `Attrs` already had, so a `Cell` stays the
+    /// same size.
+    pub overline: bool,
     /// OSC 8 hyperlink id (index into the screen's hyperlink store, +1).
     /// 0 means no hyperlink.  Part of Attrs so a link change is reflected in
     /// cell equality (forcing a redraw) and travels with the cell through all
@@ -108,22 +113,29 @@ impl Attrs {
         self.mode & TEXT_MODE_DIM != 0
     }
 
-    fn intensity(&self) -> u8 {
-        self.mode & TEXT_MODE_INTENSITY
-    }
-
+    /// SGR 1 adds bold and leaves dim as it is, and SGR 2 the other way
+    /// round: they are two bits, as in tmux (`GRID_ATTR_BRIGHT` and
+    /// `GRID_ATTR_DIM`, input.c:2420-2425 at tag 3.8) and in terminals, so
+    /// `CSI 1 ; 2 m` is bold and dim. Only SGR 22 clears both.
     pub fn set_bold(&mut self) {
-        self.mode &= !TEXT_MODE_INTENSITY;
         self.mode |= TEXT_MODE_BOLD;
     }
 
     pub fn set_dim(&mut self) {
-        self.mode &= !TEXT_MODE_INTENSITY;
         self.mode |= TEXT_MODE_DIM;
     }
 
+    /// SGR 22 (input.c:2450-2451): neither bold nor dim.
     pub fn set_normal_intensity(&mut self) {
         self.mode &= !TEXT_MODE_INTENSITY;
+    }
+
+    pub fn overline(&self) -> bool {
+        self.overline
+    }
+
+    pub fn set_overline(&mut self, overline: bool) {
+        self.overline = overline;
     }
 
     pub fn italic(&self) -> bool {
@@ -246,14 +258,18 @@ impl Attrs {
         } else {
             attrs.bgcolor(self.bgcolor)
         };
-        let attrs = if self.intensity() == other.intensity() {
+        // Bold and dim are two bits a terminal sets one by one, and only SGR
+        // 22 takes either away, both at once. So when one goes, 22 comes
+        // first and whatever is still on is set again; otherwise only what is
+        // new is set.
+        let attrs = if self.bold() == other.bold() && self.dim() == other.dim() {
             attrs
         } else {
-            attrs.intensity(match self.intensity() {
-                0 => crate::term::Intensity::Normal,
-                TEXT_MODE_BOLD => crate::term::Intensity::Bold,
-                TEXT_MODE_DIM => crate::term::Intensity::Dim,
-                _ => unreachable!(),
+            let reset = (other.bold() && !self.bold()) || (other.dim() && !self.dim());
+            attrs.intensity(crate::term::Intensity {
+                reset,
+                bold: self.bold() && (reset || !other.bold()),
+                dim: self.dim() && (reset || !other.dim()),
             })
         };
         let attrs = if self.italic() == other.italic() {
@@ -290,6 +306,11 @@ impl Attrs {
             attrs
         } else {
             attrs.strikethrough(self.strikethrough())
+        };
+        let attrs = if self.overline == other.overline {
+            attrs
+        } else {
+            attrs.overline(self.overline)
         };
 
         attrs.write_buf(contents);

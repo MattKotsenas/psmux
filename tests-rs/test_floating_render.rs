@@ -14,7 +14,7 @@ fn row_of(ch: char, n: usize) -> RowRunsJson {
     RowRunsJson {
         runs: (0..n).map(|_| CellRunJson {
             text: ch.to_string(), fg: String::new(), bg: String::new(),
-            flags: 0, width: 1, link: None, ul: 0, ulc: None,
+            flags: 0, width: 1, link: None, ul: 0, ulc: None, ol: false,
         }).collect(),
     }
 }

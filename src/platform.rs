@@ -7001,6 +7001,7 @@ where
     let mut underline_color = ratatui::style::Color::Reset;
     let mut modifier = Modifier::empty();
     let mut ul_style: u8 = 0;
+    let mut overline = false;
     let mut last_pos: Option<(u16, u16)> = None;
     for (x, y, cell) in content {
         if !matches!(last_pos, Some((px, py)) if x == px + 1 && y == py) {
@@ -7033,6 +7034,14 @@ where
                 _ => {}
             }
             ul_style = cell_ul;
+        }
+
+        // SGR 53 overline, from its smuggled bit (crate::rendering). The
+        // modifier diff never writes `0`, so it cannot have cleared it.
+        let cell_overline = crate::rendering::overline_of(cell.modifier);
+        if cell_overline != overline {
+            w.write_all(if cell_overline { b"\x1b[53m" } else { b"\x1b[55m" })?;
+            overline = cell_overline;
         }
 
         if cell.fg != fg {

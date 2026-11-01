@@ -339,4 +339,11 @@ impl Cell {
     pub fn strikethrough(&self) -> bool {
         self.attrs.strikethrough()
     }
+
+    /// Returns whether the cell should be rendered with an overline (SGR
+    /// 53).
+    #[must_use]
+    pub fn overline(&self) -> bool {
+        self.attrs.overline()
+    }
 }

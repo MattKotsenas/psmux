@@ -118,7 +118,7 @@ fn run(text: &str) -> CellRunJson {
         width: text.chars().count() as u16,
         link: None,
         ul: 0,
-        ulc: None,
+        ulc: None, ol: false,
     }
 }
 

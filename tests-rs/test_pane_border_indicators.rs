@@ -136,7 +136,7 @@ fn float_row(ch: char, width: usize) -> RowRunsJson {
                 width: 1,
                 link: None,
                 ul: 0,
-                ulc: None,
+                ulc: None, ol: false,
             })
             .collect(),
     }
