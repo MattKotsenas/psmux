@@ -49,6 +49,8 @@ Set-Content -Path $env:PSMUX_CONFIG_FILE -Value @(
     "bind -n F8 { set -g @f 1 ; set -g @g 1 }"
     "bind -n F3 set -g @z 1"
     "bind t set -g @t 1"
+    "bind -n F1 `"send-keys 'qa qb'`""
+    "bind -n F2 send-keys 'uc ud'"
 )
 $NS = "bqc_" + [guid]::NewGuid().ToString('N').Substring(0, 6)
 function P { & $PSMUX -L $NS @args 2>&1 }
@@ -107,6 +109,20 @@ try {
     Check "config unquoted (F3, prefix + t, as before)" "$(V '@z') $(V '@t')" "1 1"
     Check "CLI bind -n F9 'set -g @h 1 ; set -g @i 1' (F9, as before)" "$(V '@h') $(V '@i')" "1 1"
     Check "CLI bind -n F10 'set -g @j 1' (F10, as before)" (V '@j') "1"
+
+    Write-Host "`n[3] send-keys with a quoted argument, and the default bindings" -ForegroundColor Yellow
+    Check "list-keys -T root F1" ((P list-keys -T root F1) -join ' ').Trim() "bind-key -T root F1 send-keys 'qa qb'"
+    Check "list-keys -T root F2 (as before)" ((P list-keys -T root F2) -join ' ').Trim() "bind-key -T root F2 send-keys 'uc ud'"
+    & $INJ $client.Id "{F1}{SLEEP:400}{F2}{SLEEP:800}" | Out-Null
+    Start-Sleep -Milliseconds 800
+    $screen = (P capture-pane -p -t s) -join "`n"
+    if ($screen -match 'qa qb') { Write-Pass "config `"send-keys 'qa qb'`" (F1) typed qa qb" } else { Write-Fail "F1 did not type 'qa qb'" }
+    if ($screen -match 'uc ud') { Write-Pass "config send-keys 'uc ud' (F2, as before) typed uc ud" } else { Write-Fail "F2 did not type 'uc ud'" }
+    # Default prefix bindings still work: prefix + c makes a window, prefix + % splits it.
+    & $INJ $client.Id "^b{SLEEP:400}c{SLEEP:1500}^b{SLEEP:400}%{SLEEP:1500}" | Out-Null
+    Start-Sleep -Milliseconds 800
+    Check "default prefix + c (windows)" ((P display -p -t s '#{session_windows}') -join '') "2"
+    Check "default prefix + % (panes in the new window)" ((P display -p -t s '#{window_panes}') -join '') "2"
 }
 catch {
     if ("$_" -ne 'no injector') { Write-Fail "exception: $_" }

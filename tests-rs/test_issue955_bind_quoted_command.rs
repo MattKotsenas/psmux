@@ -40,6 +40,17 @@ fn a_quoted_list_is_its_commands() {
 fn a_quoted_command_is_that_command() {
     assert_eq!(bind_command_list("'set -g @c 1'"), v(&["set -g @c 1"]));
     assert_eq!(bind_command_list("\"select-pane -L\""), v(&["select-pane -L"]));
+    // tmux: `bind x "send-keys 'a b'"` binds send-keys with the one argument `a b`.
+    assert_eq!(bind_command_list("\"send-keys 'a b'\""), v(&["send-keys 'a b'"]));
+}
+
+#[test]
+fn a_quoted_send_keys_binding_keeps_its_argument() {
+    let mut app = app();
+    parse_config_content(&mut app, "bind -n F1 \"send-keys 'a b'\"\nbind -n F2 send-keys 'c d'\n");
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    assert_eq!(bound(&app, "root", "F1").unwrap(), "send-keys 'a b'");
+    assert_eq!(bound(&app, "root", "F2").unwrap(), "send-keys 'c d'");
 }
 
 #[test]
