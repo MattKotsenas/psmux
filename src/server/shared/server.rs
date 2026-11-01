@@ -668,7 +668,7 @@ fn switch_across(
     });
     let fail = |sessions: &mut BTreeMap<usize, Session>, msg: String| {
         if let Some(s) = sessions.get_mut(&sid) {
-            s.app.status_message = Some((format!("switch-client: {}", msg), Instant::now(), None));
+            s.app.status_message = Some((crate::server::helpers::status_line_error(&msg), Instant::now(), None));
             s.lp.state_dirty = true;
         }
         let _ = resp.send(format!("ERROR {}", msg));

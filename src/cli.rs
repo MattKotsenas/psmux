@@ -182,6 +182,12 @@ fn args_entry(command: &str) -> Option<&'static (&'static str, &'static str, &'s
         .find(|(name, alias, _)| *name == canonical || (!alias.is_empty() && *alias == canonical))
 }
 
+/// The full name of `command`, resolving aliases (`display` is
+/// `display-message`), as tmux's cmd_find gives entry->name.
+pub fn full_command_name(command: &str) -> Option<&'static str> {
+    args_entry(command).map(|(name, _, _)| *name)
+}
+
 /// The tmux `.args` template for `command`, resolving aliases.
 pub fn args_template(command: &str) -> Option<&'static str> {
     args_entry(command).map(|(_, _, template)| *template)

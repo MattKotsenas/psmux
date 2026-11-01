@@ -123,6 +123,62 @@ pub(crate) fn close_dead_key_pane(app: &mut AppState) -> bool {
     true
 }
 
+/// The status line text for one `ERROR` reply line of a command typed at the
+/// command prompt, or `None` for a line that is no error.
+///
+/// tmux's cmdq_error shows the error of a command whose client has a session
+/// on that client's status line with its first letter in upper case
+/// (cmd-queue.c:880-882 at tag 3.8). A command line that does not parse is
+/// worded `command NAME: ERROR` first (cmd.c:534), NAME the command's full
+/// name, for the errors args_parse gives (arguments.c:166-341); `command` is
+/// the name the command was typed with, for that.
+pub(crate) fn prompt_error_message(command: Option<&str>, reply: &str) -> Option<String> {
+    let rest = reply.trim_end().strip_prefix("ERROR")?;
+    let message = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    if message.is_empty() {
+        return None;
+    }
+    let parse_error = message.starts_with("unknown flag -")
+        || message.starts_with("invalid flag -")
+        || message.ends_with(" expects an argument")
+        || message.ends_with(" argument must be a string")
+        || message.starts_with("too few arguments")
+        || message.starts_with("too many arguments");
+    let message = match command.and_then(crate::cli::full_command_name) {
+        Some(name) if parse_error => format!("command {}: {}", name, message),
+        _ => message.to_string(),
+    };
+    Some(status_line_error(&message))
+}
+
+/// A command's error as the status line shows it: the first letter in upper
+/// case, as cmdq_error does (cmd-queue.c:881 at tag 3.8), so
+/// `can't find pane: %9` reads `Can't find pane: %9`.
+pub(crate) fn status_line_error(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The status line text for a popup of the command prompt's output that is
+/// an error and nothing else, or `None` for one with any other line.
+///
+/// On the persistent connection a command's output opens a popup, and its
+/// error opened one too; tmux shows the error on the status line instead
+/// (cmd-queue.c:880-882). Only a popup made of `ERROR` lines alone counts,
+/// so pane or buffer text that happens to start with `ERROR`
+/// (capture-pane, show-buffer) still opens as text. Of several error lines
+/// the last is shown, as each status_message_set replaces the one before.
+pub(crate) fn popup_prompt_error(content: &str) -> Option<String> {
+    let mut error = None;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        error = Some(prompt_error_message(None, line)?);
+    }
+    error
+}
+
 /// A key press closes the status message, as in tmux, unless that message was
 /// shown with `display-message -N` (status_message_set ignore_keys): then it
 /// stays until its delay expires.
@@ -155,6 +211,31 @@ pub(crate) fn append_default_key_table_json(table: &str, buf: &mut String) {
     buf.push_str(",\"default_key_table\":\"");
     buf.push_str(&json_escape_string(table));
     buf.push_str("\"}");
+}
+
+/// Whether the key table `table` exists, as tmux's key_bindings_get_table
+/// with create 0 finds it: root, prefix, copy-mode and copy-mode-vi always
+/// do, since tmux's default bindings fill them, and psmux keeps the copy
+/// mode keys outside `key_tables`; any other table exists while it has
+/// bindings, as does the session's own key-table.
+pub(crate) fn key_table_exists(app: &AppState, table: &str) -> bool {
+    matches!(table, "root" | "prefix" | "copy-mode" | "copy-mode-vi")
+        || table == default_key_table(app)
+        || app.key_tables.contains_key(table)
+}
+
+/// The `UnbindKey` request: unbind `key` from `table` (the prefix table when
+/// none), or tmux's "table %s doesn't exist" (cmd-unbind-key.c:89-96 at
+/// tag 3.8) when the table is none, leaving every table as it was.
+pub(crate) fn unbind_key_request(app: &mut AppState, key: &str, table: Option<String>) -> Result<(), String> {
+    let target = table.unwrap_or_else(|| "prefix".to_string());
+    if !key_table_exists(app, &target) {
+        return Err(format!("table {} doesn't exist", target));
+    }
+    if let Some(kc) = crate::config::parse_key_string(key) {
+        crate::config::unbind_key_in_table(app, &target, kc);
+    }
+    Ok(())
 }
 
 /// Resolve a `switch-client -T <table>` request against the live key tables.

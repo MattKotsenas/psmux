@@ -4997,7 +4997,15 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 }
                 cmd.push('\n');
                 match send_control_with_response(cmd) {
-                    Ok(resp) => { print!("{}", resp); }
+                    Ok(resp) => {
+                        // A table that is none: "table %s doesn't exist" at
+                        // exit 1 (cmd-list-keys.c:201 at tag 3.8).
+                        if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                            eprintln!("psmux: {}", msg.trim_end());
+                            std::process::exit(1);
+                        }
+                        print!("{}", resp);
+                    }
                     Err(_) => {
                         // No running server — emit built-in defaults filtered by -T and key.
                         // Real tmux supports this without a server for the prefix table.
@@ -5040,8 +5048,15 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
             "unbind-key" | "unbind" => {
                 reject_unknown_key_name(&cmd_args, "unbind-key");
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
-                match send_control(format!("{}\n", cmd_str)) {
-                    Ok(()) => {},
+                match send_control_with_response(format!("{}\n", cmd_str)) {
+                    // A table that is none: "table %s doesn't exist" at exit 1
+                    // (cmd-unbind-key.c:89-96 at tag 3.8).
+                    Ok(resp) => {
+                        if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                            eprintln!("psmux: {}", msg.trim_end());
+                            std::process::exit(1);
+                        }
+                    },
                     Err(e) if e.to_string().contains("no session") => {
                         eprintln!("warning: no active session; unbind-key will take effect when set inside a session or via config file");
                     },
@@ -5849,13 +5864,24 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 // `cmd1` and ran `cmd2` there and then. A lone `;` or `\;`
                 // argument is left as it was.
                 let cmd_str = crate::util::quoted_wire_line(&cmd_args);
-                send_control(format!("{}\n", cmd_str))?;
+                // A name that is no hook: "invalid option: NAME" at exit 1,
+                // as tmux's set-hook is set-option (cmd-set-option.c:269).
+                let resp = send_control_with_response(format!("{}\n", cmd_str))?;
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             // show-hooks - Show hooks
             "show-hooks" => {
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
                 let resp = send_control_with_response(format!("{}\n", cmd_str))?;
+                // A name that is no hook: "invalid option: NAME" at exit 1.
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
                 print!("{}", resp);
                 return Ok(());
             }

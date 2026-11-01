@@ -4332,7 +4332,10 @@ pub enum CtrlReq {
     /// show-options -p (issue #580): list a pane's scoped options.
     ShowPaneOptions(String, mpsc::Sender<String>),
     BindKey(String, String, String, bool, Option<String>),  // table, key, command, repeat, -N note
-    UnbindKey(String, Option<String>),  // key, optional table (None = prefix)
+    /// key, optional table (None = prefix), and a reply for the prompt and
+    /// the CLI: tmux's "table %s doesn't exist" for a table that is none
+    /// (cmd-unbind-key.c), Ok otherwise.
+    UnbindKey(String, Option<String>, Option<mpsc::Sender<Result<(), String>>>),
     UnbindAll,
     UnbindAllInTable(String),
     ListKeys(mpsc::Sender<String>),

@@ -1209,10 +1209,10 @@ fn drain_plugin_req(
         CtrlReq::UnbindAllInTable(table) => {
             crate::config::unbind_all_in_table(app, &table);
         }
-        CtrlReq::UnbindKey(key, table) => {
-            if let Some(kc) = parse_key_string(&key) {
-                let target = table.unwrap_or_else(|| "prefix".to_string());
-                crate::config::unbind_key_in_table(app, &target, kc);
+        CtrlReq::UnbindKey(key, table, resp) => {
+            let result = helpers::unbind_key_request(app, &key, table);
+            if let Some(resp) = resp {
+                let _ = resp.send(result);
             }
         }
         // Ignore other request types during plugin drain
@@ -4012,7 +4012,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let result = crate::commands::resolve_in_server_target(&app, kind, &spec);
                     if let Err(ref msg) = result {
                         // The status bar, as for ValidateTarget below.
-                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        app.status_message = Some((helpers::status_line_error(msg), Instant::now(), None));
                         state_dirty = true;
                     }
                     let _ = resp.send(result);
@@ -4025,7 +4025,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             // same convention as join-pane (#437) and
                             // kill-window (8edd1cb). The Err reply makes the
                             // connection thread skip the command.
-                            app.status_message = Some((msg.clone(), Instant::now(), None));
+                            app.status_message = Some((helpers::status_line_error(&msg), Instant::now(), None));
                             state_dirty = true;
                             let _ = resp.send(Err(msg));
                         }
@@ -6404,10 +6404,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         &app, table.as_deref(), all, key.as_deref(),
                     ));
                 }
-                CtrlReq::UnbindKey(key, table) => {
-                    if let Some(kc) = parse_key_string(&key) {
-                        let target = table.unwrap_or_else(|| "prefix".to_string());
-                        crate::config::unbind_key_in_table(&mut app, &target, kc);
+                CtrlReq::UnbindKey(key, table, resp) => {
+                    let result = helpers::unbind_key_request(&mut app, &key, table);
+                    if let Some(resp) = resp {
+                        let _ = resp.send(result);
                     }
                     meta_dirty = true;
                     state_dirty = true;
@@ -7955,7 +7955,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = resp_tx.send("OK".to_string());
                         }
                         Err(msg) => {
-                            app.status_message = Some((format!("switch-client: {}", msg), now, None));
+                            app.status_message = Some((helpers::status_line_error(&msg), now, None));
                             state_dirty = true;
                             let _ = resp_tx.send(format!("ERROR {}", msg));
                         }
@@ -8585,6 +8585,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             }
                             state_dirty = true;
                         }
+                    }
+                }
+                // A command typed at the prompt that failed: its error goes to
+                // the status line, as tmux's cmdq_error puts it there.
+                CtrlReq::ShowTextPopup(_, content) if helpers::popup_prompt_error(&content).is_some() => {
+                    if let Some(message) = helpers::popup_prompt_error(&content) {
+                        app.status_message = Some((message, std::time::Instant::now(), None));
+                        state_dirty = true;
                     }
                 }
                 CtrlReq::ShowTextPopup(title, content) => {

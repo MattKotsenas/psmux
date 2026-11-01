@@ -125,11 +125,39 @@ pub(crate) fn one_shot_new_session_reply(out: String, in_command_list: bool) -> 
 /// after a command fails. Every command error on this connection is written
 /// with `write!`/`writeln!` as an `ERROR...` line (pane text such as
 /// capture-pane's goes out with `write_all` and is not looked at).
-pub(crate) struct ReplyStream(TcpStream, bool);
+///
+/// The third field is set on a persistent connection, the one an attached
+/// client sends its command prompt over: there an error reply goes to the
+/// status line rather than the socket, where the client read it as a frame
+/// and dropped it. tmux's cmdq_error shows the error of a command whose
+/// client has a session on that client's status line (cmd-queue.c:880-882
+/// at tag 3.8).
+pub(crate) struct ReplyStream(TcpStream, bool, Option<PromptErrors>);
+
+/// Where a persistent connection's error replies go: the server loop, as a
+/// status message, worded for the command that is running.
+pub(crate) struct PromptErrors {
+    tx: mpsc::Sender<CtrlReq>,
+    command: String,
+}
 
 impl ReplyStream {
     fn new(stream: TcpStream) -> ReplyStream {
-        ReplyStream(stream, false)
+        ReplyStream(stream, false, None)
+    }
+
+    /// Send this connection's error replies to the status line from now on.
+    fn errors_to_status_line(&mut self, tx: mpsc::Sender<CtrlReq>) {
+        self.2 = Some(PromptErrors { tx, command: String::new() });
+    }
+
+    /// The command whose replies follow, for the `command NAME:` a parse
+    /// error is worded with (cmd.c:534).
+    fn running(&mut self, command: &str) {
+        if let Some(errors) = self.2.as_mut() {
+            errors.command.clear();
+            errors.command.push_str(command);
+        }
     }
 
     fn try_clone(&self) -> io::Result<ReplyStream> {
@@ -144,6 +172,15 @@ impl ReplyStream {
     fn send_reply(&mut self, text: &str) -> io::Result<()> {
         if is_error_reply(text) {
             self.1 = true;
+            if let Some(errors) = &self.2 {
+                for line in text.lines() {
+                    let message = crate::server::helpers::prompt_error_message(Some(&errors.command), line);
+                    if let Some(message) = message {
+                        let _ = errors.tx.send(CtrlReq::StatusMessage(message));
+                    }
+                }
+                return Ok(());
+            }
         }
         self.0.write_all(text.as_bytes())
     }
@@ -1088,6 +1125,41 @@ fn list_keys_notes_args(args: &[&str]) -> (Option<String>, bool, Option<String>)
 /// `new-window -d`; it used to keep the quotes on the control mode and raw
 /// TCP routes and the hook ran nothing. Several words are re-quoted so they
 /// parse back the same.
+/// Whether set-hook may take `name`: a tmux option name (hooks are options
+/// there), an `@` user option, or `after-` or `before-` and a command, the
+/// form of the hooks psmux fires that its tmux option list does not carry
+/// (`before-select-window`, `after-break-pane`, and tmux 3.8's
+/// `after-swap-window`, 5269e141).
+pub(crate) fn is_hook_name(name: &str) -> bool {
+    let base = name.split('[').next().unwrap_or(name);
+    crate::server::option_catalog::is_valid_option_name(name)
+        || ["after-", "before-"]
+            .iter()
+            .any(|prefix| base.strip_prefix(prefix).is_some_and(is_catalog_command))
+}
+
+/// The hook a `show-hooks` names, if any: the first operand, `-t`'s value
+/// skipped (show-hooks takes `gpt:w`, cmd-show-options.c).
+pub(crate) fn show_hooks_name<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return args.get(i + 1).copied();
+        }
+        if a == "-t" {
+            i += 2;
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
 pub(crate) fn set_hook_request(args: &[&str]) -> Option<CtrlReq> {
     let mut flag_chars = String::new();
     let mut non_flag: Vec<&str> = Vec::new();
@@ -2048,6 +2120,9 @@ if r.read_line(&mut line).is_err() {
 // Check if client requests persistent connection mode
 if line.trim() == "PERSISTENT" {
     persistent = true;
+    // A command that fails here was typed at the client's command prompt:
+    // its error belongs on the status line, not on this socket.
+    write_stream.errors_to_status_line(tx.clone());
     // Enable TCP_NODELAY for low-latency persistent connections
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
@@ -3130,6 +3205,7 @@ loop {
     crate::cli::canonicalize_target_values(&mut parsed);
     let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
     let (cmd, args): (&str, Vec<&str>) = (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect());
+    write_stream.running(cmd);
     // select-pane / last-pane read flags by exact token below (the -t scan,
     // the -l/-m/-T arms), so a clustered `-dt %2` lost its target and fenced
     // the ACTIVE pane.  Split clusters the way tmux's getopt reads them.
@@ -3382,8 +3458,10 @@ if is_focus_cmd {
     // up): `select-pane -t %99` answered nothing at all and did nothing. The
     // pane part is checked for existence only, so a floating pane still
     // passes and select_pane_requests keeps owning the selection.
+    // At the command prompt (a persistent connection) the same check gives
+    // the status line its "can't find pane" (cmd-queue.c:880-882).
     let has_target = target_win.is_some() || target_win_name.is_some() || target_pane.is_some();
-    if selectp_owns_target && !persistent && has_target {
+    if selectp_owns_target && has_target {
         let spec = crate::types::TempTarget {
             win: target_win,
             win_is_id: target_win_is_id,
@@ -3396,7 +3474,9 @@ if is_focus_cmd {
         if let Err(e) = validate_target(&tx, spec) {
             let _ = writeln!(write_stream, "ERROR: {}", e);
             let _ = write_stream.flush();
-            break;
+            if !persistent { break; }
+            line.clear();
+            continue;
         }
     }
     if selectp_owns_target {
@@ -3972,10 +4052,8 @@ match cmd {
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" | "send" => {
         if let Err(e) = send_keys_requests(&args, tx, client_id) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "select-pane" | "selectp" if sp_input_toggle => {
@@ -3990,10 +4068,8 @@ match cmd {
             resp: Some(resp_s),
         });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "select-pane" | "selectp" => {
@@ -4030,10 +4106,8 @@ match cmd {
             let (resp_s, resp_r) = mpsc::channel();
             let _ = tx.send(CtrlReq::LastPane { resp: resp_s });
             if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
             }
         } else if !dir.is_empty() {
             let keep_zoom = args.iter().any(|a| *a == "-Z");
@@ -4052,10 +4126,8 @@ match cmd {
         // "can't find window: N" at exit 1, not a silent no-op.
         if let Some(r) = resp_r {
             if let Ok(Err(e)) = r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
             }
         }
     }
@@ -4112,11 +4184,11 @@ match cmd {
                 resp: resp_s,
             });
             if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
-                // persistent clients see it in the status bar (set server-side)
+                // On a persistent connection this reply is the status line's
+                // message, over the one the server set for the attached
+                // client.
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
             }
         } else {
             let _ = tx.send(CtrlReq::KillWindow);
@@ -4160,6 +4232,12 @@ match cmd {
                     let self_name = line.split(':').next().unwrap_or("").trim();
                     if !self_name.is_empty() && self_name == tgt {
                         let _ = tx.send(CtrlReq::KillSession);
+                    } else {
+                        // tmux's "can't find session: %s" (cmd-find.c:1262 at
+                        // tag 3.8). The CLI says so before it sends
+                        // the command; the prompt and raw TCP did nothing.
+                        let _ = writeln!(write_stream, "ERROR: can't find session: {}", tgt);
+                        let _ = write_stream.flush();
                     }
                 }
             }
@@ -4227,10 +4305,8 @@ match cmd {
                 resp: resp_s,
             });
             if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
             }
         } else if let Some(tok) = raw_t.filter(|t| t.starts_with('{')) {
             // Layout position token like {top-right} — layout-independent.
@@ -4492,10 +4568,8 @@ match cmd {
         let (resp_s, resp_r) = mpsc::channel();
         let _ = tx.send(CtrlReq::LastWindow { resp: Some(resp_s) });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "last-pane" | "lastp" if last_pane_input_toggle(&args).is_some() => {
@@ -4510,10 +4584,8 @@ match cmd {
             resp: Some(resp_s),
         });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "last-pane" | "lastp" => {
@@ -4522,10 +4594,8 @@ match cmd {
         let (resp_s, resp_r) = mpsc::channel();
         let _ = tx.send(CtrlReq::LastPane { resp: resp_s });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "rotate-window" | "rotatew" => {
@@ -4549,10 +4619,8 @@ match cmd {
                 }
             }
             Ok(Err(e)) => {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
             }
             Err(_) => {}
         }
@@ -4600,10 +4668,8 @@ match cmd {
             size: crate::commands::join_size_arg(&args),
         });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "respawn-pane" | "respawnp" => {
@@ -4647,10 +4713,8 @@ match cmd {
         let env_sets = env_flag_values(&args);
         let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s, env_sets));
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     // ── Cross-session pane forwarding commands ──────────────────────
@@ -4936,7 +5000,19 @@ match cmd {
                 .map(|(_, a)| *a)
                 .next();
             if let Some(key) = key_arg {
-                let _ = tx.send(CtrlReq::UnbindKey(key.to_string(), table));
+                // A table that is none is "table %s doesn't exist", unless
+                // -q (cmd-unbind-key.c:89-96).
+                let quiet = args.iter().any(|a| {
+                    a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c.is_ascii_alphabetic()) && a.contains('q')
+                });
+                let (resp_s, resp_r) = mpsc::channel();
+                let _ = tx.send(CtrlReq::UnbindKey(key.to_string(), table, Some(resp_s)));
+                if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+                    if !quiet {
+                        let _ = writeln!(write_stream, "ERROR: {}", e);
+                        let _ = write_stream.flush();
+                    }
+                }
             }
         }
     }
@@ -4993,7 +5069,17 @@ match cmd {
             } else {
                 text
             };
-            if persistent {
+            // A table that has no binding is none, and tmux's list-keys -T
+            // refuses it: "table %s doesn't exist" (cmd-list-keys.c:201 at
+            // tag 3.8). root, prefix and the copy mode tables always exist
+            // there.
+            let missing_table = table_filter.as_deref().filter(|tbl| {
+                filtered.trim().is_empty() && !matches!(*tbl, "root" | "prefix" | "copy-mode" | "copy-mode-vi")
+            });
+            if let Some(tbl) = missing_table {
+                let _ = writeln!(write_stream, "ERROR: table {} doesn't exist", tbl);
+                let _ = write_stream.flush();
+            } else if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-keys".to_string(), filtered));
             } else {
                 let _ = write!(write_stream, "{}\n", filtered); let _ = write_stream.flush();
@@ -5634,10 +5720,8 @@ match cmd {
             resp: resp_s,
         });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "swap-window" | "swapw" => {
@@ -5666,18 +5750,14 @@ match cmd {
                     resp: resp_s,
                 });
                 if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                    if !persistent {
-                        let _ = writeln!(write_stream, "ERROR: {}", e);
-                        let _ = write_stream.flush();
-                    }
+                    let _ = writeln!(write_stream, "ERROR: {}", e);
+                    let _ = write_stream.flush();
                 }
             }
             None => {
                 // tmux requires -t; without one there is nothing to swap with.
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: can't find window: ");
-                    let _ = write_stream.flush();
-                }
+                let _ = writeln!(write_stream, "ERROR: can't find window: ");
+                let _ = write_stream.flush();
             }
         }
     }
@@ -5692,10 +5772,8 @@ match cmd {
             resp: resp_s,
         });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "unlink-window" | "unlinkw" => {
@@ -5703,10 +5781,8 @@ match cmd {
         let (resp_s, resp_r) = mpsc::channel();
         let _ = tx.send(CtrlReq::UnlinkWindowReq { target, resp: resp_s });
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "find-window" | "findw" => {
@@ -5843,10 +5919,8 @@ match cmd {
         // client is not one, so reject the flag instead of silently ignoring
         // it and letting the caller believe the size/subscription was applied.
         if let Some(flag) = args.iter().find(|a| matches!(**a, "-C" | "-B" | "-A" | "-f")) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: refresh-client {}: not a control client", flag);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: refresh-client {}: not a control client", flag);
+            let _ = write_stream.flush();
         } else if args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('l')) {
             // tmux refresh-client -l: ask the client's terminal for its
             // clipboard (OSC 52) and store the answer as a new paste buffer
@@ -5952,8 +6026,27 @@ match cmd {
         // delete the hook at rc 0; a dash-leading token after the hook name
         // is part of the hook command.
         if let Some(req) = set_hook_request(&args) {
-            let _ = tx.send(req);
+            // A hook is an option in tmux, so a name that is none is
+            // "invalid option: NAME" (cmd-set-option.c:269), and it used to
+            // be kept as a hook nothing fires.
+            let name = match &req {
+                CtrlReq::SetHook(name, _) | CtrlReq::AppendHook(name, _) | CtrlReq::RemoveHook(name) => name.as_str(),
+                _ => "",
+            };
+            if is_hook_name(name) {
+                let _ = tx.send(req);
+            } else {
+                let _ = writeln!(write_stream, "ERROR: invalid option: {}", name);
+                let _ = write_stream.flush();
+            }
         }
+    }
+    // A name that is no hook is "invalid option: NAME", as show-options
+    // gives for any option that is none (cmd-show-options.c).
+    "show-hooks" if show_hooks_name(&args).is_some_and(|name| !is_hook_name(name)) => {
+        let name = show_hooks_name(&args).unwrap_or_default();
+        let _ = writeln!(write_stream, "ERROR: invalid option: {}", name);
+        let _ = write_stream.flush();
     }
     "show-hooks" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -6808,10 +6901,8 @@ match cmd {
         let env_sets = env_flag_values(&args);
         let _ = tx.send(CtrlReq::RespawnWindow(workdir, command, resp_s, env_sets));
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
         }
     }
     "lock-server" | "lock-session" | "lock" | "locks" => {
@@ -6868,12 +6959,19 @@ match cmd {
         }
         if !persistent && pending_chain.is_empty() { break; }
     }
+    // The client sends this for a modified Enter that arrives without its
+    // press (client.rs), and no arm has read it. Named here so the unknown
+    // command error below does not report it on the status line.
+    "send-key-raw" => {}
     _ => {
         // A name no arm knows did nothing at all, silently, and the list
         // went on (`set @a 1 ; bogus ; set @b 2` set both at exit 0). tmux
         // refuses an unknown command ("unknown command: bogus") and runs
         // none of the list after it; the reply's ERROR ends the list here.
-        if !persistent && in_command_list && !is_catalog_command(cmd) {
+        // A persistent connection reports it as well: there it was typed at
+        // the command prompt, and the error goes to the status line, as
+        // cmd_find's "unknown command: %s" does in tmux (cmd.c:489).
+        if (persistent || in_command_list) && !is_catalog_command(cmd) {
             let _ = writeln!(write_stream, "ERROR: unknown command: {}", cmd);
             let _ = write_stream.flush();
         }
@@ -8110,7 +8208,7 @@ fn dispatch_control_command(
                     .map(|(_, a)| *a)
                     .next();
                 if let Some(key) = key_arg {
-                    let _ = tx.send(CtrlReq::UnbindKey(key.to_string(), table));
+                    let _ = tx.send(CtrlReq::UnbindKey(key.to_string(), table, None));
                 }
             }
             let _ = resp_tx.send(String::new());
