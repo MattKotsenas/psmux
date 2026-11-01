@@ -88,8 +88,9 @@ P set -g 'status-format[2]' ' spaced value ' | Out-Null
 Check "show status-format[2] keeps its spaces" ((P show -g 'status-format[2]') -join ' | ') 'status-format[2] " spaced value "'
 P set -gu status-format | Out-Null
 Check "show after -gu" (Show) "status-format"
-$out = P set -g 'status-format[x]' Y
-if ($LASTEXITCODE -ne 0 -and "$out" -match 'invalid option') { Write-Pass "status-format[x] is refused: $out" } else { Write-Fail "status-format[x] rc=$LASTEXITCODE '$out'" }
+# An empty key is refused; a name is a key, as in tmux 3.8 (#957).
+$out = P set -g 'status-format[]' Y
+if ($LASTEXITCODE -ne 0 -and "$out" -match 'invalid option') { Write-Pass "status-format[] is refused: $out" } else { Write-Fail "status-format[] rc=$LASTEXITCODE '$out'" }
 
 # -- 2. what each frame carries --
 Write-Host "`n--- 2. only the shown lines are expanded and sent ---" -ForegroundColor Yellow

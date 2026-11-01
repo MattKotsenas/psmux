@@ -315,3 +315,7 @@ impl OptionArray {
 #[cfg(test)]
 #[path = "../tests-rs/test_option_array.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_array_named_keys.rs"]
+mod tests_named_keys;

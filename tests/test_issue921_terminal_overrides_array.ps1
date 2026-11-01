@@ -76,11 +76,11 @@ try {
     Check "show -s terminal-overrides[10]" ((P show -s 'terminal-overrides[10]') -join ' | ') 'terminal-overrides[10] e:smcup@:rmcup@'
 
     Write-Host "`n[8] a bad index is refused and stores nothing" -ForegroundColor Yellow
-    $out = (P set -s 'terminal-overrides[x]' 'z') -join ' | '
+    # An empty key. tmux fails too (rc=1); its message is `ambiguous option`,
+    # psmux says `invalid option`. A name is a key, as in tmux 3.8 (#957).
+    $out = (P set -s 'terminal-overrides[]' 'z') -join ' | '
     $rc = $LASTEXITCODE
-    # tmux 3.7c fails too (rc=1); its message is `ambiguous option`, psmux says
-    # `invalid option` as it does for command-alias[x].
-    if ($rc -ne 0 -and $out -match 'invalid option: terminal-overrides\[x\]') { Write-Pass "set terminal-overrides[x] fails: rc=$rc '$out'" } else { Write-Fail "set terminal-overrides[x] rc=$rc '$out'" }
+    if ($rc -ne 0 -and $out -match 'invalid option: terminal-overrides\[\]') { Write-Pass "set terminal-overrides[] fails: rc=$rc '$out'" } else { Write-Fail "set terminal-overrides[] rc=$rc '$out'" }
     Check "show after the bad index" (Show) 'terminal-overrides[0] f:Tc | terminal-overrides[1] b:rmcup@ | terminal-overrides[2] c:Tc | terminal-overrides[3] d:Tc | terminal-overrides[10] e:smcup@:rmcup@'
 
     Write-Host "`n[9] -u puts tmux's default back" -ForegroundColor Yellow

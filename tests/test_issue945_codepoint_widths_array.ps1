@@ -147,13 +147,11 @@ try {
     Check "show" (Show) 'codepoint-widths[0] U+2502=2'
 
     Write-Host "`n[11] a bad index is refused and stores nothing" -ForegroundColor Yellow
-    # As for every array since #921, after tmux 3.7c. tmux 3.8 also keys an
-    # element by a name (options.c:62-76, options_array_correct_key) and
-    # keeps `codepoint-widths[x]`; that applies to every array and is left to
-    # a change of its own.
-    $out = (P set -s 'codepoint-widths[x]' 'U+2603=2') -join ' | '
+    # An empty key, as for every array since #921. A name is a key, as in
+    # tmux 3.8 (options.c:41-76, options_array_correct_key; #957).
+    $out = (P set -s 'codepoint-widths[]' 'U+2603=2') -join ' | '
     $rc = $LASTEXITCODE
-    if ($rc -ne 0 -and $out -match 'invalid option: codepoint-widths\[x\]') { Write-Pass "set codepoint-widths[x] fails: rc=$rc '$out'" } else { Write-Fail "set codepoint-widths[x] rc=$rc '$out'" }
+    if ($rc -ne 0 -and $out -match 'invalid option: codepoint-widths\[\]') { Write-Pass "set codepoint-widths[] fails: rc=$rc '$out'" } else { Write-Fail "set codepoint-widths[] rc=$rc '$out'" }
     Check "show after the bad index" (Show) 'codepoint-widths[0] U+2502=2'
 
     Write-Host "`n[12] a config file uses tmux's spelling" -ForegroundColor Yellow
