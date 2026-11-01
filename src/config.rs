@@ -835,11 +835,36 @@ fn whole_block_inner(text: &str) -> Option<&str> {
 /// tmux's block form `bind x { a; b }` (one line, or several lines joined by
 /// `join_brace_blocks`) all give `[a, b]`. Nested blocks stay inside their
 /// command (`if -F c { a } { b }` is one command).
+///
+/// A command given as one quoted argument is parsed again as a command
+/// string, as tmux's bind-key does with the key and exactly one more argument
+/// (cmd-bind-key.c:91-92 at tag 3.8, cmd_parse_from_string): its `;`
+/// separates commands and its quotes are its commands' own, so
+/// `'rename-window "x y"'` gives `[rename-window "x y"]` (#955). Split as it
+/// was, the quoted text stayed one command named by all of it, and the key
+/// ran nothing.
 pub fn bind_command_list(command: &str) -> Vec<String> {
-    match whole_block_inner(command) {
-        Some(inner) => split_chained_commands(inner),
+    if let Some(inner) = whole_block_inner(command) {
+        return split_chained_commands(inner);
+    }
+    match lone_quoted_argument(command) {
+        Some(text) => split_chained_commands(&text),
         None => split_chained_commands(command),
     }
+}
+
+/// The text of `command` when all of it is one quoted argument (`'a ; b'`,
+/// `"a b"`), quotes removed as the command parser removes them.
+fn lone_quoted_argument(command: &str) -> Option<String> {
+    let t = command.trim();
+    if !(t.starts_with('\'') || t.starts_with('"')) {
+        return None;
+    }
+    let mut words = crate::commands::parse_command_line(t);
+    if words.len() != 1 {
+        return None;
+    }
+    words.pop()
 }
 
 /// [`bind_command_list`] with each command's `command-alias` expanded. tmux

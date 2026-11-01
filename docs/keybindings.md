@@ -763,6 +763,15 @@ bind -n F9 {
 
 `list-keys` prints the block as its command list (`set -g @a 1 \; set -g @b 2`).
 
+A command given as one quoted argument is read as a command string, as in tmux: its `;` separates
+commands and the quotes inside it are its commands' own. The first line below binds the same list as
+the block above, and the second names the window `x y`:
+
+```
+bind -n F8 'set -g @a 1; set -g @b 2'
+bind r 'rename-window "x y"'
+```
+
 ### Extended keys from the host terminal
 
 A host terminal that reports modified keys in the `CSI u` form (Windows Terminal with
