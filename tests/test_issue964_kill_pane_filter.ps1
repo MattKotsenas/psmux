@@ -124,7 +124,8 @@ try {
     $ctl = if ($outTask.Wait(2000)) { $outTask.Result } else { '' }
     $left = (Ids 'k1:0') -join ' '
     Check ($left -eq "$($ids[0]) $($ids[2])") "control mode kill-pane -f 1 kills nothing, -a -f kills only $($ids[1])" "(left $left)"
-    Check ($ctl -match '%error[^\n]*\r?\n-f only valid with -a') 'control mode reports -f only valid with -a' "(output: $(($ctl -split "`n" | Select-String 'error|valid') -join ' | '))"
+    # tmux prints the message between %begin and %error.
+    Check ($ctl -match '%begin[^\n]*\r?\n-f only valid with -a\r?\n%error') 'control mode reports -f only valid with -a' "(output: $(($ctl -split "`n" | Select-String 'error|valid') -join ' | '))"
     Done k1
 
     Write-Output "== hook (in server route)"
@@ -138,7 +139,8 @@ try {
     Check ($left.Count -eq 3 -and $ids[1] -notin $left -and $ids[0] -in $left -and $ids[2] -in $left) "hook kill-pane -a -f kills only $($ids[1])" "(left $($left -join ' '))"
     P set-hook -u -t h1 after-split-window | Out-Null
     P set-hook -t h1 after-split-window 'kill-pane -f 1' | Out-Null
-    P split-window -d -t "h1:0.0" | Out-Null
+    # -h: the top pane is too short for another vertical split.
+    P split-window -d -h -t "h1:0.0" | Out-Null
     Start-Sleep -Milliseconds 1200
     Check ((Ids 'h1:0').Count -eq 4) 'hook kill-pane -f without -a kills nothing' "($(Panes 'h1:0'))"
     Done h1
