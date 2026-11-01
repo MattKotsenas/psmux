@@ -517,3 +517,83 @@ fn unzoom_alone_resizes_the_ptys() {
     assert!(app.windows[1].zoom_saved.is_none());
     assert!(pane_cols(&app, 1, 4) < 100, "%4 is back to its share of the window");
 }
+
+// kill-pane -f (cmd-kill-pane.c:56 and :96-115). -a was read but -f was
+// dropped, so `-a -f <filter>` killed every other pane and a bare `-f` killed
+// the current pane. With -a the filter picks which other panes go; without -a
+// it is the error "-f only valid with -a" and nothing is killed.
+
+#[test]
+fn f_is_read_by_the_getopt_walk() {
+    assert_eq!(own_flag_value("kill-pane", &["-a", "-f", "x"], 'f'), Some("x"));
+    assert_eq!(own_flag_value("kill-pane", &["-af", "x"], 'f'), Some("x"));
+    assert_eq!(own_flag_value("kill-pane", &["-fx", "-a"], 'f'), Some("x"));
+    assert_eq!(own_flag_value("kill-pane", &["-t", "-f", "-a"], 'f'), None, "-f as the value of -t is not the flag");
+    assert_eq!(own_flag_value("kill-pane", &["--", "-f", "x"], 'f'), None);
+    assert!(!own_flag_set("kill-pane", &["-f", "-a"], 'a'), "-a as the value of -f is not the flag");
+}
+
+#[test]
+fn a_with_a_filter_kills_only_the_matching_panes() {
+    let mut app = two_windows();
+    execute_command_string(&mut app, "kill-pane -a -f '#{==:#{pane_id},%3}'").unwrap();
+    assert_eq!(ids(&app, 0), vec![1, 2], "only %3 matched the filter");
+    assert_eq!(active(&app, 0), Some(2));
+    assert_eq!(ids(&app, 1), vec![4, 5]);
+}
+
+#[test]
+fn a_with_a_false_filter_kills_nothing() {
+    let mut app = two_windows();
+    execute_command_string(&mut app, "kill-pane -a -f 0").unwrap();
+    assert_eq!(ids(&app, 0), vec![1, 2, 3]);
+    assert!(app.status_message.is_none(), "{:?}", app.status_message);
+}
+
+#[test]
+fn a_spared_active_pane_stays_active() {
+    // Keep %1, the filter takes %3 only: %2 was active and stays active, as
+    // tmux moves the active pane only when it removes it.
+    let mut app = two_windows();
+    execute_command_string(&mut app, "kill-pane -a -t %1 -f '#{==:#{pane_id},%3}'").unwrap();
+    assert_eq!(ids(&app, 0), vec![1, 2]);
+    assert_eq!(active(&app, 0), Some(2));
+}
+
+#[test]
+fn a_filter_spares_a_focused_float() {
+    let mut app = two_windows();
+    app.windows[0].floating = vec![make_float(8), make_float(9)];
+    app.windows[0].floating_focus = Some(1);
+    let spare = crate::pane::kill_pane_filter_spares(&app, 0, 2, Some("#{==:#{pane_id},%8}"));
+    assert_eq!(spare, vec![1, 3, 9]);
+    assert_eq!(crate::pane::kill_panes_except_sparing(&mut app, 0, 2, &spare), 1);
+    let floats: Vec<usize> = app.windows[0].floating.iter().map(|f| f.id).collect();
+    assert_eq!(floats, vec![9]);
+    assert_eq!(app.windows[0].floating_focus, Some(0), "%9 keeps the focus");
+    assert_eq!(ids(&app, 0), vec![1, 2, 3]);
+}
+
+#[test]
+fn f_without_a_is_an_error_and_kills_nothing() {
+    let mut app = two_windows();
+    execute_command_string(&mut app, "kill-pane -f 1").unwrap();
+    assert_eq!(ids(&app, 0), vec![1, 2, 3], "nothing is killed");
+    assert!(app.status_message.as_ref().is_some_and(|(m, ..)| m == "-f only valid with -a"), "{:?}", app.status_message);
+}
+
+#[test]
+fn command_prompt_a_with_a_filter() {
+    let mut app = two_windows();
+    app.mode = Mode::CommandPrompt { input: "kill-pane -a -f '#{==:#{pane_id},%1}'".to_string(), cursor: 0 };
+    execute_command_prompt(&mut app).unwrap();
+    assert_eq!(ids(&app, 0), vec![2, 3]);
+}
+
+#[test]
+fn command_prompt_f_without_a_kills_nothing() {
+    let mut app = two_windows();
+    app.mode = Mode::CommandPrompt { input: "kill-pane -f 1".to_string(), cursor: 0 };
+    execute_command_prompt(&mut app).unwrap();
+    assert_eq!(ids(&app, 0), vec![1, 2, 3]);
+}
