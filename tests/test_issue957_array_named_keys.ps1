@@ -114,6 +114,16 @@ try {
     # tmux lists its three default formats before it; psmux's default is
     # empty (#947).
     Check "show -g status-format" (Out show -g status-format) 'status-format[x] NAMED'
+
+    Write-Host "`n[5] The CLI runs an alias whose key has a space or a quote" -ForegroundColor Yellow
+    # `psmux NAME` reads the table back from `show -s command-alias`, where
+    # tmux prints the key as it is (cmd-show-options.c:172).
+    P set -s 'command-alias[a b]' 'ab=display -p AB' | Out-Null
+    P set -s 'command-alias[q"t]' 'qt=display -p QT' | Out-Null
+    P set -s "command-alias[s'q]" 'sq=display -p SQ' | Out-Null
+    Check "ab (key 'a b')" (Out ab) "AB"
+    Check "qt (key 'q`"t')" (Out qt) "QT"
+    Check "sq (key `"s'q`")" (Out sq) "SQ"
 }
 finally {
     P kill-server | Out-Null

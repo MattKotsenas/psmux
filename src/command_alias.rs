@@ -166,11 +166,22 @@ pub fn write(shared: &SharedAliases) -> std::sync::RwLockWriteGuard<'_, CommandA
 pub fn from_show_output(text: &str) -> CommandAliases {
     let mut aliases = CommandAliases::default();
     for line in text.lines() {
-        let words = crate::commands::parse_command_line(line);
-        if let [name, value] = words.as_slice() {
-            if name != OPTION && is_alias_option(name) {
-                let _ = aliases.set(name, value, false);
-            }
+        // `show` prints a named key as it is, spaces and quotes included
+        // (cmd-show-options.c:172, `%s[%s]`), so the name is cut at the first
+        // `]`, where options_parse ends the key, and only the value is split
+        // into words. Splitting the whole line lost `command-alias[a b]`.
+        let Some(rest) = line.strip_prefix(OPTION).filter(|rest| rest.starts_with('[')) else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let name = &line[..OPTION.len() + close + 1];
+        let Some(value) = rest[close + 1..].strip_prefix(' ') else {
+            continue;
+        };
+        if let [value] = crate::commands::parse_command_line(value).as_slice() {
+            let _ = aliases.set(name, value, false);
         }
     }
     aliases
@@ -179,3 +190,7 @@ pub fn from_show_output(text: &str) -> CommandAliases {
 #[cfg(test)]
 #[path = "../tests-rs/test_command_alias.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue957_alias_show_roundtrip.rs"]
+mod tests_issue957;
