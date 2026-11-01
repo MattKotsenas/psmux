@@ -4727,6 +4727,10 @@ mod test_ctrl_wheel_zoom_option;
 mod test_bind_brace_blocks;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue955_bind_quoted_command.rs"]
+mod test_issue955_bind_quoted_command;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_source_file_key_tables.rs"]
 mod test_source_file_key_tables;
 
