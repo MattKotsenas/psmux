@@ -101,6 +101,10 @@ path = "tests/query_detector.rs"
 name = "issue919_input_buffer_size"
 path = "tests/issue919_input_buffer_size.rs"
 
+[[test]]
+name = "issue962_sgr_bold_dim_overline"
+path = "tests/issue962_sgr_bold_dim_overline.rs"
+
 [dependencies.itoa]
 version = "1.0.18"
 

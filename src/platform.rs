@@ -7486,6 +7486,10 @@ mod tests_issue726_hidden_cursor_ime_park;
 mod tests_issue589_undercurl;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_sgr_bold_dim_overline.rs"]
+mod tests_sgr_bold_dim_overline;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_no_color_client.rs"]
 mod tests_no_color_client;
 
