@@ -5045,6 +5045,9 @@ match cmd {
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::ListKeys(rtx));
         if let Ok(text) = rrx.recv() {
+            let table_has_bindings = table_filter.as_deref().is_some_and(|tbl| {
+                text.lines().any(|line| list_keys_line_table_key(line).0 == Some(tbl))
+            });
             let filtered = if table_filter.is_some() || key_filter.is_some() {
                 text.lines().filter(|line| {
                     // list-keys output format: "bind-key [-r] -T <table> <key> <command>".
@@ -5073,11 +5076,17 @@ match cmd {
             // refuses it: "table %s doesn't exist" (cmd-list-keys.c:201 at
             // tag 3.8). root, prefix and the copy mode tables always exist
             // there.
+            // A table that has bindings exists even when the key filter
+            // leaves none of them: that is "unknown key: %s"
+            // (cmd-list-keys.c:226-227), not a missing table.
             let missing_table = table_filter.as_deref().filter(|tbl| {
                 filtered.trim().is_empty() && !matches!(*tbl, "root" | "prefix" | "copy-mode" | "copy-mode-vi")
             });
             if let Some(tbl) = missing_table {
-                let _ = writeln!(write_stream, "ERROR: table {} doesn't exist", tbl);
+                match key_filter.as_deref().filter(|_| table_has_bindings) {
+                    Some(key) => { let _ = writeln!(write_stream, "ERROR: unknown key: {}", key); }
+                    None => { let _ = writeln!(write_stream, "ERROR: table {} doesn't exist", tbl); }
+                }
                 let _ = write_stream.flush();
             } else if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-keys".to_string(), filtered));
