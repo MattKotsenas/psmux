@@ -191,9 +191,12 @@ else { Write-Fail "Filter leaked: $nonPrefix non-prefix lines out of $prefixCoun
 
 # 4c: Nonexistent table returns empty
 Write-Host "[4c] CLI: list-keys -T nonexistent" -ForegroundColor Yellow
+# tmux refuses a table that does not exist (cmd-list-keys.c:201): "table
+# nonexistent doesn't exist", exit 1 (#951).
 $noTable = (& $PSMUX list-keys -T nonexistent -t $SESSION 2>&1 | Out-String).Trim()
-if ($noTable -eq "" -or $noTable.Length -le 1) { Write-Pass "Nonexistent table returns empty" }
-else { Write-Fail "Expected empty for bogus table, got: $noTable" }
+$noTableRc = $LASTEXITCODE
+if ($noTableRc -eq 1 -and $noTable -match "table nonexistent doesn't exist") { Write-Pass "Nonexistent table is an error: exit 1, table nonexistent doesn't exist" }
+else { Write-Fail "Expected exit 1 and table nonexistent doesn't exist for a bogus table, got exit ${noTableRc}: $noTable" }
 
 # 4d: TCP path
 Write-Host "[4d] TCP: list-keys -T prefix" -ForegroundColor Yellow
