@@ -53,7 +53,7 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | `has-session` | `has` | `t:` | CLI, SRV, CFG, CTL |
 | `if-shell` | `if` | `bFt:` | CLI, SRV, CFG |
 | `join-pane` | `joinp` | `dhvs:t:` | CLI, SRV, CFG |
-| `kill-pane` | `killp` | `at:` | CLI, SRV, CFG, CTL |
+| `kill-pane` | `killp` | `af:t:` | CLI, SRV, CFG, CTL |
 | `kill-server` | *(none)* | `a` (psmux extension) | CLI, SRV, CFG, CTL |
 | `kill-session` | `kill-ses` | `t:` | CLI, SRV, CFG |
 | `kill-window` | `killw` | `at:` | CLI, SRV, CFG, CTL |
@@ -310,8 +310,8 @@ A psmux extension that creates a pane floating above the tiled layout.
 
 **kill-pane** (`killp`)
 - Boolean: `-a` keeps the target pane and kills every other pane of its window (cmd-kill-pane.c:72-93). The window is unzoomed first, a one-pane window is left alone, and with no `-t` the target is the current pane. Floating panes count as panes of the window: a tiled target closes all of them, and a floating target closes the other floats but leaves the tiled panes, since the tiled layout cannot be emptied. Clusters such as `-at %4` are split. Before #964, `-a` was ignored and the target itself was killed.
+- Value: `-f <filter>` with `-a`: only the other panes the format expands true for are killed (cmd-kill-pane.c:96-115); without `-a` it is the error `-f only valid with -a` and nothing is killed (cmd-kill-pane.c:56). Before this, `-f` was dropped: `-a -f` killed every other pane and a bare `-f` killed the current pane.
 - Value: `-t` (target pane, via the global `-t` handler)
-- Not accepted: `-f`
 
 **resize-pane** (`resizep`)
 - Boolean: `-U`, `-D`, `-L`, `-R` (directional), `-Z` (toggle zoom)

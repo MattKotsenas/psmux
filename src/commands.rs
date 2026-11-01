@@ -1841,8 +1841,9 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
             }
         }
         // -a: cmd-kill-pane.c:61 (#964). The in server route reads the -t
-        // and a focused float.
-        "kill-pane" | "killp" if own_flag_set(parts[0], &parts[1..], 'a') => {
+        // and a focused float. -f filters -a and is an error without it.
+        "kill-pane" | "killp" if own_flag_set(parts[0], &parts[1..], 'a')
+            || own_flag_value(parts[0], &parts[1..], 'f').is_some() => {
             execute_command_string(app, &cmdline)?;
         }
         "kill-pane" | "killp" => { kill_active_pane(app)?; }
@@ -2641,6 +2642,34 @@ pub(crate) fn own_flag_set(command: &str, args: &[&str], wanted: char) -> bool {
     false
 }
 
+/// The value of the command's own value flag `wanted` (for example
+/// `kill-pane -f`), read with the same getopt walk as [`own_target_flag`]:
+/// the rest of its word or the next word, never after `--` or an operand.
+pub(crate) fn own_flag_value<'a>(command: &str, args: &[&'a str], wanted: char) -> Option<&'a str> {
+    let mut i = 0;
+    while i < args.len() {
+        let rest = args[i].strip_prefix('-').filter(|r| !r.is_empty() && *r != "-")?;
+        for (at, flag) in rest.char_indices() {
+            if flag == wanted || flag == 't' || crate::cli::flag_takes_value(command, flag) {
+                let end = at + flag.len_utf8();
+                if flag == wanted {
+                    return if end == rest.len() { args.get(i + 1).copied() } else { Some(&args[i][1 + end..]) };
+                }
+                if end == rest.len() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// tmux cmd-kill-pane.c:56: `-f` filters the panes `-a` kills and is an
+/// error without it.
+pub(crate) const KILL_PANE_F_WITHOUT_A: &str = "-f only valid with -a";
+
 /// Run a line whose `-t` names ANOTHER session on that session's server, and
 /// report a session that does not exist (#938, owner ruling 2026-10-31).
 ///
@@ -2757,7 +2786,7 @@ pub(crate) fn kill_windows_except(app: &mut AppState, keep: usize) -> usize {
 /// `kill-pane -a [-t target]` on the in server route (#964). No target is the
 /// current pane, a focused float included; a target naming nothing is tmux's
 /// error and nothing is killed.
-fn kill_pane_all_here(app: &mut AppState, target: Option<&str>) {
+fn kill_pane_all_here(app: &mut AppState, target: Option<&str>, filter: Option<&str>) {
     if app.windows.is_empty() {
         return;
     }
@@ -2805,12 +2834,14 @@ fn kill_pane_all_here(app: &mut AppState, target: Option<&str>) {
                 let keep_tiled = crate::tree::find_path_by_id(&win.root, keep).is_some();
                 // The focus moved to `keep` for the command; the window's own
                 // active pane is the one it had before.
-                let was_active = if win_id == target_win { target_win_active == Some(keep) }
-                    else { crate::server::temp_target::is_real_active_pane(app, &saved, wi, keep) };
-                let killed_active = keep_tiled && !was_active;
+                let was_active = |id: usize| if win_id == target_win { target_win_active == Some(id) }
+                    else { crate::server::temp_target::is_real_active_pane(app, &saved, wi, id) };
+                // -f spares the panes it expands false for (cmd_kill_pane_filter).
+                let spare = crate::pane::kill_pane_filter_spares(app, wi, keep, filter);
+                let killed_active = keep_tiled && !was_active(keep) && !spare.iter().any(|&id| was_active(id));
                 // An unzoom alone changes the window flags too.
                 let unzoomed = win.zoom_saved.is_some();
-                let killed = crate::pane::kill_panes_except(app, wi, keep);
+                let killed = crate::pane::kill_panes_except_sparing(app, wi, keep, &spare);
                 crate::control::emit_panes_closed(app, win_id, killed_active, killed + unzoomed as usize);
                 if hooks {
                     fire_kill_pane_hook(app, "after-kill-pane");
@@ -2917,9 +2948,17 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
     // target was put back. It reads its own -t, before the rewrite below,
     // which knows the tiled panes only. Its hooks fire here, and not inside
     // a hook's own commands (tmux CMDQ_STATE_NOHOOKS).
-    if matches!(parts[0], "kill-pane" | "killp") && own_flag_set(parts[0], &parts[1..], 'a') {
-        kill_pane_all_here(app, own_target_flag(parts[0], &parts[1..]));
-        return Ok(());
+    if matches!(parts[0], "kill-pane" | "killp") {
+        let filter = own_flag_value(parts[0], &parts[1..], 'f');
+        if own_flag_set(parts[0], &parts[1..], 'a') {
+            kill_pane_all_here(app, own_target_flag(parts[0], &parts[1..]), filter);
+            return Ok(());
+        }
+        if filter.is_some() {
+            // cmd-kill-pane.c:56: an error, and nothing is killed.
+            app.status_message = Some((KILL_PANE_F_WITHOUT_A.to_string(), Instant::now(), None));
+            return Ok(());
+        }
     }
 
     // A bare `-t` name of a window or pane command on this route (hooks,

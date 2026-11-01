@@ -3605,8 +3605,18 @@ match cmd {
         // -a kills the target window's other panes (cmd-kill-pane.c:61, #964);
         // its target, an id too, is already the temporary focus. -a is read
         // where getopt reads it, never after `--` or an operand.
+        let filter = crate::commands::own_flag_value(cmd, &args, 'f').map(str::to_string);
         if crate::commands::own_flag_set(cmd, &args, 'a') {
-            let _ = tx.send(CtrlReq::KillPanesExcept { pane: None });
+            let _ = tx.send(CtrlReq::KillPanesExcept { pane: None, filter });
+        } else if filter.is_some() {
+            // cmd-kill-pane.c:56: an error, and nothing is killed.
+            let msg = crate::commands::KILL_PANE_F_WITHOUT_A;
+            if persistent {
+                let _ = tx.send(CtrlReq::ShowTextPopup("kill-pane".to_string(), format!("ERROR: {}", msg)));
+            } else {
+                let _ = write!(write_stream, "ERROR: {}\n", msg);
+                let _ = write_stream.flush();
+            }
         } else if let Some(pid) = targeted_kill_pane_id {
             let _ = tx.send(CtrlReq::KillPaneById(pid));
         } else {
@@ -7272,10 +7282,15 @@ fn dispatch_control_command(
             true
         }
         "kill-pane" | "killp" => {
+            let filter = crate::commands::own_flag_value(cmd, args, 'f').map(str::to_string);
             if crate::commands::own_flag_set(cmd, args, 'a') {
                 // cmd-kill-pane.c:61 (#964), as in the one-shot route.
                 let pane = if pane_is_id { target_pane } else { None };
-                let _ = tx.send(CtrlReq::KillPanesExcept { pane });
+                let _ = tx.send(CtrlReq::KillPanesExcept { pane, filter });
+            } else if filter.is_some() {
+                // cmd-kill-pane.c:56: an error, and nothing is killed.
+                let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", crate::commands::KILL_PANE_F_WITHOUT_A));
+                return true;
             } else if pane_is_id {
                 if let Some(pid) = target_pane {
                     let _ = tx.send(CtrlReq::KillPaneById(pid));

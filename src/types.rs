@@ -3892,7 +3892,8 @@ pub enum CtrlReq {
     /// the target (tmux cmd-kill-pane.c:72-93, cmd_kill_pane_all, #964).
     /// `None` is the active pane (after any temporary focus), `Some` a `%id`
     /// in any window, floats included.
-    KillPanesExcept { pane: Option<usize> },
+    /// `filter` is `-f`: only the other panes it expands true for go.
+    KillPanesExcept { pane: Option<usize>, filter: Option<String> },
     /// Capture a pane's plain text. Fields: resp, target pane id
     /// (`-t %N`, None = active pane), the `-N` / `-J` line flags.
     CapturePane(mpsc::Sender<String>, Option<usize>, crate::copy_mode::CaptureOpts),

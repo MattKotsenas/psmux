@@ -173,7 +173,7 @@ pub fn format_list_clients(app: &AppState, fmt: &str, filter: Option<&str>) -> S
 }
 
 /// tmux's format_true: empty and "0" are false, anything else is true.
-fn format_truthy(s: &str) -> bool {
+pub(crate) fn format_truthy(s: &str) -> bool {
     !s.is_empty() && s != "0"
 }
 

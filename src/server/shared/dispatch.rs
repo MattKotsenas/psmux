@@ -418,7 +418,7 @@ pub(crate) fn dispatch(
                     }
                 }
                 // copied from server/mod.rs run_server (line 3812, #964)
-                CtrlReq::KillPanesExcept { pane } => {
+                CtrlReq::KillPanesExcept { pane, filter } => {
                     if let Some(cmds) = app.hooks.get("before-kill-pane") { let cmds = cmds.clone(); crate::commands::run_hook_commands(&mut app, &cmds); }
                     // tmux cmd_kill_pane_all (#964), as in run_server.
                     let target = match pane {
@@ -434,10 +434,13 @@ pub(crate) fn dispatch(
                     if let Some((wi, keep)) = target {
                         let win_id = app.windows[wi].id;
                         let keep_tiled = crate::tree::find_path_by_id(&app.windows[wi].root, keep).is_some();
-                        let killed_active = keep_tiled && !temp_target::is_real_active_pane(&app, &temp_focus_restore, wi, keep);
+                        // -f spares the panes it expands false for (cmd_kill_pane_filter).
+                        let spare = crate::pane::kill_pane_filter_spares(&app, wi, keep, filter.as_deref());
+                        let real_active = |id: usize| temp_target::is_real_active_pane(&app, &temp_focus_restore, wi, id);
+                        let killed_active = keep_tiled && !real_active(keep) && !spare.iter().any(|&id| real_active(id));
                         // An unzoom alone changes the window flags too.
                         let unzoomed = app.windows[wi].zoom_saved.is_some();
-                        let killed = crate::pane::kill_panes_except(&mut app, wi, keep);
+                        let killed = crate::pane::kill_panes_except_sparing(&mut app, wi, keep, &spare);
                         if killed > 0 || unzoomed {
                             resize_all_panes(&mut app); meta_dirty = true; state_dirty = true;
                             control::emit_panes_closed(&app, win_id, killed_active, killed + unzoomed as usize);

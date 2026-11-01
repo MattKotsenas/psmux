@@ -2445,6 +2445,26 @@ pub fn kill_pane_by_id(app: &mut AppState, pane_id: usize) -> io::Result<()> {
 /// window (#767), so they go too. A floating `keep` closes the other floats
 /// only: the tiled tree cannot be emptied. Returns how many panes went.
 pub fn kill_panes_except(app: &mut AppState, win_idx: usize, keep: usize) -> usize {
+    kill_panes_except_sparing(app, win_idx, keep, &[])
+}
+
+/// The panes of window `win_idx` other than `keep` that `kill-pane -a -f
+/// <filter>` leaves alone: those whose filter expands false for them
+/// (cmd-kill-pane.c:96-115, cmd_kill_pane_filter, format_true). No filter
+/// spares none.
+pub fn kill_pane_filter_spares(app: &AppState, win_idx: usize, keep: usize, filter: Option<&str>) -> Vec<usize> {
+    let (Some(filter), Some(win)) = (filter, app.windows.get(win_idx)) else { return Vec::new() };
+    crate::tree::collect_pane_ids(&win.root).into_iter()
+        .chain(win.floating.iter().map(|fp| fp.id))
+        .filter(|&id| id != keep)
+        .filter(|&id| !crate::format::format_truthy(&crate::format::expand_format_for_pane_by_id(filter, app, id)))
+        .collect()
+}
+
+/// [`kill_panes_except`] that also leaves the panes in `spare` alone (the
+/// ones `kill-pane -a -f` filtered out). A spared pane that was active stays
+/// active, as tmux changes the active pane only when it removes it.
+pub fn kill_panes_except_sparing(app: &mut AppState, win_idx: usize, keep: usize, spare: &[usize]) -> usize {
     let Some(win) = app.windows.get(win_idx) else { return 0 };
     let keep_is_float = win.floating.iter().any(|fp| fp.id == keep);
     if !keep_is_float && crate::tree::find_path_by_id(&win.root, keep).is_none() {
@@ -2459,10 +2479,11 @@ pub fn kill_panes_except(app: &mut AppState, win_idx: usize, keep: usize) -> usi
             if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
         }
     }
-    let keep_focused = win.floating_focus.and_then(|f| win.floating.get(f)).map(|fp| fp.id) == Some(keep);
+    let focused = win.floating_focus.and_then(|f| win.floating.get(f)).map(|fp| fp.id);
+    let prev_tiled_active = crate::tree::get_active_pane_id(&win.root, &win.active_path);
     let mut killed = 0;
     for mut fp in std::mem::take(&mut win.floating) {
-        if fp.id == keep {
+        if fp.id == keep || spare.contains(&fp.id) {
             win.floating.push(fp);
         } else {
             // The whole tree, as a tiled pane's goes (kill_pane_at_path):
@@ -2471,10 +2492,10 @@ pub fn kill_panes_except(app: &mut AppState, win_idx: usize, keep: usize) -> usi
             killed += 1;
         }
     }
-    win.floating_focus = if keep_focused { Some(0) } else { None };
+    win.floating_focus = focused.and_then(|id| win.floating.iter().position(|fp| fp.id == id));
     if !keep_is_float {
         for id in crate::tree::collect_pane_ids(&win.root) {
-            if id == keep {
+            if id == keep || spare.contains(&id) {
                 continue;
             }
             if let Some(path) = crate::tree::find_path_by_id(&win.root, id) {
@@ -2482,7 +2503,10 @@ pub fn kill_panes_except(app: &mut AppState, win_idx: usize, keep: usize) -> usi
                 killed += 1;
             }
         }
-        if let Some(path) = crate::tree::find_path_by_id(&win.root, keep) {
+        // A spared active pane stays active; otherwise `keep` takes over.
+        if let Some(path) = prev_tiled_active.and_then(|id| crate::tree::find_path_by_id(&win.root, id))
+            .or_else(|| crate::tree::find_path_by_id(&win.root, keep))
+        {
             win.active_path = path;
         }
     }

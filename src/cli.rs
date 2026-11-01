@@ -1335,6 +1335,7 @@ PANE COMMANDS:
         -c <dir>            Start directory
     kill-pane, killp        Close the current pane
         -a                  Close every other pane of the window instead
+        -f <filter>         With -a, close only the panes the format is true for
     select-pane, selectp    Select a pane
         -U / -D / -L / -R  Direction (up/down/left/right)
         -t <id>             Target pane (e.g. %3)

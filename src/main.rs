@@ -3195,7 +3195,21 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 // Read as getopt reads it: `kill-pane -- -a` has no -a.
                 let rest: Vec<&str> = cmd_args.iter().skip(1).map(|a| a.as_str()).collect();
                 let all = crate::commands::own_flag_set("kill-pane", &rest, 'a');
-                let resp = send_control_with_response(if all { "kill-pane -a\n" } else { "kill-pane\n" }.to_string())?;
+                // -f filters the panes -a kills; without -a it is an error and
+                // nothing is killed (cmd-kill-pane.c:56). It was dropped here
+                // too, so `-a -f` killed every other pane.
+                let filter = crate::commands::own_flag_value("kill-pane", &rest, 'f');
+                if filter.is_some() && !all {
+                    eprintln!("psmux: {}", crate::commands::KILL_PANE_F_WITHOUT_A);
+                    std::process::exit(1);
+                }
+                let mut line = if all { "kill-pane -a".to_string() } else { "kill-pane".to_string() };
+                if let Some(f) = filter {
+                    line.push_str(" -f ");
+                    line.push_str(&crate::util::quote_arg_if_needed(f));
+                }
+                line.push('\n');
+                let resp = send_control_with_response(line)?;
                 if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
                     eprintln!("psmux: {}", msg.trim_end());
                     std::process::exit(1);
