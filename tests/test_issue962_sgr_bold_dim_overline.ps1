@@ -8,8 +8,7 @@
 #
 # [1] a pane on the default console host (the inbox conhost) shows each
 # payload, read back with `capture-pane -e`. [2] the same on OpenConsole
-# (PSMUX_CONPTY_DIR), when C:\Users\tanae\psmux_conpty_dir or $env:PSMUX_TEST_CONPTY_DIR
-# holds it; skipped otherwise. [3] the frame the server sends a client
+# (PSMUX_CONPTY_DIR), when $env:PSMUX_TEST_CONPTY_DIR holds conpty.dll; skipped otherwise. [3] the frame the server sends a client
 # (dump-state) carries the overline and both flags. [4] a real attached
 # client draws the overline: its console cell has COMMON_LVB_GRID_HORIZONTAL,
 # read with tests\conread.cs.
@@ -26,7 +25,7 @@ foreach ($name in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PSMUX_*' 
 $PSMUX = $env:PSMUX_EXE
 if (-not $PSMUX) { $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe" -EA SilentlyContinue).Path }
 if (-not $PSMUX) { Write-Error "psmux binary not found"; exit 1 }
-$ConptyDir = if ($env:PSMUX_TEST_CONPTY_DIR) { $env:PSMUX_TEST_CONPTY_DIR } else { 'C:\Users\tanae\psmux_conpty_dir' }
+$ConptyDir = if ($env:PSMUX_TEST_CONPTY_DIR) { $env:PSMUX_TEST_CONPTY_DIR } else { '' }
 
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -155,7 +154,7 @@ try {
     Start-Sleep -Milliseconds 500
 
     Write-Host "`n[2] capture-pane -e on OpenConsole" -ForegroundColor Yellow
-    if (Test-Path (Join-Path $ConptyDir 'conpty.dll')) {
+    if ($ConptyDir -and (Test-Path (Join-Path $ConptyDir 'conpty.dll'))) {
         $env:PSMUX_CONPTY_DIR = $ConptyDir
         Run-Captures 'OpenConsole'
         P kill-server | Out-Null
