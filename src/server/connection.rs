@@ -8891,3 +8891,7 @@ mod tests_readonly_control_client;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue943_prompt_error_spin.rs"]
 mod tests_issue943_prompt_error_spin;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_prompt_error_status_line.rs"]
+mod tests_prompt_error_status_line;

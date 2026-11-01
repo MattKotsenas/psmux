@@ -14,7 +14,8 @@
 #   display-message -x hi          a flag display-message lacks   (#795)
 #   show-options -p                the pane options               (#580)
 #
-# tmux reports each failure (cmd-show-options.c:132, cmdq_error) and the
+# tmux reports each failure on the status line (cmd-show-options.c:132,
+# cmdq_error, cmd-queue.c:880-882), as psmux does since #951, and the
 # client carries on. Here each case types the command at prefix + :, then
 # checks that the error is shown where there is one, that Escape closes it,
 # that the next command typed at the prompt still runs, that typing reaches
@@ -46,7 +47,9 @@ New-Item -ItemType Directory -Force $TempHome | Out-Null
 $env:USERPROFILE = $TempHome
 $env:PSMUX_DATA_DIR = $TempHome
 $env:PSMUX_CONFIG_FILE = Join-Path $TempHome "empty.conf"
-Set-Content -Path $env:PSMUX_CONFIG_FILE -Value ""
+# The error is a status message; a long display-time keeps it up until it
+# is read (#951).
+Set-Content -Path $env:PSMUX_CONFIG_FILE -Value "set -g display-time 20000"
 # Each case runs on a server of its own, so a spin left by one case cannot
 # be counted against the next.
 $script:NS = "pes_" + [guid]::NewGuid().ToString('N').Substring(0, 6)
@@ -127,13 +130,13 @@ function Case($command, $shown) {
 }
 
 try {
-    Case 'show-options codepoint-width' 'invalid option: codepoint-width'
-    Case 'show-options @nope' 'invalid option: @nope'
-    Case 'display-message -x hi' $null
+    Case 'show-options codepoint-width' 'Invalid option: codepoint-width'
+    Case 'show-options @nope' 'Invalid option: @nope'
+    Case 'display-message -x hi' 'Command display-message: unknown flag -x'
     Case 'show-options -p' $null
     # The same arms with other flags, and through a line if-shell feeds back.
-    Case 'show-options -g nosuch' 'invalid option: nosuch'
-    Case 'if-shell -F 1 "show-options @nope"' 'invalid option: @nope'
+    Case 'show-options -g nosuch' 'Invalid option: nosuch'
+    Case 'if-shell -F 1 "show-options @nope"' 'Invalid option: @nope'
     # The same prompt with a command that works, for comparison.
     Case 'show-options -s codepoint-widths' 'codepoint-widths'
 }
