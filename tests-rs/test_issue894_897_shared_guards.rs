@@ -168,3 +168,43 @@ fn an_undecided_opening_is_gated_only_after_a_good_auth() {
     assert!(!router::opening_authenticates(b"AUTH k2\n", "k1"));
     assert!(!router::opening_authenticates(b"HELLO\n", "k1"));
 }
+
+fn delivery_peer(alias: Option<&str>) -> (Peer, mpsc::Receiver<CtrlReq>) {
+    let (tx, rx) = mpsc::channel();
+    let aliases: Aliases = Default::default();
+    if let Some(value) = alias {
+        crate::command_alias::write(&aliases)
+            .set("command-alias[0]", value, false)
+            .unwrap();
+    }
+    let peer = Peer {
+        sid: 0,
+        name: "A".to_string(),
+        key: "k1".to_string(),
+        base: "A".to_string(),
+        tx,
+        aliases,
+    };
+    (peer, rx)
+}
+
+#[test]
+fn a_delivery_runs_on_the_receiving_sessions_handler() {
+    let (peer, rx) = delivery_peer(None);
+    deliver(&peer, "bind -n F7 send-keys -t B: -l XQ");
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(CtrlReq::BindKey(table, key, command, _, _)) => {
+            assert_eq!(table, "root");
+            assert_eq!(key, "F7");
+            assert!(command.contains("-t B:"), "bound command: {command}");
+        }
+        _ => panic!("the delivery did not reach the handler"),
+    }
+}
+
+#[test]
+fn a_delivery_cannot_run_a_refused_command_through_the_receivers_alias() {
+    let (peer, rx) = delivery_peer(Some("bind=if-shell -F 1 'set -g @x value'"));
+    deliver(&peer, "bind -n F7 send-keys -l XQ");
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+}

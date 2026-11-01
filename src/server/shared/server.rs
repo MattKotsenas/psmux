@@ -180,7 +180,6 @@ enum Msg {
 struct Peer {
     sid: usize,
     name: String,
-    port: u16,
     key: String,
     /// The registry base, for a target that names it (`route`).
     base: String,
@@ -190,15 +189,25 @@ struct Peer {
     aliases: Aliases,
 }
 
-/// Deliver one server wide write to a session through its own listener,
-/// exactly as a client sends it, and wait for the reply. Registered as an
-/// echo first, so the session runs it without propagating it again.
-fn deliver(globals: &Globals, p: &Peer, line: &str) {
-    globals.expect_echo(p.sid, line);
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p.port));
-    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+/// Deliver one server wide write straight to a session's own handler, with
+/// that session's request channel and aliases, and wait for the reply or a
+/// read timeout. It does not pass the listener, so the delivery itself is
+/// neither routed nor propagated again. It is skipped when the aliases at this
+/// check expand the line to a refused command, or when its connection cannot
+/// be made.
+fn deliver(p: &Peer, line: &str) {
+    if router::first_unsupported_aliased(line, |name| alias_of(&p.aliases, name)).is_some() {
+        return;
+    }
+    let Ok((inner, mut s)) = loopback_pair() else {
         return;
     };
+    {
+        let tx = p.tx.clone();
+        let key = p.key.clone();
+        let aliases = p.aliases.clone();
+        thread::spawn(move || connection::handle_connection(inner, tx, &key, aliases));
+    }
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = write!(s, "AUTH {}\n{}\n", p.key, line);
     let _ = s.flush();
@@ -217,39 +226,11 @@ struct Globals {
     peers: std::sync::RwLock<Vec<Peer>>,
     /// Server wide writes so far, replayed on every session created later.
     replay: std::sync::Mutex<Vec<String>>,
-    /// Writes this server itself is delivering to a session (a propagation,
-    /// a replay, or `execute_command_string` handing a `set` to its own
-    /// listener): that session must run them, not propagate them again.
-    /// Entries older than ECHO_TTL are dropped.
-    echoes: std::sync::Mutex<Vec<(usize, String, Instant)>>,
 }
-
-const ECHO_TTL: Duration = Duration::from_secs(10);
 
 /// How long a connection may show a good AUTH line and nothing else before
 /// the shared server takes it for a client waiting for `OK` (an attach).
 const AUTH_ALONE_GRACE: Duration = Duration::from_millis(30);
-
-impl Globals {
-    fn expect_echo(&self, sid: usize, line: &str) {
-        if let Ok(mut e) = self.echoes.lock() {
-            e.retain(|(_, _, at)| at.elapsed() < ECHO_TTL);
-            e.push((sid, line.trim().to_string(), Instant::now()));
-        }
-    }
-
-    fn take_echo(&self, sid: usize, line: &str) -> bool {
-        let Ok(mut e) = self.echoes.lock() else { return false };
-        e.retain(|(_, _, at)| at.elapsed() < ECHO_TTL);
-        match e.iter().position(|(s, l, _)| *s == sid && l == line.trim()) {
-            Some(i) => {
-                e.remove(i);
-                true
-            }
-            None => false,
-        }
-    }
-}
 
 /// `psmux server --shared-server [-L ns]`. Never returns.
 pub(crate) fn run_from_args() -> ! {
@@ -1033,7 +1014,6 @@ fn create_session(
         p.push(Peer {
             sid,
             name: name.clone(),
-            port,
             key: session_key,
             base: base.clone(),
             tx,
@@ -1559,17 +1539,13 @@ fn serve_gated(
 }
 
 /// A server wide write (`router::is_global_write`) arriving on one session's
-/// listener is delivered first to every OTHER session of the server, through
-/// their own listeners exactly as a client would send it (so each runs the
-/// per session handler), and remembered for sessions created later; then the
+/// listener is first tried on every OTHER session of the server, on its own
+/// per session handler, and remembered for sessions created later; then the
 /// connection goes on to run it on its own session as usual, so its reply is
 /// the per session one. Runs on the connection thread, never on the loop, so
-/// the loop is free to serve the deliveries. A delivery this server makes is
-/// registered as an echo and is not propagated again.
+/// the loop is free to serve the deliveries. A delivery does not pass a
+/// listener, so the delivery itself is neither routed nor propagated.
 fn apply_global_writes(line: &str, sid: usize, globals: &Globals) {
-    if globals.take_echo(sid, line) {
-        return;
-    }
     let writes = router::global_writes(line);
     if writes.is_empty() {
         return;
@@ -1584,7 +1560,7 @@ fn apply_global_writes(line: &str, sid: usize, globals: &Globals) {
         .unwrap_or_default();
     for p in others {
         for w in &writes {
-            deliver(globals, &p, w);
+            deliver(&p, w);
         }
     }
 }
@@ -1687,9 +1663,9 @@ fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>, 
     let outcome = rrx
         .recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|_| Outcome::Failed("no response from server (timed out)".into()));
-    // A new session gets the server wide writes made so far (tmux keeps them
-    // once per server), delivered from this thread through its listener so
-    // the loop is free to serve them, before the CLI hears it was made.
+    // The server wide writes remembered so far (tmux keeps them once per
+    // server) are tried on a new session from this thread, so the loop is
+    // free to serve them, before the CLI hears it was made.
     if let Outcome::Done(ref text) = outcome {
         let name = text.lines().next().and_then(|l| l.strip_prefix("session="));
         let peer = name.and_then(|n| {
@@ -1698,7 +1674,7 @@ fn serve_control(stream: std::net::TcpStream, key: &str, tx: mpsc::Sender<Msg>, 
         if let Some(peer) = peer {
             let writes: Vec<String> = globals.replay.lock().map(|r| r.clone()).unwrap_or_default();
             for w in &writes {
-                deliver(globals, &peer, w);
+                deliver(&peer, w);
             }
         }
     }
