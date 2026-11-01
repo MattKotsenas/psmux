@@ -156,11 +156,11 @@ fn config_sets_and_unsets_one_element_by_index() {
         "set -g terminal-overrides[5] '*:smcup@:rmcup@'\nset -ga terminal-overrides[5] ':Tc'\n",
     );
     assert!(a.config_warnings.is_empty(), "{:?}", a.config_warnings);
-    assert_eq!(a.terminal_overrides.get(0), Some("linux*:AX@"));
-    assert_eq!(a.terminal_overrides.get(5), Some("*:smcup@:rmcup@:Tc"), "-a on an element appends text");
+    assert_eq!(a.terminal_overrides.get_index(0), Some("linux*:AX@"));
+    assert_eq!(a.terminal_overrides.get_index(5), Some("*:smcup@:rmcup@:Tc"), "-a on an element appends text");
     assert!(!a.user_options.contains_key("terminal-overrides[5]"));
     crate::config::parse_config_content(&mut a, "set -gu terminal-overrides[0]\n");
-    let indexes: Vec<u32> = a.terminal_overrides.iter().map(|(index, _)| index).collect();
+    let indexes: Vec<u32> = a.terminal_overrides.numbered().map(|(index, _)| index).collect();
     assert_eq!(indexes, vec![5], "the other elements keep their indexes");
 }
 
@@ -185,27 +185,27 @@ fn runtime_index_append_and_unset_follow_tmux() {
     reset_option_to_default(&mut a, "terminal-overrides[0]");
     crate::server::options::set_array_option(&mut a, "terminal-overrides", "f:Tc", true).unwrap();
     let items: Vec<(u32, String)> =
-        a.terminal_overrides.iter().map(|(index, entry)| (index, entry.to_string())).collect();
+        a.terminal_overrides.numbered().map(|(index, entry)| (index, entry.to_string())).collect();
     assert_eq!(
         items,
         vec![(0, "f:Tc".to_string()), (1, "b:rmcup@".to_string()), (10, "e:smcup@".to_string())],
         "-a takes the lowest free index, as tmux 3.7c does after -u [0]",
     );
-    let error = apply_set_option(&mut a, "terminal-overrides[x]", "z", false).unwrap_err();
+    let error = apply_set_option(&mut a, "terminal-overrides[]", "z", false).unwrap_err();
     assert!(error.contains("invalid option"), "{error}");
     // The CLI validates before it sends, so the refusal has to come from here
-    // for `psmux set -s terminal-overrides[x] z` to fail as tmux's does.
-    let error = crate::server::option_catalog::validate_option_value("terminal-overrides[x]", "z").unwrap_err();
-    assert_eq!(error, "invalid option: terminal-overrides[x]");
+    // for `psmux set -s terminal-overrides[] z` to fail as tmux's does.
+    let error = crate::server::option_catalog::validate_option_value("terminal-overrides[]", "z").unwrap_err();
+    assert_eq!(error, "invalid option: terminal-overrides[]");
     assert!(crate::server::option_catalog::validate_option_value("terminal-overrides[3]", "z").is_ok());
-    // `set -su terminal-overrides[x]` and `show -s terminal-overrides[x]` fail
+    // `set -su terminal-overrides[]` and `show -s terminal-overrides[]` fail
     // in tmux too (options_parse), not only a set with a value.
-    for args in [&["-su", "terminal-overrides[x]"][..], &["-su", "command-alias[x]"][..]] {
+    for args in [&["-su", "terminal-overrides[]"][..], &["-su", "command-alias[]"][..]] {
         let error = crate::cli::parse_set_option_args(args).validate(false).unwrap_err();
         assert!(error.starts_with("invalid option: "), "{args:?}: {error}");
     }
     assert!(crate::cli::parse_set_option_args(&["-su", "terminal-overrides[3]"]).validate(false).is_ok());
-    assert!(!crate::server::option_catalog::is_valid_option_name("terminal-overrides[x]"));
+    assert!(!crate::server::option_catalog::is_valid_option_name("terminal-overrides[]"));
     assert!(crate::server::option_catalog::is_valid_option_name("terminal-overrides[3]"));
     assert!(crate::server::option_catalog::is_valid_option_name("status-format[1]"));
     reset_option_to_default(&mut a, "terminal-overrides");

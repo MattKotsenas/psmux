@@ -6,7 +6,12 @@
 use super::*;
 
 fn items(array: &OptionArray) -> Vec<(u32, &str)> {
-    array.iter().collect()
+    array.numbered().collect()
+}
+
+/// The key of element `n`.
+fn i(n: u32) -> Option<ArrayKey> {
+    Some(ArrayKey::Index(n))
 }
 
 /// A spec that splits on `separator` and keeps the spaces, as tmux does.
@@ -17,17 +22,19 @@ fn sep(separator: &'static str) -> ArraySpec {
 #[test]
 fn parse_name_splits_the_index_off() {
     assert_eq!(parse_name("command-alias"), Ok(("command-alias", None)));
-    assert_eq!(parse_name("command-alias[0]"), Ok(("command-alias", Some(0))));
-    assert_eq!(parse_name("status-format[12]"), Ok(("status-format", Some(12))));
-    assert_eq!(parse_name("command-alias[01]"), Ok(("command-alias", Some(1))));
+    assert_eq!(parse_name("command-alias[0]"), Ok(("command-alias", Some(ArrayKey::Index(0)))));
+    assert_eq!(parse_name("status-format[12]"), Ok(("status-format", Some(ArrayKey::Index(12)))));
+    assert_eq!(parse_name("command-alias[01]"), Ok(("command-alias", Some(ArrayKey::Index(1)))));
 }
 
 #[test]
 fn parse_name_refuses_what_options_parse_refuses() {
-    for name in ["", "a[", "a[]", "a[x]", "a[-1]", "a[1]x", "a[1][2]", "a[99999999999]"] {
+    // A name as a key is no longer refused (tmux 3.8, #957): see
+    // tests-rs/test_array_named_keys.rs.
+    for name in ["", "a[", "a[]", "a[1]x", "a[1][2]", "a[x]]", "a[99999999999]", "a[4294967296]"] {
         assert!(parse_name(name).is_err(), "{:?}", name);
     }
-    assert_eq!(parse_name("a[x]"), Err("invalid option: a[x]".to_string()));
+    assert_eq!(parse_name("a[]"), Err("invalid option: a[]".to_string()));
 }
 
 #[test]
@@ -35,7 +42,7 @@ fn spec_finds_an_array_by_its_base_name() {
     assert_eq!(spec("command-alias").map(|s| s.separator), Some(","));
     assert_eq!(spec("command-alias[3]").map(|s| s.name), Some("command-alias"));
     assert!(spec("status-left").is_none());
-    assert!(spec("command-alias[x]").is_none());
+    assert!(spec("command-alias[]").is_none());
 }
 
 #[test]
@@ -43,8 +50,8 @@ fn set_with_an_index_and_append_extends_that_element() {
     // `set -s command-alias[4] a=list-keys`, then
     // `set -as command-alias[4] ' -T root'`: "a=list-keys -T root".
     let mut a = OptionArray::default();
-    a.apply_set(Some(4), "a=list-keys", false, &sep(","));
-    a.apply_set(Some(4), " -T root", true, &sep(","));
+    a.apply_set(i(4), "a=list-keys", false, &sep(","));
+    a.apply_set(i(4), " -T root", true, &sep(","));
     assert_eq!(items(&a), vec![(4, "a=list-keys -T root")]);
 }
 
@@ -52,7 +59,7 @@ fn set_with_an_index_and_append_extends_that_element() {
 fn append_without_an_index_takes_the_lowest_free_index() {
     // `[4]` set, then `set -as command-alias b=list-buffers` lands at [0].
     let mut a = OptionArray::default();
-    a.apply_set(Some(4), "a=list-keys", false, &sep(","));
+    a.apply_set(i(4), "a=list-keys", false, &sep(","));
     a.apply_set(None, "b=list-buffers", true, &sep(","));
     assert_eq!(items(&a), vec![(0, "b=list-buffers"), (4, "a=list-keys")]);
     a.apply_set(None, "c=kill-pane", true, &sep(","));
@@ -64,8 +71,8 @@ fn a_value_without_an_index_replaces_the_array() {
     // `set -s command-alias 'c=new-window,d=split-window -h'` after [0] and
     // [4] leaves [0] and [1] only.
     let mut a = OptionArray::default();
-    a.apply_set(Some(0), "b=list-buffers", false, &sep(","));
-    a.apply_set(Some(4), "a=list-keys", false, &sep(","));
+    a.apply_set(i(0), "b=list-buffers", false, &sep(","));
+    a.apply_set(i(4), "a=list-keys", false, &sep(","));
     a.apply_set(None, "c=new-window,d=split-window -h", false, &sep(","));
     assert_eq!(items(&a), vec![(0, "c=new-window"), (1, "d=split-window -h")]);
 }
@@ -87,7 +94,7 @@ fn an_empty_separator_keeps_the_value_whole() {
     // A hook: `set-hook -g h[3] ...` then `set-hook -ga h 'display two'`
     // puts the second at [0], unsplit.
     let mut a = OptionArray::default();
-    a.apply_set(Some(3), "display hi", false, &sep(""));
+    a.apply_set(i(3), "display hi", false, &sep(""));
     a.apply_set(None, "display two", true, &sep(""));
     assert_eq!(items(&a), vec![(0, "display two"), (3, "display hi")]);
 }
@@ -95,7 +102,7 @@ fn an_empty_separator_keeps_the_value_whole() {
 #[test]
 fn an_empty_value_without_an_index_empties_the_array() {
     let mut a = OptionArray::default();
-    a.apply_set(Some(2), "x=y", false, &sep(","));
+    a.apply_set(i(2), "x=y", false, &sep(","));
     a.apply_set(None, "", false, &sep(","));
     assert!(a.is_empty());
 }
@@ -106,7 +113,7 @@ fn unset_with_an_index_keeps_the_other_indexes() {
     let spec = spec("command-alias").unwrap();
     let mut a = OptionArray::default();
     a.apply_set(None, "c=new-window,d=split-window -h,e=kill-pane", false, &sep(","));
-    a.apply_unset(Some(1), spec);
+    a.apply_unset(i(1), spec);
     assert_eq!(items(&a), vec![(0, "c=new-window"), (2, "e=kill-pane")]);
 }
 
@@ -151,8 +158,8 @@ fn unset_without_an_index_puts_the_default_back() {
 fn joined_uses_spaces() {
     // `display -p '#{command-alias}'` printed "c=new-window e=kill-pane".
     let mut a = OptionArray::default();
-    a.apply_set(Some(0), "c=new-window", false, &sep(","));
-    a.apply_set(Some(2), "e=kill-pane", false, &sep(","));
+    a.apply_set(i(0), "c=new-window", false, &sep(","));
+    a.apply_set(i(2), "e=kill-pane", false, &sep(","));
     assert_eq!(a.joined(), "c=new-window e=kill-pane");
 }
 
@@ -161,8 +168,8 @@ fn show_lines_prints_as_show_options_does() {
     let mut a = OptionArray::default();
     assert_eq!(a.show_lines("command-alias", false), "command-alias\n");
     assert_eq!(a.show_lines("command-alias", true), "");
-    a.apply_set(Some(0), "c=new-window", false, &sep(","));
-    a.apply_set(Some(1), "d=split-window -h", false, &sep(","));
+    a.apply_set(i(0), "c=new-window", false, &sep(","));
+    a.apply_set(i(1), "d=split-window -h", false, &sep(","));
     assert_eq!(
         a.show_lines("command-alias", false),
         "command-alias[0] c=new-window\ncommand-alias[1] \"d=split-window -h\"\n"
@@ -176,7 +183,7 @@ fn is_array_name_takes_the_bare_name_or_any_bracketed_index() {
     assert_eq!(is_array_name("terminal-overrides[10]").map(|spec| spec.name), Some("terminal-overrides"));
     // A bad index is still the array's, so set answers it with invalid option.
     assert_eq!(is_array_name("terminal-overrides[x]").map(|spec| spec.name), Some("terminal-overrides"));
-    assert!(parse_name("terminal-overrides[x]").is_err());
+    assert!(parse_name("terminal-overrides[]").is_err());
     assert_eq!(is_array_name("command-alias[0]").map(|spec| spec.name), Some("command-alias"));
     assert!(is_array_name("terminal-overridesx").is_none());
     assert!(is_array_name("terminal-overrides[1").is_none());
@@ -202,8 +209,8 @@ fn a_trimming_spec_keeps_each_element_without_its_spaces() {
     let mut a = OptionArray::default();
     a.apply_set(None, " U+2502=2, U+4E2D=1 ,  ,", false, &trim);
     assert_eq!(items(&a), vec![(0, "U+2502=2"), (1, "U+4E2D=1")]);
-    a.apply_set(Some(5), "  U+25CF=2 ", false, &trim);
-    assert_eq!(a.get(5), Some("U+25CF=2"));
+    a.apply_set(i(5), "  U+25CF=2 ", false, &trim);
+    assert_eq!(a.get_index(5), Some("U+25CF=2"));
     a.apply_set(None, "   ", false, &trim);
     assert!(a.is_empty(), "a value of spaces only is an empty value");
     let mut a = OptionArray::default();

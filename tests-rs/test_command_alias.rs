@@ -9,20 +9,30 @@ fn words(line: &str) -> Vec<String> {
     crate::commands::parse_command_line(line)
 }
 
+/// The numbered elements, as (number, entry).
+fn numbered(a: &CommandAliases) -> Vec<(u32, &str)> {
+    a.items()
+        .filter_map(|(key, entry)| match key {
+            crate::option_array::ArrayKey::Index(index) => Some((*index, entry)),
+            crate::option_array::ArrayKey::Name(_) => None,
+        })
+        .collect()
+}
+
 #[test]
 fn indexed_name_sets_that_element() {
     let mut a = CommandAliases::default();
     a.set("command-alias[100]", "zz=rename-window ZZ", false).unwrap();
     assert_eq!(a.get("zz").as_deref(), Some("rename-window ZZ"));
-    assert_eq!(a.items().collect::<Vec<_>>(), vec![(100, "zz=rename-window ZZ")]);
+    assert_eq!(numbered(&a), vec![(100, "zz=rename-window ZZ")]);
 }
 
 #[test]
-fn indexed_name_that_is_no_number_is_refused() {
+fn a_key_that_is_no_key_is_refused() {
     let mut a = CommandAliases::default();
     assert_eq!(
-        a.set("command-alias[x]", "zz=list-keys", false),
-        Err("invalid option: command-alias[x]".to_string())
+        a.set("command-alias[]", "zz=list-keys", false),
+        Err("invalid option: command-alias[]".to_string())
     );
     assert!(a.is_empty());
 }
@@ -42,10 +52,10 @@ fn bare_name_replaces_the_whole_array() {
     let mut a = CommandAliases::default();
     a.set("command-alias[5]", "sp=split-window", false).unwrap();
     a.set("command-alias", "nw=new-window", false).unwrap();
-    assert_eq!(a.items().collect::<Vec<_>>(), vec![(0, "nw=new-window")]);
+    assert_eq!(numbered(&a), vec![(0, "nw=new-window")]);
     a.set("command-alias", "sp=split-window -h,nw=new-window -d", false).unwrap();
     assert_eq!(
-        a.items().collect::<Vec<_>>(),
+        numbered(&a),
         vec![(0, "sp=split-window -h"), (1, "nw=new-window -d")]
     );
 }
@@ -92,7 +102,7 @@ fn a_server_starts_with_tmux_default_aliases() {
     assert_eq!(aliases.get("info").as_deref(), Some("show-messages -JT"));
     assert_eq!(aliases.get("choose-window").as_deref(), Some("choose-tree -w"));
     assert_eq!(aliases.get("choose-session").as_deref(), Some("choose-tree -s"));
-    assert_eq!(aliases.items().map(|(i, _)| i).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+    assert_eq!(aliases.items().map(|(key, _)| key.to_string()).collect::<Vec<_>>(), vec!["0", "1", "2", "3", "4", "5"]);
 }
 
 #[test]
@@ -226,8 +236,8 @@ fn config_append_and_unset_work_on_the_array() {
     assert!(!read(&app.command_aliases).contains_key("a"));
     assert!(read(&app.command_aliases).contains_key("b"));
     assert_eq!(
-        read(&app.command_aliases).items().map(|(i, _)| i).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 5, 6]
+        read(&app.command_aliases).items().map(|(key, _)| key.to_string()).collect::<Vec<_>>(),
+        vec!["0", "1", "2", "3", "5", "6"]
     );
     crate::config::parse_config_content(&mut app, "set -su command-alias\n");
     assert_eq!(*read(&app.command_aliases), CommandAliases::with_defaults());
@@ -237,12 +247,12 @@ fn config_append_and_unset_work_on_the_array() {
 }
 
 #[test]
-fn config_index_that_is_no_number_warns() {
+fn config_key_that_is_no_key_warns() {
     let mut app = app();
-    crate::config::parse_config_content(&mut app, "set -s command-alias[x] 'zz=list-keys'\n");
+    crate::config::parse_config_content(&mut app, "set -s command-alias[] 'zz=list-keys'\n");
     assert_eq!(*read(&app.command_aliases), CommandAliases::with_defaults());
     assert!(
-        app.config_warnings.iter().any(|w| w.contains("invalid option: command-alias[x]")),
+        app.config_warnings.iter().any(|w| w.contains("invalid option: command-alias[]")),
         "got: {:?}",
         app.config_warnings
     );

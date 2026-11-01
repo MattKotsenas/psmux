@@ -20,7 +20,7 @@ fn app() -> AppState {
 }
 
 fn items(a: &AppState) -> Vec<(u32, String)> {
-    a.status_format.iter().map(|(index, entry)| (index, entry.to_string())).collect()
+    a.status_format.numbered().map(|(index, entry)| (index, entry.to_string())).collect()
 }
 
 fn item(index: u32, entry: &str) -> (u32, String) {
@@ -92,9 +92,9 @@ fn config_set_append_index_and_unset_follow_tmux() {
 }
 
 #[test]
-fn a_bad_index_is_no_option() {
+fn a_key_that_is_no_key_is_no_option() {
     let mut a = app();
-    let error = apply_set_option(&mut a, "status-format[x]", "Y", false).unwrap_err();
+    let error = apply_set_option(&mut a, "status-format[]", "Y", false).unwrap_err();
     assert!(error.contains("invalid option"), "{error}");
     assert!(a.status_format.is_empty());
 }

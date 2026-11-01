@@ -1,10 +1,12 @@
 //! Array options, as tmux keeps them in options.c. An option whose table
-//! entry carries `OPTIONS_TABLE_IS_ARRAY` holds numbered elements, and every
-//! such option goes through the same functions: `name[N]` names one element
+//! entry carries `OPTIONS_TABLE_IS_ARRAY` holds elements, each keyed by a
+//! number or, since tmux 3.8 (20ef19b4), by a name, and every such option goes
+//! through the same functions: `name[N]` or `name[KEY]` names one element
 //! (`options_parse`), a value without an index replaces the whole array
 //! (`options_array_assign`), `-a` and `-u` work on one element or on all of
 //! them (cmd-set-option.c), and `show-options` prints a `name[N] value` line
-//! per element (cmd-show-options.c). Line numbers below are tag 3.7c.
+//! per element (cmd-show-options.c). Line numbers below are tag 3.7c unless
+//! they say 3.8.
 //!
 //! [`ARRAY_OPTIONS`] lists the options built on this so far. tmux 3.7c has
 //! more, and they move here one at a time: terminal-features and user-keys
@@ -92,10 +94,48 @@ pub fn is_array_name(name: &str) -> Option<&'static ArraySpec> {
     })
 }
 
-/// `name` split into its base name and its index, `None` for no index
-/// (options.c:624-647, `options_parse`). An index must end the name, be
-/// digits and fit; anything else is no option at all.
-pub fn parse_name(name: &str) -> Result<(&str, Option<u32>), String> {
+/// The key of one array element: a number, or a name (tmux 3.8, 20ef19b4).
+///
+/// The order is tmux's `options_array_cmp` (options.c:78-98 at tag 3.8):
+/// every numbered element comes first, by number, then the named ones,
+/// compared byte by byte as `strcmp` compares them. The derived order gives
+/// exactly that, `Index` being declared first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArrayKey {
+    Index(u32),
+    Name(String),
+}
+
+impl std::fmt::Display for ArrayKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArrayKey::Index(index) => write!(f, "{}", index),
+            ArrayKey::Name(name) => f.write_str(name),
+        }
+    }
+}
+
+impl ArrayKey {
+    /// A key as tmux 3.8 corrects it (`options_array_correct_key`,
+    /// options.c:41-76): digits only are a number from 0 to `u32::MAX`, kept
+    /// as that number (`007` is 7); anything else is a name, kept as it is.
+    /// An empty key, or digits too large for the number, is no key.
+    pub fn parse(key: &str) -> Option<ArrayKey> {
+        if key.is_empty() {
+            return None;
+        }
+        if key.bytes().all(|b| b.is_ascii_digit()) {
+            return key.parse::<u32>().ok().map(ArrayKey::Index);
+        }
+        Some(ArrayKey::Name(key.to_string()))
+    }
+}
+
+/// `name` split into its base name and its key, `None` for no key
+/// (options.c:759-784 at tag 3.8, `options_parse`). The key runs from the
+/// first `[` to the first `]` after it, which must end the name; a key that
+/// [`ArrayKey::parse`] refuses, or text after the `]`, is no option at all.
+pub fn parse_name(name: &str) -> Result<(&str, Option<ArrayKey>), String> {
     let invalid = || format!("invalid option: {}", name);
     if name.is_empty() {
         return Err(invalid());
@@ -103,20 +143,21 @@ pub fn parse_name(name: &str) -> Result<(&str, Option<u32>), String> {
     let Some(open) = name.find('[') else {
         return Ok((name, None));
     };
-    let index = name[open + 1..].strip_suffix(']').ok_or_else(invalid)?;
-    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+    let rest = &name[open + 1..];
+    let close = rest.find(']').ok_or_else(invalid)?;
+    if close + 1 != rest.len() {
         return Err(invalid());
     }
-    let index = index.parse::<u32>().map_err(|_| invalid())?;
-    Ok((&name[..open], Some(index)))
+    let key = ArrayKey::parse(&rest[..close]).ok_or_else(invalid)?;
+    Ok((&name[..open], Some(key)))
 }
 
-/// The elements of one array option, by index. Values are strings
+/// The elements of one array option, by key. Values are strings
 /// (`OPTIONS_TABLE_STRING`); hooks and pane-colours widen this when they move
 /// here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionArray {
-    items: BTreeMap<u32, String>,
+    items: BTreeMap<ArrayKey, String>,
 }
 
 impl OptionArray {
@@ -128,13 +169,28 @@ impl OptionArray {
         array
     }
 
-    pub fn get(&self, index: u32) -> Option<&str> {
-        self.items.get(&index).map(String::as_str)
+    pub fn get(&self, key: &ArrayKey) -> Option<&str> {
+        self.items.get(key).map(String::as_str)
     }
 
-    /// The elements in index order.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &str)> {
-        self.items.iter().map(|(index, value)| (*index, value.as_str()))
+    /// The element numbered `index`, as tmux reads an array line by line
+    /// (`options_array_getv(o, "%u", i)`, status.c:277 at tag 3.8 for
+    /// status-format).
+    pub fn get_index(&self, index: u32) -> Option<&str> {
+        self.get(&ArrayKey::Index(index))
+    }
+
+    /// Every element in key order: the numbered ones, then the named ones.
+    pub fn iter(&self) -> impl Iterator<Item = (&ArrayKey, &str)> {
+        self.items.iter().map(|(key, value)| (key, value.as_str()))
+    }
+
+    /// The numbered elements alone, in order.
+    pub fn numbered(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.items.iter().filter_map(|(key, value)| match key {
+            ArrayKey::Index(index) => Some((*index, value.as_str())),
+            ArrayKey::Name(_) => None,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -150,24 +206,25 @@ impl OptionArray {
     /// `None` removes it; `append` adds `value` to the end of its text.
     /// `value` is stored as given; [`OptionArray::apply_set`] trims it first
     /// for an option whose spec says so.
-    pub fn set(&mut self, index: u32, value: Option<&str>, append: bool) {
+    pub fn set(&mut self, key: ArrayKey, value: Option<&str>, append: bool) {
         match value {
             None => {
-                self.items.remove(&index);
+                self.items.remove(&key);
             }
-            Some(value) if append => self.items.entry(index).or_default().push_str(value),
+            Some(value) if append => self.items.entry(key).or_default().push_str(value),
             Some(value) => {
-                self.items.insert(index, value.to_string());
+                self.items.insert(key, value.to_string());
             }
         }
     }
 
-    /// The lowest index with no element, where `options_array_assign` puts
-    /// each new one.
+    /// The lowest number with no element, where `options_array_assign` puts
+    /// each new one (options.c:638-683 at tag 3.8 tries `%u` from 0 up, so a
+    /// named element takes no number).
     fn first_free(&self) -> u32 {
         let mut index = 0;
-        for used in self.items.keys() {
-            if *used != index {
+        for (used, _) in self.numbered() {
+            if used != index {
                 break;
             }
             index += 1;
@@ -188,7 +245,7 @@ impl OptionArray {
         }
         if spec.separator.is_empty() {
             let index = self.first_free();
-            self.set(index, Some(value), false);
+            self.set(ArrayKey::Index(index), Some(value), false);
             return;
         }
         for piece in value.split(|c| spec.separator.contains(c)) {
@@ -197,34 +254,34 @@ impl OptionArray {
                 continue;
             }
             let index = self.first_free();
-            self.set(index, Some(piece), false);
+            self.set(ArrayKey::Index(index), Some(piece), false);
         }
     }
 
-    /// `set-option NAME VALUE` (cmd-set-option.c:194-225): without an index
-    /// the array is cleared, unless `-a`, and the value assigned; with one,
-    /// that element is set, its value trimmed when `spec.trim` says so.
-    pub fn apply_set(&mut self, index: Option<u32>, value: &str, append: bool, spec: &ArraySpec) {
-        match index {
+    /// `set-option NAME VALUE` (cmd-set-option.c:194-225): without a key the
+    /// array is cleared, unless `-a`, and the value assigned; with one, that
+    /// element is set, its value trimmed when `spec.trim` says so.
+    pub fn apply_set(&mut self, key: Option<ArrayKey>, value: &str, append: bool, spec: &ArraySpec) {
+        match key {
             None => {
                 if !append {
                     self.clear();
                 }
                 self.assign(value, spec);
             }
-            Some(index) => {
+            Some(key) => {
                 let value = if spec.trim { value.trim() } else { value };
-                self.set(index, Some(value), append);
+                self.set(key, Some(value), append);
             }
         }
     }
 
     /// `set-option -u` (options.c:1275, `options_remove_or_default`): one
-    /// element, the others keeping their indexes, or, without an index, the
-    /// whole array back to its default, as for a global option.
-    pub fn apply_unset(&mut self, index: Option<u32>, spec: &ArraySpec) {
-        match index {
-            Some(index) => self.set(index, None, false),
+    /// element, the others keeping their keys, or, without a key, the whole
+    /// array back to its default, as for a global option.
+    pub fn apply_unset(&mut self, key: Option<ArrayKey>, spec: &ArraySpec) {
+        match key {
+            Some(key) => self.set(key, None, false),
             None => *self = Self::with_default(spec),
         }
     }
@@ -244,11 +301,11 @@ impl OptionArray {
         }
         self.items
             .iter()
-            .map(|(index, value)| {
+            .map(|(key, value)| {
                 if values_only {
                     format!("{}\n", value)
                 } else {
-                    format!("{}[{}] {}\n", name, index, crate::util::quote_arg_if_needed(value))
+                    format!("{}[{}] {}\n", name, key, crate::util::quote_arg_if_needed(value))
                 }
             })
             .collect()

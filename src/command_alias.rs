@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::option_array::{self, OptionArray};
+use crate::option_array::{self, ArrayKey, OptionArray};
 
 pub const OPTION: &str = "command-alias";
 
@@ -30,8 +30,8 @@ pub struct CommandAliases {
     array: OptionArray,
 }
 
-/// True for `command-alias` and `command-alias[N]`, also when N is no index
-/// at all, so `set` can answer that with `invalid option`.
+/// True for `command-alias` and `command-alias[KEY]`, also when KEY is no
+/// key at all, so `set` can answer that with `invalid option`.
 pub fn is_alias_option(name: &str) -> bool {
     name == OPTION
         || name
@@ -39,10 +39,10 @@ pub fn is_alias_option(name: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('[') && rest.ends_with(']'))
 }
 
-/// The index `name` gives, `None` for the bare name.
-fn option_index(name: &str) -> Result<Option<u32>, String> {
-    let (_, index) = option_array::parse_name(name)?;
-    Ok(index)
+/// The key `name` gives, `None` for the bare name.
+fn option_key(name: &str) -> Result<Option<ArrayKey>, String> {
+    let (_, key) = option_array::parse_name(name)?;
+    Ok(key)
 }
 
 /// command-alias's entry in [`option_array::ARRAY_OPTIONS`].
@@ -57,8 +57,9 @@ impl CommandAliases {
         Self { array: OptionArray::with_default(spec()) }
     }
 
-    /// The command `name` stands for. The lowest index wins when two elements
-    /// define the same name, as tmux's `cmd_get_alias` walks the array.
+    /// The command `name` stands for. The first element in key order wins
+    /// when two define the same name, as tmux's `cmd_get_alias` walks the
+    /// array: the numbered elements first, then the named ones.
     pub fn get(&self, name: &str) -> Option<String> {
         self.array.iter().find_map(|(_, entry)| {
             let (alias, command) = entry.split_once('=')?;
@@ -74,32 +75,32 @@ impl CommandAliases {
         self.array.is_empty()
     }
 
-    /// The elements in index order.
-    pub fn items(&self) -> impl Iterator<Item = (u32, &str)> {
+    /// The elements in key order.
+    pub fn items(&self) -> impl Iterator<Item = (&ArrayKey, &str)> {
         self.array.iter()
     }
 
-    /// `set-option` on `command-alias` or `command-alias[N]`, as for any
+    /// `set-option` on `command-alias` or `command-alias[KEY]`, as for any
     /// array option ([`OptionArray::apply_set`]).
     pub fn set(&mut self, name: &str, value: &str, append: bool) -> Result<(), String> {
-        let index = option_index(name)?;
-        self.array.apply_set(index, value, append, spec());
+        let key = option_key(name)?;
+        self.array.apply_set(key, value, append, spec());
         Ok(())
     }
 
-    /// `set-option -u`: one element for `command-alias[N]`; the bare name
+    /// `set-option -u`: one element for `command-alias[KEY]`; the bare name
     /// puts tmux's default aliases back.
     pub fn unset(&mut self, name: &str) -> Result<(), String> {
-        let index = option_index(name)?;
-        self.array.apply_unset(index, spec());
+        let key = option_key(name)?;
+        self.array.apply_unset(key, spec());
         Ok(())
     }
 
     /// The value of `name` as a string: one element, or the whole array
     /// joined with spaces, as tmux's `#{command-alias}` gives it.
     pub fn value(&self, name: &str) -> String {
-        match option_index(name) {
-            Ok(Some(index)) => self.array.get(index).unwrap_or_default().to_string(),
+        match option_key(name) {
+            Ok(Some(key)) => self.array.get(&key).unwrap_or_default().to_string(),
             Ok(None) => self.array.joined(),
             Err(_) => String::new(),
         }

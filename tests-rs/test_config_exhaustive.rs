@@ -1096,7 +1096,7 @@ fn config_file_command_alias() {
 fn config_file_status_format_indexed() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g status-format[0] 'line zero'\n");
-    assert_eq!(app.status_format.get(0), Some("line zero"));
+    assert_eq!(app.status_format.get_index(0), Some("line zero"));
 }
 
 #[test]
@@ -1104,8 +1104,8 @@ fn config_file_status_format_indexed_1() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g status-format[1] 'line one'\n");
     // Only [1] exists, as in tmux; no empty [0] is padded in below it (#947).
-    assert_eq!(app.status_format.get(0), None);
-    assert_eq!(app.status_format.get(1), Some("line one"));
+    assert_eq!(app.status_format.get_index(0), None);
+    assert_eq!(app.status_format.get_index(1), Some("line one"));
 }
 
 #[test]
@@ -2382,8 +2382,8 @@ fn config_prefix2_none() {
 fn config_status_format_0_and_1() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g status-format[0] 'zero'\nset -g status-format[1] 'one'\n");
-    assert_eq!(app.status_format.get(0), Some("zero"));
-    assert_eq!(app.status_format.get(1), Some("one"));
+    assert_eq!(app.status_format.get_index(0), Some("zero"));
+    assert_eq!(app.status_format.get_index(1), Some("one"));
 }
 
 #[test]

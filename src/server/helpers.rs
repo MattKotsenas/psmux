@@ -386,9 +386,12 @@ pub(crate) struct StatusFormats {
 /// `[]` as before.
 pub(crate) fn status_format_json(app: &AppState) -> String {
     let lines = app.status_lines.max(1) as u64;
+    // Numbered elements alone: a named one is no line, as tmux reads
+    // status-format line by line (status.c:277 at tag 3.8,
+    // options_array_getv(o, "%u", i)).
     let Some((last, _)) = app
         .status_format
-        .iter()
+        .numbered()
         .take_while(|(index, _)| u64::from(*index) < lines)
         .last()
     else {
@@ -400,7 +403,7 @@ pub(crate) fn status_format_json(app: &AppState) -> String {
             sf.push(',');
         }
         sf.push('"');
-        if let Some(fmt_str) = app.status_format.get(i) {
+        if let Some(fmt_str) = app.status_format.get_index(i) {
             sf.push_str(&json_escape_string(&crate::format::expand_format(fmt_str, app)));
         }
         sf.push('"');

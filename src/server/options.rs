@@ -83,10 +83,10 @@ pub(crate) fn is_stored_array_option(name: &str) -> bool {
 /// `set-option NAME VALUE` (with `-a` when `append`) on an array option or one
 /// of its elements (cmd-set-option.c:194-225).
 pub(crate) fn set_array_option(app: &mut AppState, name: &str, value: &str, append: bool) -> Result<(), String> {
-    let (base, index) = crate::option_array::parse_name(name)?;
+    let (base, key) = crate::option_array::parse_name(name)?;
     let spec = crate::option_array::spec(base).ok_or_else(|| format!("invalid option: {}", name))?;
     let array = array_option_mut(app, base).ok_or_else(|| format!("invalid option: {}", name))?;
-    array.apply_set(index, value, append, spec);
+    array.apply_set(key, value, append, spec);
     array_option_changed(app, base);
     Ok(())
 }
@@ -94,10 +94,10 @@ pub(crate) fn set_array_option(app: &mut AppState, name: &str, value: &str, appe
 /// `set-option -u`: one element, or the whole array back to its default
 /// (options.c:1275, `options_remove_or_default`).
 pub(crate) fn unset_array_option(app: &mut AppState, name: &str) -> Result<(), String> {
-    let (base, index) = crate::option_array::parse_name(name)?;
+    let (base, key) = crate::option_array::parse_name(name)?;
     let spec = crate::option_array::spec(base).ok_or_else(|| format!("invalid option: {}", name))?;
     let array = array_option_mut(app, base).ok_or_else(|| format!("invalid option: {}", name))?;
-    array.apply_unset(index, spec);
+    array.apply_unset(key, spec);
     array_option_changed(app, base);
     Ok(())
 }
@@ -113,14 +113,14 @@ fn array_option_changed(app: &AppState, base: &str) {
 /// The value as `#{NAME}` and `show -v NAME[N]` give it: one element, or the
 /// whole array joined with spaces (options.c:590-614, `options_to_string`).
 pub(crate) fn array_option_value(app: &AppState, name: &str) -> String {
-    let Ok((base, index)) = crate::option_array::parse_name(name) else {
+    let Ok((base, key)) = crate::option_array::parse_name(name) else {
         return String::new();
     };
     let Some(array) = array_option(app, base) else {
         return String::new();
     };
-    match index {
-        Some(index) => array.get(index).unwrap_or_default().to_string(),
+    match key {
+        Some(key) => array.get(&key).unwrap_or_default().to_string(),
         None => array.joined(),
     }
 }
@@ -129,23 +129,23 @@ pub(crate) fn array_option_value(app: &AppState, name: &str) -> String {
 /// `name[N] value` line per element for the bare name, the one line for
 /// `name[N]`, and only the values with `-v`.
 pub(crate) fn array_option_show_lines(app: &AppState, name: &str, values_only: bool) -> String {
-    let Ok((base, index)) = crate::option_array::parse_name(name) else {
+    let Ok((base, key)) = crate::option_array::parse_name(name) else {
         return String::new();
     };
     let Some(array) = array_option(app, base) else {
         return String::new();
     };
-    match index {
+    match key {
         None => array.show_lines(base, values_only),
-        Some(index) => match array.get(index) {
+        Some(key) => match array.get(&key) {
             Some(value) if values_only => format!("{}\n", value),
-            Some(value) => format!("{}[{}] {}\n", base, index, crate::util::quote_arg_if_needed(value)),
+            Some(value) => format!("{}[{}] {}\n", base, key, crate::util::quote_arg_if_needed(value)),
             // No such element: tmux still prints the line, its value the
             // empty string options_to_string gives (options.c:729-730) as
             // args_escape writes it (arguments.c:613-615), and with -v an
             // empty line (cmd-show-options.c:192-194).
             None if values_only => "\n".to_string(),
-            None => format!("{}[{}] ''\n", base, index),
+            None => format!("{}[{}] ''\n", base, key),
         },
     }
 }

@@ -33,7 +33,7 @@ impl Drop for WidthTable {
 }
 
 fn items(a: &AppState) -> Vec<(u32, String)> {
-    a.codepoint_widths.iter().map(|(index, entry)| (index, entry.to_string())).collect()
+    a.codepoint_widths.numbered().map(|(index, entry)| (index, entry.to_string())).collect()
 }
 
 fn item(index: u32, entry: &str) -> (u32, String) {
@@ -100,15 +100,15 @@ fn runtime_set_replaces_the_array_and_joins_with_a_space() {
 }
 
 #[test]
-fn a_bad_index_is_no_option() {
+fn a_key_that_is_no_key_is_no_option() {
     let mut a = app();
-    let error = apply_set_option(&mut a, "codepoint-widths[x]", "U+E010=2", false).unwrap_err();
+    let error = apply_set_option(&mut a, "codepoint-widths[]", "U+E010=2", false).unwrap_err();
     assert!(error.contains("invalid option"), "{error}");
     assert_eq!(
-        crate::server::option_catalog::validate_option_value("codepoint-widths[x]", "U+E010=2").unwrap_err(),
-        "invalid option: codepoint-widths[x]"
+        crate::server::option_catalog::validate_option_value("codepoint-widths[]", "U+E010=2").unwrap_err(),
+        "invalid option: codepoint-widths[]"
     );
-    assert!(!crate::server::option_catalog::is_valid_option_name("codepoint-widths[x]"));
+    assert!(!crate::server::option_catalog::is_valid_option_name("codepoint-widths[]"));
     assert!(crate::server::option_catalog::is_valid_option_name("codepoint-widths[3]"));
     assert!(a.codepoint_widths.is_empty());
 }
@@ -123,7 +123,7 @@ fn each_element_is_kept_without_its_spaces() {
     apply_set_option(&mut a, OPTION, "U+E010=2, U+E011=1 , ,", false).unwrap();
     assert_eq!(items(&a), vec![item(0, "U+E010=2"), item(1, "U+E011=1")]);
     apply_set_option(&mut a, "codepoint-widths[4]", "  U+E012=2 ", false).unwrap();
-    assert_eq!(a.codepoint_widths.get(4), Some("U+E012=2"));
+    assert_eq!(a.codepoint_widths.get_index(4), Some("U+E012=2"));
     crate::config::parse_config_content(&mut a, "set -s codepoint-widths ' U+E013=2'\n");
     assert_eq!(items(&a), vec![item(0, "U+E013=2")]);
 }
