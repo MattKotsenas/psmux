@@ -498,9 +498,9 @@ the other session's own listener; a window or pane in another session is refused
 as deferred), and a real attached client (dump-state, keys, paste, resize, focus,
 detach). Ids `@N`/`%N` are unique and
 dense across the server. Scoping as in tmux: `set -g`, `set -s`, `setw -g`,
-`setenv -g`, `set-hook -g` and key bindings are server wide (delivered to every
-session through its own listener and replayed on sessions created later; a
-delivery the server makes itself is an echo and is not propagated again); session
+`setenv -g`, `set-hook -g` and key bindings are server wide (tried directly on
+each session's own handler, not through its listener, and on sessions created
+later by replay; that delivery is not routed or propagated again); session
 options stay in their session. `show -s server-mode` answers `shared`.
 kill-session ends one session; the server exits when its last session ends
 (tmux with `exit-empty`). The per session `__warm__` standby is never claimed and
