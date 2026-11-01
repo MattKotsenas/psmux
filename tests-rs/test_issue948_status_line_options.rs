@@ -167,3 +167,43 @@ fn the_status_lengths_stop_at_32767() {
     crate::config::parse_config_content(&mut a, "set -g status-left-length 99999\n");
     assert_eq!(get_option_value(&a, "status-left-length"), "10");
 }
+
+// `-a` on a colour option sets the colour given at session scope too, and a
+// global shadowed by the session's own value is kept in the form show prints.
+// tmux's options_from_string appends only in its string case (options.c:
+// 1303-1336 at 3.8), so a colour option takes the colour given on -a at any
+// scope. psmux used to append there and refuse `bad colour: redblue`.
+
+#[test]
+fn append_at_session_scope_sets_the_colour_given() {
+    let mut a = app();
+    assert_eq!(apply_set_session_option(&mut a, "status-bg", "red", false, false, false, false), "");
+    assert_eq!(apply_set_session_option(&mut a, "status-bg", "blue", false, true, false, false), "");
+    assert_eq!(get_option_value(&a, "status-bg"), "blue");
+    assert_eq!(drawn(&a), "bg=green,fg=black,bg=blue");
+}
+
+#[test]
+fn append_to_a_shadowed_global_sets_the_colour_given() {
+    let mut a = app();
+    apply_set_session_option(&mut a, "status-bg", "red", false, false, false, false);
+    write_shadowed_global(&mut a, "status-bg", GlobalWrite::Append("green")).unwrap();
+    assert_eq!(global_session_option_value(&a, "status-bg"), "green");
+    assert_eq!(get_option_value(&a, "status-bg"), "red", "the session keeps its own");
+}
+
+#[test]
+fn a_shadowed_global_colour_is_shown_as_tmux_shows_it() {
+    let mut a = app();
+    apply_set_session_option(&mut a, "status-bg", "red", false, false, false, false);
+    write_shadowed_global(&mut a, "status-bg", GlobalWrite::Set("1")).unwrap();
+    assert_eq!(global_session_option_value(&a, "status-bg"), "red");
+    unset_session_option(&mut a, "status-bg");
+    assert_eq!(get_option_value(&a, "status-bg"), "red");
+}
+
+#[test]
+fn append_still_appends_to_a_string_option() {
+    assert_eq!(crate::server::option_catalog::appended_value("status-left", "a", "b"), "ab");
+    assert_eq!(crate::server::option_catalog::appended_value("status-fg", "red", "blue"), "blue");
+}

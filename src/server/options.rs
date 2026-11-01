@@ -608,6 +608,10 @@ fn canonical_global_value(name: &str, value: &str) -> String {
             "off" | "false" | "0" | "no" => "off".to_string(),
             _ => value.to_string(),
         },
+        // A colour in the form show prints it (`1` as `red`), as
+        // apply_set_option keeps the typed field (#948).
+        "status-bg" | "status-fg" => crate::style::option_colour_name(value)
+            .unwrap_or_else(|| value.to_string()),
         _ => value.to_string(),
     }
 }
@@ -647,7 +651,11 @@ pub(crate) fn apply_set_session_option(
     let new_value = if toggle {
         toggled_value(option, &get_option_value(app, option))
     } else if append {
-        format!("{}{}", crate::format::lookup_option_pub(option, app).unwrap_or_default(), value)
+        crate::server::option_catalog::appended_value(
+            option,
+            &crate::format::lookup_option_pub(option, app).unwrap_or_default(),
+            value,
+        )
     } else {
         value.to_string()
     };
@@ -716,7 +724,7 @@ pub(crate) fn write_shadowed_global(app: &mut AppState, option: &str, op: Global
         GlobalWrite::Set(value) | GlobalWrite::OnlyIfUnset(value) => value.to_string(),
         GlobalWrite::Append(value) => {
             crate::server::option_catalog::validate_option_append(option)?;
-            format!("{}{}", current, value)
+            crate::server::option_catalog::appended_value(option, &current, value)
         }
         GlobalWrite::Toggle => {
             if !is_boolean_option(option) {

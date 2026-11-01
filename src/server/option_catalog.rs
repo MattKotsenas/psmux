@@ -632,6 +632,18 @@ pub fn is_known_option(name: &str) -> bool {
         || VALIDATION_ONLY_OPTIONS.iter().any(|definition| definition.name == name)
 }
 
+/// The value `-a` leaves on `name`: the current value with `value` after it,
+/// except on a colour option, which `-a` sets to the colour given as tmux
+/// does (only the string case of options_from_string appends, options.c:
+/// 1303-1305 at 3.8).
+pub fn appended_value(name: &str, current: &str, value: &str) -> String {
+    if option_definition(name).is_some_and(|d| d.option_type == OptionType::Colour) {
+        value.to_string()
+    } else {
+        format!("{}{}", current, value)
+    }
+}
+
 pub fn validate_option_append(name: &str) -> Result<(), String> {
     option_definition(name).map_or(Ok(()), OptionDef::validate_append)
 }

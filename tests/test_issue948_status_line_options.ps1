@@ -162,6 +162,25 @@ P set -g status-right-length 32767 | Out-Null
 Check "status-right-length 32767" (ShowG status-right-length) "status-right-length 32767"
 Check "status-left-length unchanged" (ShowG status-left-length) "status-left-length 10"
 
+# tmux sets a colour option to the colour given on -a, at any scope (only the
+# string case of options_from_string appends, options.c:1303-1336 at 3.8), so
+# `set status-bg red; set -a status-bg blue` leaves `blue`, and
+# `set -ga status-bg green` / `set -g status-bg 1` change the global the
+# session's own value shadows to `green` / `red` (colour_tostring).
+Write-Host "`n[11] -a and the shadowed global at session scope" -ForegroundColor Yellow
+Start-Server
+P set status-bg red | Out-Null
+$out = (P set -a status-bg blue) -join ' '
+Check "set -a status-bg blue (session) output" $out ""
+Check "show status-bg" ((P show status-bg) -join '') "status-bg blue"
+P set -ga status-bg green | Out-Null
+Check "set -ga over the session's own" (ShowG status-bg) "status-bg green"
+P set -g status-bg 1 | Out-Null
+Check "set -g 1 over the session's own" (ShowG status-bg) "status-bg red"
+Check "the session keeps its own" ((P show status-bg) -join '') "status-bg blue"
+Start-Sleep -Milliseconds 300
+Check "drawn with the session's" (Frame) "bg=green,fg=black,bg=blue"
+
 P kill-server | Out-Null
 Start-Sleep -Milliseconds 500
 Remove-Item Env:PSMUX_CONFIG_FILE, Env:PSMUX_DATA_DIR, Env:PSMUX_NO_WARM -EA SilentlyContinue
